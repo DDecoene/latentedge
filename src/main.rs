@@ -1,4 +1,5 @@
 mod config;
+mod laya_client;
 mod phoenix_decode;
 mod streamer;
 mod types;
