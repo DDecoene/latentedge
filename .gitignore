@@ -1,0 +1,6 @@
+/target
+.env
+*.env
+/laya_server/.venv
+__pycache__/
+*.pyc
