@@ -1,4 +1,3 @@
-use crate::config::Config;
 use crate::phoenix_decode::decode_from_ladder_json;
 use crate::types::{BotState, OrderBookSnapshot, StreamHealth};
 use chrono::Utc;
@@ -10,6 +9,25 @@ pub trait FetchLadder: Send + Sync {
     /// Returns (slot, raw_ladder_json) or an error representing a dropped
     /// connection / failed fetch.
     async fn fetch(&self) -> anyhow::Result<(u64, String)>;
+}
+
+/// Placeholder fetcher wiring real Solana WS RPC + phoenix-sdk decoding;
+/// see this module's note on replacing it with a live subscription before
+/// enabling real trading.
+///
+/// The error message deliberately omits `rpc_url`: that URL often carries
+/// an RPC provider's API key (e.g. Helius), and this error is logged on
+/// every failed poll — including it here would write the key to the log
+/// file repeatedly for the life of the process.
+pub struct RpcPollFetcher {
+    pub rpc_url: String,
+}
+
+#[async_trait::async_trait]
+impl FetchLadder for RpcPollFetcher {
+    async fn fetch(&self) -> anyhow::Result<(u64, String)> {
+        anyhow::bail!("RpcPollFetcher fetch not yet implemented — see this module's note")
+    }
 }
 
 /// Attempts one fetch; on failure, retries once immediately (real backoff
@@ -107,5 +125,14 @@ mod tests {
 
         let health = state.read().await.stream_health.clone().unwrap();
         assert_eq!(health.reconnect_count, 1);
+    }
+
+    #[tokio::test]
+    async fn rpc_poll_fetcher_error_never_includes_the_rpc_url() {
+        let fetcher = RpcPollFetcher {
+            rpc_url: "wss://mainnet.helius-rpc.com/?api-key=SECRET123".to_string(),
+        };
+        let err = fetcher.fetch().await.unwrap_err();
+        assert!(!err.to_string().contains("SECRET123"));
     }
 }

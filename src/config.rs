@@ -21,6 +21,7 @@ pub struct Config {
     pub max_slippage_bps: u16,
     pub max_daily_loss: u64,
     pub kill_switch_path: String,
+    pub trade_size: u64,
 }
 
 impl Config {
@@ -41,7 +42,11 @@ impl Config {
 
         let execution_mode = match get_or("EXECUTION_MODE", "dry_run").as_str() {
             "dry_run" => ExecutionMode::DryRun,
-            "live" => ExecutionMode::Live,
+            "live" => anyhow::bail!(
+                "EXECUTION_MODE=live is not yet supported: real trade submission \
+                 (Solana signing/broadcast) is not implemented — see the plan's \
+                 post-plan follow-up section"
+            ),
             other => anyhow::bail!("EXECUTION_MODE must be dry_run or live, got {other}"),
         };
 
@@ -58,6 +63,7 @@ impl Config {
             max_slippage_bps: get_or("MAX_SLIPPAGE_BPS", "50").parse()?,
             max_daily_loss: get_or("MAX_DAILY_LOSS", "5000000").parse()?,
             kill_switch_path: get_or("KILL_SWITCH_PATH", "./KILL_SWITCH"),
+            trade_size: get_or("TRADE_SIZE", "1000").parse()?,
         })
     }
 }
@@ -93,5 +99,28 @@ mod tests {
         vars.insert("EXECUTION_MODE".to_string(), "yolo".to_string());
         let err = Config::from_map(&vars).unwrap_err();
         assert!(err.to_string().contains("EXECUTION_MODE"));
+    }
+
+    #[test]
+    fn rejects_live_mode_until_submission_is_implemented() {
+        let mut vars = std::collections::HashMap::new();
+        vars.insert("EXECUTION_MODE".to_string(), "live".to_string());
+        let err = Config::from_map(&vars).unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("live"));
+    }
+
+    #[test]
+    fn trade_size_defaults_and_is_configurable() {
+        let mut vars = std::collections::HashMap::new();
+        vars.insert("SOLANA_WS_URL".to_string(), "wss://x".to_string());
+        vars.insert("SOLANA_RPC_URL".to_string(), "https://x".to_string());
+        vars.insert("PHOENIX_MARKET_ADDRESS".to_string(), "abc".to_string());
+
+        let default_config = Config::from_map(&vars).expect("should parse with default trade size");
+        assert_eq!(default_config.trade_size, 1000);
+
+        vars.insert("TRADE_SIZE".to_string(), "250".to_string());
+        let configured = Config::from_map(&vars).expect("should parse configured trade size");
+        assert_eq!(configured.trade_size, 250);
     }
 }

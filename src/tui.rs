@@ -58,11 +58,40 @@ pub fn render_lines(state: &BotState) -> DashboardLines {
     DashboardLines { lines }
 }
 
+fn is_quit_key(key: crossterm::event::KeyEvent) -> bool {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    key.code == KeyCode::Char('q')
+        || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+}
+
+/// Raw mode is disabled on drop, so it's restored on every exit path —
+/// including an early `?` return — not just the happy path.
+struct RawModeGuard;
+
+impl RawModeGuard {
+    fn new() -> anyhow::Result<Self> {
+        crossterm::terminal::enable_raw_mode()?;
+        Ok(Self)
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
+}
+
+/// Raw mode disables the terminal's SIGINT generation (`ISIG`), so Ctrl+C
+/// arrives here as a key event, not a signal — this is what actually quits
+/// the bot; `tokio::signal::ctrl_c()` in `main` never fires while the TUI
+/// owns the terminal. Detecting a quit key here trips `shutdown_tx` so
+/// every other task (and `main`) shuts down too.
 pub async fn run_tui(
     state: Arc<RwLock<BotState>>,
+    shutdown_tx: broadcast::Sender<()>,
     mut shutdown_rx: broadcast::Receiver<()>,
 ) -> anyhow::Result<()> {
-    crossterm::terminal::enable_raw_mode()?;
+    let _raw_mode = RawModeGuard::new()?;
     let backend = CrosstermBackend::new(std::io::stdout());
     let mut terminal = Terminal::new(backend)?;
 
@@ -76,19 +105,22 @@ pub async fn run_tui(
 
         tokio::select! {
             _ = shutdown_rx.recv() => break,
-            _ = tokio::time::sleep(tokio::time::Duration::from_millis(250)) => {}
-            _ = tokio::task::spawn_blocking(|| {
-                if crossterm::event::poll(std::time::Duration::from_millis(0)).unwrap_or(false) {
+            quit = tokio::task::spawn_blocking(|| {
+                if crossterm::event::poll(std::time::Duration::from_millis(200)).unwrap_or(false) {
                     if let Ok(crossterm::event::Event::Key(key)) = crossterm::event::read() {
-                        return key.code == crossterm::event::KeyCode::Char('q');
+                        return is_quit_key(key);
                     }
                 }
                 false
-            }) => {}
+            }) => {
+                if quit.unwrap_or(false) {
+                    let _ = shutdown_tx.send(());
+                    break;
+                }
+            }
         }
     }
 
-    crossterm::terminal::disable_raw_mode()?;
     Ok(())
 }
 
@@ -128,5 +160,26 @@ mod tests {
         state.kill_switch_active = true;
         let lines = render_lines(&state);
         assert!(lines.lines.iter().any(|l| l.to_uppercase().contains("KILL SWITCH")));
+    }
+
+    #[test]
+    fn q_key_is_a_quit_key() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let key = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE);
+        assert!(is_quit_key(key));
+    }
+
+    #[test]
+    fn ctrl_c_is_a_quit_key() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(is_quit_key(key));
+    }
+
+    #[test]
+    fn other_keys_are_not_quit_keys() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let key = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
+        assert!(!is_quit_key(key));
     }
 }

@@ -58,12 +58,23 @@ struct JupiterQuote {
     slippage_bps: u16,
 }
 
+/// Fails closed: if existence can't be determined (e.g. a permission
+/// error on a parent directory), this treats the kill switch as active
+/// rather than absent. Only a definite "not found" counts as "safe to
+/// trade".
 fn kill_switch_present(path: &str) -> bool {
-    std::path::Path::new(path).exists()
+    match std::fs::metadata(path) {
+        Ok(_) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => true,
+    }
 }
 
+const QUOTE_TIMEOUT: Duration = Duration::from_millis(500);
+
 async fn fetch_quote(jupiter_base_url: &str) -> Option<JupiterQuote> {
-    reqwest::Client::new()
+    let client = reqwest::Client::builder().timeout(QUOTE_TIMEOUT).build().ok()?;
+    client
         .get(format!("{jupiter_base_url}/quote"))
         .send()
         .await
@@ -90,7 +101,7 @@ pub async fn evaluate_trade(
     jupiter_base_url: &str,
     state: &Arc<RwLock<BotState>>,
 ) -> TradeEvent {
-    let trade_size = 1000u64; // fixed size for v1, per spec
+    let trade_size = config.trade_size; // fixed per-run size, config-driven per spec
     let dry_run = config.execution_mode != crate::config::ExecutionMode::Live;
 
     if kill_switch_present(&config.kill_switch_path) {
@@ -146,6 +157,7 @@ mod tests {
     use super::*;
     use crate::config::{Config, ExecutionMode};
     use crate::types::BotState;
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::Arc;
     use tokio::sync::RwLock;
     use wiremock::matchers::{method, path};
@@ -165,6 +177,7 @@ mod tests {
             max_slippage_bps: 50,
             max_daily_loss: 5_000_000,
             kill_switch_path: kill_switch_path.to_string(),
+            trade_size: 1000,
         }
     }
 
@@ -190,6 +203,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn uses_configured_trade_size_not_a_hardcoded_value() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/quote"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "outAmount": "999900", "slippageBps": 10
+            })))
+            .mount(&server)
+            .await;
+
+        let mut config = test_config("/tmp/layatrade_test_kill_6");
+        config.trade_size = 777;
+        let mut guard = SafetyGuardState::new();
+        let state = Arc::new(RwLock::new(BotState::new()));
+
+        let event = evaluate_trade(&config, &mut guard, &server.uri(), &state).await;
+
+        assert_eq!(event.size, 777);
+    }
+
+    #[tokio::test]
     async fn refuses_when_kill_switch_file_present() {
         let kill_switch_file = "/tmp/layatrade_test_kill_2";
         std::fs::write(kill_switch_file, b"stop").unwrap();
@@ -211,6 +245,65 @@ mod tests {
 
         assert!(event.note.contains("kill switch"));
         std::fs::remove_file(kill_switch_file).ok();
+    }
+
+    #[tokio::test]
+    async fn kill_switch_fails_closed_when_path_cannot_be_checked() {
+        // A path inside a directory with no execute permission can't be
+        // stat()-ed: metadata() returns PermissionDenied, not NotFound.
+        // The kill switch must treat that as "active" (fail closed), not
+        // as "absent" (fail open).
+        let dir = "/tmp/layatrade_test_kill_dir_unreadable";
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let unreadable_path = format!("{dir}/kill_switch");
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/quote"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "outAmount": "999900", "slippageBps": 10
+            })))
+            .mount(&server)
+            .await;
+
+        let config = test_config(&unreadable_path);
+        let mut guard = SafetyGuardState::new();
+        let state = Arc::new(RwLock::new(BotState::new()));
+
+        let event = evaluate_trade(&config, &mut guard, &server.uri(), &state).await;
+
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::remove_dir_all(dir).ok();
+
+        assert!(event.note.contains("kill switch"), "note was: {}", event.note);
+    }
+
+    #[tokio::test]
+    async fn quote_fetch_times_out_instead_of_hanging() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/quote"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_secs(5))
+                    .set_body_json(serde_json::json!({"outAmount": "999900", "slippageBps": 10})),
+            )
+            .mount(&server)
+            .await;
+
+        let config = test_config("/tmp/layatrade_test_kill_7");
+        let mut guard = SafetyGuardState::new();
+        let state = Arc::new(RwLock::new(BotState::new()));
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            evaluate_trade(&config, &mut guard, &server.uri(), &state),
+        )
+        .await;
+
+        let event = result.expect("evaluate_trade should time out its own quote request, not hang");
+        assert!(event.note.contains("quote fetch failed"));
     }
 
     #[test]

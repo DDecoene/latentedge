@@ -1,29 +1,12 @@
 use layatrade_rs::config::Config;
 use layatrade_rs::executor::{evaluate_trade, SafetyGuardState};
 use layatrade_rs::laya_client::LayaClient;
-use layatrade_rs::streamer::{run_streamer, FetchLadder};
+use layatrade_rs::streamer::{run_streamer, RpcPollFetcher};
 use layatrade_rs::tui::run_tui;
 use layatrade_rs::types::{BotState, TradeEvent};
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, RwLock};
 use tracing_subscriber::EnvFilter;
-
-/// Placeholder fetcher wiring real Solana WS RPC + phoenix-sdk decoding;
-/// see Task 4's note on replacing this with a live subscription before
-/// enabling real trading.
-struct RpcPollFetcher {
-    rpc_url: String,
-}
-
-#[async_trait::async_trait]
-impl FetchLadder for RpcPollFetcher {
-    async fn fetch(&self) -> anyhow::Result<(u64, String)> {
-        anyhow::bail!(
-            "RpcPollFetcher against {} not yet implemented — see Task 4 note",
-            self.rpc_url
-        )
-    }
-}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -92,12 +75,22 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let tui_state = state.clone();
+    let tui_shutdown_tx = shutdown_tx.clone();
     let tui_shutdown = shutdown_tx.subscribe();
     let tui_handle = tokio::spawn(async move {
-        let _ = run_tui(tui_state, tui_shutdown).await;
+        let _ = run_tui(tui_state, tui_shutdown_tx, tui_shutdown).await;
     });
 
-    tokio::signal::ctrl_c().await?;
+    // Raw mode (enabled while the TUI runs) disables SIGINT generation, so
+    // `ctrl_c()` never fires once the TUI is up — it only still matters
+    // before the TUI starts, or if the TUI itself has already exited. The
+    // TUI's own quit-key handling (`q` / Ctrl+C as a key event) is what
+    // actually trips `shutdown_tx` in the running case.
+    let mut main_shutdown_rx = shutdown_tx.subscribe();
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = main_shutdown_rx.recv() => {}
+    }
     let _ = shutdown_tx.send(());
 
     let _ = tokio::join!(streamer_handle, signal_handle, tui_handle);
