@@ -3,6 +3,7 @@ from pathlib import Path
 import click
 import httpx
 import pandas as pd
+from dotenv import load_dotenv
 
 from latentedge import config
 from latentedge.bars import build_bars
@@ -18,6 +19,13 @@ from latentedge.training_data import FEATURE_COLUMNS, assemble_training_data
 @click.group()
 def cli() -> None:
     """latentedge: ingest, train, and backtest the v1 WETH/USDC pipeline."""
+    # Loaded fresh on every invocation (not just at import) so a .env
+    # file in whatever directory the command is run from is picked up.
+    # load_dotenv() with no path searches upward from this *file's*
+    # location, not the process's cwd — an easy-to-miss python-dotenv
+    # default that would silently ignore a .env in the user's actual
+    # working directory. Search from cwd explicitly instead.
+    load_dotenv(dotenv_path=Path.cwd() / ".env")
 
 
 DEFAULT_RPC_URL = "https://ethereum.publicnode.com"
@@ -26,7 +34,13 @@ DEFAULT_RPC_URL = "https://ethereum.publicnode.com"
 @cli.command()
 @click.option("--from-block", type=int, required=True)
 @click.option("--to-block", type=int, required=True)
-@click.option("--rpc-url", type=str, default=DEFAULT_RPC_URL, help="An archive-capable RPC endpoint for ranges reaching back further than a few hours (e.g. an Alchemy/Infura URL) — free public endpoints gate deep history behind a paid token.")
+@click.option(
+    "--rpc-url",
+    type=str,
+    default=DEFAULT_RPC_URL,
+    envvar="LATENTEDGE_RPC_URL",
+    help="An archive-capable RPC endpoint for ranges reaching back further than a few hours (e.g. an Alchemy/Infura URL) — free public endpoints gate deep history behind a paid token. Falls back to the LATENTEDGE_RPC_URL env var (or a .env file) if omitted, so a provider key never needs to appear as a bare CLI argument.",
+)
 @click.option("--out", type=click.Path(path_type=Path), default=Path("data/swaps.parquet"))
 @click.option("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE, help="Blocks per eth_getLogs call — keep well under your provider's per-call limit.")
 @click.option("--max-retries", type=int, default=DEFAULT_MAX_RETRIES)

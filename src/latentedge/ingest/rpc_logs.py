@@ -28,6 +28,47 @@ def _rpc_call(client: httpx.Client, rpc_url: str, method: str, params: list[Any]
     return payload["result"]
 
 
+BLOCK_BATCH_SIZE = 100
+
+
+def _batch_fetch_blocks(block_numbers: list[int], client: httpx.Client, rpc_url: str) -> dict[int, tuple[int, int]]:
+    """Fetch (timestamp, base_fee_wei) for each block number in as few
+    HTTP round-trips as possible — a JSON-RPC batch request per
+    BLOCK_BATCH_SIZE blocks, rather than one call per block. A year of
+    history for an actively-traded pool can mean fetching timestamps for
+    roughly a million unique blocks; one-at-a-time would take days.
+    """
+    result: dict[int, tuple[int, int]] = {}
+    unique_blocks = list(dict.fromkeys(block_numbers))  # de-dupe, keep order
+
+    for i in range(0, len(unique_blocks), BLOCK_BATCH_SIZE):
+        batch = unique_blocks[i : i + BLOCK_BATCH_SIZE]
+        payload = [
+            {"jsonrpc": "2.0", "id": block_number, "method": "eth_getBlockByNumber", "params": [hex(block_number), False]}
+            for block_number in batch
+        ]
+        response = client.post(rpc_url, json=payload)
+        if response.status_code != 200:
+            raise RpcLogsError(f"RPC returned HTTP {response.status_code}: {response.text}")
+
+        responses = response.json()
+        by_id = {entry["id"]: entry for entry in responses}
+
+        for block_number in batch:
+            entry = by_id.get(block_number)
+            if entry is None:
+                raise RpcLogsError(f"batch response missing block {block_number}")
+            if "error" in entry:
+                raise RpcLogsError(f"RPC error for block {block_number}: {entry['error']}")
+
+            block = entry["result"]
+            timestamp = int(block["timestamp"], 16)
+            base_fee_wei = int(block["baseFeePerGas"], 16) if "baseFeePerGas" in block else 0
+            result[block_number] = (timestamp, base_fee_wei)
+
+    return result
+
+
 def _decode_int(hex_str: str, bits: int, signed: bool) -> int:
     value = int(hex_str, 16)
     if signed and value >= (1 << (bits - 1)):
@@ -61,21 +102,19 @@ def fetch_swaps(pool_address: str, from_block: int, to_block: int, client: httpx
         ],
     )
 
-    records: list[SwapRecord] = []
-    # Cache both the timestamp and base fee from a single block fetch —
+    # Both the timestamp and base fee come from the same block fetch —
     # eth_getBlockByNumber's response already carries baseFeePerGas, so
     # there's no need for a second round-trip per block (see
     # ingest.pool_state.backfill_base_fee, kept as a fallback utility for
     # records sourced without it, e.g. pre-London blocks with no base fee).
-    block_cache: dict[int, tuple[int, int]] = {}
+    # Batched rather than one call per block: a year of history for an
+    # actively-traded pool can touch close to a million unique blocks.
+    unique_block_numbers = [int(log["blockNumber"], 16) for log in logs]
+    block_cache = _batch_fetch_blocks(unique_block_numbers, client, rpc_url)
 
+    records: list[SwapRecord] = []
     for log in logs:
         block_number = int(log["blockNumber"], 16)
-        if block_number not in block_cache:
-            block = _rpc_call(client, rpc_url, "eth_getBlockByNumber", [log["blockNumber"], False])
-            timestamp = int(block["timestamp"], 16)
-            base_fee_wei = int(block["baseFeePerGas"], 16) if "baseFeePerGas" in block else 0
-            block_cache[block_number] = (timestamp, base_fee_wei)
         timestamp, base_fee_wei = block_cache[block_number]
 
         amount0, amount1, sqrt_price_x96, liquidity, tick = _decode_swap_data(log["data"])

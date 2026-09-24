@@ -10,6 +10,7 @@ dependencies = [
     "mlx>=0.18",
     "click>=8.1",
     "plotext>=5.3",
+    "python-dotenv>=1.2.3",
 ]
 
 [dependency-groups]

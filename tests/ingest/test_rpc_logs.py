@@ -2,6 +2,7 @@ import httpx
 
 from latentedge import config
 from latentedge.ingest.rpc_logs import fetch_swaps
+from latentedge.ingest.rpc_logs import _batch_fetch_blocks
 
 RPC_URL = "https://ethereum.publicnode.com"
 
@@ -44,3 +45,27 @@ def test_fetch_swaps_decodes_real_logs():
         # needed for records sourced this way (avoids fetching each
         # block twice).
         assert r.base_fee_wei > 0
+
+
+def test_batch_fetch_blocks_matches_individually_fetched_results():
+    # A year-long pull needs to fetch timestamps/base-fees for roughly a
+    # million unique blocks — one HTTP round-trip per block would take
+    # days. This confirms batched fetches return the same data as the
+    # already-proven single-call path, for real blocks against the real
+    # service.
+    with httpx.Client(timeout=30.0) as client:
+        latest = _latest_block_number(client)
+        block_numbers = [latest - 5, latest - 4, latest - 3]
+
+        batched = _batch_fetch_blocks(block_numbers, client, RPC_URL)
+
+        for block_number in block_numbers:
+            individual_response = client.post(
+                RPC_URL,
+                json={"jsonrpc": "2.0", "id": 1, "method": "eth_getBlockByNumber", "params": [hex(block_number), False]},
+            )
+            individual_block = individual_response.json()["result"]
+            expected_timestamp = int(individual_block["timestamp"], 16)
+            expected_base_fee = int(individual_block["baseFeePerGas"], 16)
+
+            assert batched[block_number] == (expected_timestamp, expected_base_fee)
