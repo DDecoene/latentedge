@@ -24,14 +24,24 @@ def _roll_to_day_if_needed(state: GuardState, timestamp: int) -> GuardState:
 class SafetyGuard(BaseModel):
     max_position_fraction: float
     daily_loss_limit_fraction: float
+    # The predicted return at (or above) which a trade sizes at the full
+    # max_position_fraction. Below this, size scales down proportionally
+    # with the prediction's magnitude — per spec 3.5, the guard uses the
+    # predicted return's magnitude directly for sizing, not just its sign.
+    full_size_return: float
 
     def size_position(self, state: GuardState, predicted_return: float, timestamp: int) -> tuple[float, GuardState]:
         state = _roll_to_day_if_needed(state, timestamp)
 
-        if state.locked_out or predicted_return <= 0 or state.equity_usd <= 0:
+        # `not (predicted_return > 0)` rather than `<= 0` also catches
+        # NaN, which fails every comparison (NaN <= 0 is False) — the
+        # signal client should already reject NaN before it gets here,
+        # but the guard defends itself too rather than relying on that.
+        if state.locked_out or not (predicted_return > 0) or state.equity_usd <= 0:
             return 0.0, state
 
-        size_usd = state.equity_usd * self.max_position_fraction
+        confidence = min(predicted_return / self.full_size_return, 1.0)
+        size_usd = state.equity_usd * self.max_position_fraction * confidence
         return size_usd, state
 
 

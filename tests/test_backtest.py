@@ -29,7 +29,7 @@ def test_backtest_produces_hand_computable_results(tmp_path: Path):
     save(regressor, model_path)
 
     client = SignalClient(model_path, input_dim=1)
-    guard = SafetyGuard(max_position_fraction=0.1, daily_loss_limit_fraction=0.5)
+    guard = SafetyGuard(max_position_fraction=0.1, daily_loss_limit_fraction=0.5, full_size_return=0.02)
 
     # Moves sized well above real-world cost drag (fees/slippage/gas at
     # $1000 position size) — a ~1.6% move looked "obviously profitable"
