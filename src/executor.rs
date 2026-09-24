@@ -2,6 +2,9 @@ use crate::config::Config;
 use crate::types::{BotState, Position, TradeEvent, WalletState};
 use chrono::Utc;
 use serde::Deserialize;
+use solana_sdk::signature::Keypair;
+use solana_sdk::signer::Signer;
+use solana_sdk::transaction::VersionedTransaction;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
@@ -115,6 +118,76 @@ fn refusal_event(trade_size: u64, price: u64, dry_run: bool, note: String) -> Tr
     }
 }
 
+#[derive(Deserialize)]
+struct JupiterSwapResponse {
+    #[serde(rename = "swapTransaction")]
+    swap_transaction: String,
+}
+
+/// Decodes Jupiter's base64 swap transaction and re-signs its message
+/// with our keypair. Jupiter already built the message with our pubkey
+/// as the required signer, so `VersionedTransaction::try_new` (which
+/// signs a message fresh) is the correct call here, not appending a
+/// signature to the existing (placeholder) one.
+fn sign_swap_transaction(
+    base64_transaction: &str,
+    keypair: &Keypair,
+) -> anyhow::Result<VersionedTransaction> {
+    use base64::Engine;
+    let raw = base64::engine::general_purpose::STANDARD.decode(base64_transaction)?;
+    let unsigned: VersionedTransaction = bincode::deserialize(&raw)?;
+    let signed = VersionedTransaction::try_new(unsigned.message, &[keypair])?;
+    Ok(signed)
+}
+
+/// Fetches a swap transaction from Jupiter for the already-approved
+/// quote, signs it, and submits it. Only reachable from live mode, after
+/// every guard has already passed. NOTE for the implementer: verify
+/// `RpcClient`'s exact method name/signature for submitting a
+/// `VersionedTransaction` against the currently pinned `solana-client`
+/// version before relying on this in production — the Solana RPC client
+/// surface for versioned transactions has changed across versions, and
+/// this path is not exercised by an automated test against a real
+/// network (see this task's tests: they cover local signing only).
+async fn submit_live_swap(
+    config: &Config,
+    input_mint: &str,
+    output_mint: &str,
+    amount: u64,
+) -> anyhow::Result<String> {
+    let keypair_path = config
+        .solana_keypair_path
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("SOLANA_KEYPAIR_PATH is required in live mode"))?;
+    let keypair = solana_sdk::signer::keypair::read_keypair_file(keypair_path)
+        .map_err(|e| anyhow::anyhow!("failed to read keypair file: {e}"))?;
+
+    let client = reqwest::Client::builder().timeout(QUOTE_TIMEOUT).build()?;
+    let quote_url = format!(
+        "{}/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount}",
+        config.jupiter_base_url
+    );
+    let quote: serde_json::Value = client.get(quote_url).send().await?.json().await?;
+
+    let swap_response: JupiterSwapResponse = client
+        .post(format!("{}/swap", config.jupiter_base_url))
+        .json(&serde_json::json!({
+            "quoteResponse": quote,
+            "userPublicKey": keypair.pubkey().to_string(),
+            "wrapAndUnwrapSol": true,
+        }))
+        .send()
+        .await?
+        .json()
+        .await?;
+
+    let signed = sign_swap_transaction(&swap_response.swap_transaction, &keypair)?;
+
+    let rpc_client = solana_client::rpc_client::RpcClient::new(config.solana_rpc_url.clone());
+    let signature = rpc_client.send_and_confirm_transaction(&signed)?;
+    Ok(signature.to_string())
+}
+
 pub async fn evaluate_trade(
     config: &Config,
     guard: &mut SafetyGuardState,
@@ -174,6 +247,16 @@ pub async fn evaluate_trade(
     }
 
     guard.record_trade();
+
+    if !dry_run {
+        if let Err(e) = submit_live_swap(config, input_mint, output_mint, trade_size).await {
+            return (
+                refusal_event(trade_size, quote_price, dry_run, format!("refused: live submission failed: {e}")),
+                position,
+                wallet,
+            );
+        }
+    }
 
     match position {
         None => {
@@ -528,5 +611,65 @@ mod tests {
         let (event, _position, _wallet) =
             evaluate_trade(&config, &mut guard, &state, None, wallet).await;
         assert_eq!(event.size, 0);
+    }
+
+    #[tokio::test]
+    async fn dry_run_never_calls_the_swap_endpoint() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/quote"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "outAmount": "5000000", "priceImpactPct": "0.001"
+            })))
+            .mount(&server)
+            .await;
+        // Deliberately no /swap mock registered: if evaluate_trade ever
+        // calls it in dry-run mode, wiremock's unmatched-request panic
+        // (via .expect(0) below) proves it.
+        Mock::given(method("POST"))
+            .and(path("/swap"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let mut config = test_config("/tmp/layatrade_test_kill_11");
+        config.jupiter_base_url = server.uri();
+        assert_eq!(config.execution_mode, ExecutionMode::DryRun);
+        let mut guard = SafetyGuardState::new();
+        let state = Arc::new(RwLock::new(BotState::new()));
+
+        let (event, _position, _wallet) =
+            evaluate_trade(&config, &mut guard, &state, None, flat_wallet(1000)).await;
+
+        assert!(event.dry_run);
+        server.verify().await; // enforces the expect(0) above
+    }
+
+    #[tokio::test]
+    async fn live_mode_signs_the_returned_transaction_with_the_loaded_keypair() {
+        use solana_sdk::message::{v0, VersionedMessage};
+        use solana_sdk::signer::keypair::Keypair;
+        use solana_sdk::signer::Signer;
+        use solana_sdk::transaction::VersionedTransaction;
+
+        // Build an unsigned message whose only required signer is our
+        // throwaway keypair's pubkey, matching what Jupiter's real /swap
+        // response contains before the caller signs it.
+        let keypair = Keypair::new();
+        let blockhash = solana_sdk::hash::Hash::default();
+        let message = VersionedMessage::V0(
+            v0::Message::try_compile(&keypair.pubkey(), &[], &[], blockhash).unwrap(),
+        );
+        let unsigned_tx = VersionedTransaction {
+            signatures: vec![solana_sdk::signature::Signature::default()],
+            message,
+        };
+        let serialized = bincode::serialize(&unsigned_tx).unwrap();
+        let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &serialized);
+
+        let signed = sign_swap_transaction(&encoded, &keypair)
+            .expect("a well-formed swap transaction should sign cleanly");
+        assert!(signed.verify_with_results().iter().all(|ok| *ok));
     }
 }

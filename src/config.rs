@@ -40,11 +40,7 @@ impl Config {
 
         let execution_mode = match get_or("EXECUTION_MODE", "dry_run").as_str() {
             "dry_run" => ExecutionMode::DryRun,
-            "live" => anyhow::bail!(
-                "EXECUTION_MODE=live is not yet supported: real trade submission \
-                 (Solana signing/broadcast) is not implemented — see the plan's \
-                 post-plan follow-up section"
-            ),
+            "live" => ExecutionMode::Live,
             other => anyhow::bail!("EXECUTION_MODE must be dry_run or live, got {other}"),
         };
 
@@ -142,11 +138,10 @@ mod tests {
     }
 
     #[test]
-    fn rejects_live_mode_until_submission_is_implemented() {
+    fn live_mode_is_accepted_now_that_submission_exists() {
         let mut vars = std::collections::HashMap::new();
         vars.insert("EXECUTION_MODE".to_string(), "live".to_string());
-        let err = Config::from_map(&vars).unwrap_err();
-        assert!(err.to_string().to_lowercase().contains("live"));
+        let config = Config::from_map(&vars).expect("live mode should now parse");
+        assert_eq!(config.execution_mode, ExecutionMode::Live);
     }
-
 }
