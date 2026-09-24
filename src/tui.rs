@@ -67,7 +67,7 @@ pub fn render_lines(state: &BotState) -> DashboardLines {
     DashboardLines { lines }
 }
 
-fn is_quit_key(key: crossterm::event::KeyEvent) -> bool {
+pub(crate) fn is_quit_key(key: crossterm::event::KeyEvent) -> bool {
     use crossterm::event::{KeyCode, KeyModifiers};
     key.code == KeyCode::Char('q')
         || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
@@ -75,10 +75,10 @@ fn is_quit_key(key: crossterm::event::KeyEvent) -> bool {
 
 /// Raw mode is disabled on drop, so it's restored on every exit path —
 /// including an early `?` return — not just the happy path.
-struct RawModeGuard;
+pub(crate) struct RawModeGuard;
 
 impl RawModeGuard {
-    fn new() -> anyhow::Result<Self> {
+    pub(crate) fn new() -> anyhow::Result<Self> {
         crossterm::terminal::enable_raw_mode()?;
         Ok(Self)
     }

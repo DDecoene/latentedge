@@ -19,27 +19,27 @@ impl SafetyGuardState {
         Self { trade_timestamps: Vec::new(), daily_loss_accrued: 0 }
     }
 
-    pub fn check(&mut self, config: &Config, trade_size: u64) -> Result<(), String> {
+    pub(crate) fn check_size(&self, config: &Config, trade_size: u64) -> Result<(), String> {
         if trade_size > config.max_trade_size {
             return Err(format!(
                 "trade size {trade_size} exceeds max_trade_size {}",
                 config.max_trade_size
             ));
         }
-        self.check_daily_loss_and_rate_limit(config)
+        Ok(())
     }
 
-    /// Daily-loss and rate-limit checks only, no size cap. `max_trade_size`
-    /// caps a buy's quote-atom spend; a sell's `trade_size` is the
-    /// position's base-atom size (a different unit), so the size cap does
-    /// not apply when closing an already-approved position.
-    fn check_daily_loss_and_rate_limit(&mut self, config: &Config) -> Result<(), String> {
+    pub(crate) fn check_daily_loss(&self, config: &Config) -> Result<(), String> {
         if self.daily_loss_accrued >= config.max_daily_loss {
             return Err(format!(
                 "daily loss cap breached: accrued {} >= max {}",
                 self.daily_loss_accrued, config.max_daily_loss
             ));
         }
+        Ok(())
+    }
+
+    pub(crate) fn check_rate_limit(&mut self, config: &Config) -> Result<(), String> {
         let window = Duration::from_secs(60);
         let now = Instant::now();
         self.trade_timestamps.retain(|t| now.duration_since(*t) < window);
@@ -49,6 +49,23 @@ impl SafetyGuardState {
                 self.trade_timestamps.len()
             ));
         }
+        Ok(())
+    }
+
+    pub fn check(&mut self, config: &Config, trade_size: u64) -> Result<(), String> {
+        self.check_size(config, trade_size)?;
+        self.check_daily_loss(config)?;
+        self.check_rate_limit(config)?;
+        Ok(())
+    }
+
+    /// Daily-loss and rate-limit checks only, no size cap. `max_trade_size`
+    /// caps a buy's quote-atom spend; a sell's `trade_size` is the
+    /// position's base-atom size (a different unit), so the size cap does
+    /// not apply when closing an already-approved position.
+    pub(crate) fn check_daily_loss_and_rate_limit(&mut self, config: &Config) -> Result<(), String> {
+        self.check_daily_loss(config)?;
+        self.check_rate_limit(config)?;
         Ok(())
     }
 
@@ -345,6 +362,11 @@ mod tests {
             poll_interval_ms: 5000,
             trade_size_pct: 0.1,
             starting_capital: 1000,
+            coingecko_base_url: "https://api.coingecko.com/api/v3".into(),
+            coingecko_api_key: None,
+            backtest_days: 90,
+            backtest_cost_bps: 15,
+            backtest_tick_ms: 50,
         }
     }
 

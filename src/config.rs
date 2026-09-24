@@ -25,6 +25,11 @@ pub struct Config {
     pub poll_interval_ms: u64,
     pub trade_size_pct: f64,
     pub starting_capital: u64,
+    pub coingecko_base_url: String,
+    pub coingecko_api_key: Option<String>,
+    pub backtest_days: u32,
+    pub backtest_cost_bps: u32,
+    pub backtest_tick_ms: u64,
 }
 
 impl Config {
@@ -50,10 +55,10 @@ impl Config {
             laya_confidence_threshold: get_or("LAYA_CONFIDENCE_THRESHOLD", "0.85").parse()?,
             execution_mode,
             solana_keypair_path: vars.get("SOLANA_KEYPAIR_PATH").cloned().filter(|s| !s.is_empty()),
-            max_trade_size: get_or("MAX_TRADE_SIZE", "1000000").parse()?,
+            max_trade_size: get_or("MAX_TRADE_SIZE", "500000000").parse()?,
             max_trades_per_window: get_or("MAX_TRADES_PER_WINDOW", "5").parse()?,
             max_slippage_bps: get_or("MAX_SLIPPAGE_BPS", "50").parse()?,
-            max_daily_loss: get_or("MAX_DAILY_LOSS", "5000000").parse()?,
+            max_daily_loss: get_or("MAX_DAILY_LOSS", "500000000").parse()?,
             kill_switch_path: get_or("KILL_SWITCH_PATH", "./KILL_SWITCH"),
             jupiter_base_url: get_or("JUPITER_BASE_URL", "https://quote-api.jup.ag/v6"),
             base_mint: get_or("BASE_MINT", "So11111111111111111111111111111111111111112"),
@@ -67,6 +72,11 @@ impl Config {
                 pct
             },
             starting_capital: get_or("STARTING_CAPITAL", "1000000000").parse()?,
+            coingecko_base_url: get_or("COINGECKO_BASE_URL", "https://api.coingecko.com/api/v3"),
+            coingecko_api_key: vars.get("COINGECKO_API_KEY").cloned().filter(|s| !s.is_empty()),
+            backtest_days: get_or("BACKTEST_DAYS", "90").parse()?,
+            backtest_cost_bps: get_or("BACKTEST_COST_BPS", "15").parse()?,
+            backtest_tick_ms: get_or("BACKTEST_TICK_MS", "50").parse()?,
         })
     }
 }
@@ -149,6 +159,47 @@ mod tests {
         let mut zero = std::collections::HashMap::new();
         zero.insert("TRADE_SIZE_PCT".to_string(), "0".to_string());
         assert!(Config::from_map(&zero).is_err());
+    }
+
+    #[test]
+    fn backtest_config_has_sensible_defaults() {
+        let vars = std::collections::HashMap::new();
+        let config = Config::from_map(&vars).expect("should parse with all defaults");
+        assert_eq!(config.coingecko_base_url, "https://api.coingecko.com/api/v3");
+        assert_eq!(config.coingecko_api_key, None);
+        assert_eq!(config.backtest_days, 90);
+        assert_eq!(config.backtest_cost_bps, 15);
+        assert_eq!(config.backtest_tick_ms, 50);
+    }
+
+    #[test]
+    fn backtest_config_is_overridable() {
+        let mut vars = std::collections::HashMap::new();
+        vars.insert("COINGECKO_BASE_URL".to_string(), "http://127.0.0.1:9999".to_string());
+        vars.insert("COINGECKO_API_KEY".to_string(), "demo-key".to_string());
+        vars.insert("BACKTEST_DAYS".to_string(), "30".to_string());
+        vars.insert("BACKTEST_COST_BPS".to_string(), "25".to_string());
+        vars.insert("BACKTEST_TICK_MS".to_string(), "10".to_string());
+        let config = Config::from_map(&vars).expect("should parse overrides");
+        assert_eq!(config.coingecko_base_url, "http://127.0.0.1:9999");
+        assert_eq!(config.coingecko_api_key, Some("demo-key".to_string()));
+        assert_eq!(config.backtest_days, 30);
+        assert_eq!(config.backtest_cost_bps, 25);
+        assert_eq!(config.backtest_tick_ms, 10);
+    }
+
+    #[test]
+    fn max_trade_size_and_max_daily_loss_defaults_allow_a_default_buy() {
+        let vars = std::collections::HashMap::new();
+        let config = Config::from_map(&vars).expect("should parse with all defaults");
+        let default_buy_spend = (config.starting_capital as f64 * config.trade_size_pct) as u64;
+        assert!(
+            config.max_trade_size > default_buy_spend,
+            "MAX_TRADE_SIZE default ({}) must exceed a default buy's spend ({})",
+            config.max_trade_size, default_buy_spend
+        );
+        assert_eq!(config.max_trade_size, 500_000_000);
+        assert_eq!(config.max_daily_loss, 500_000_000);
     }
 
     #[test]
