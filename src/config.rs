@@ -9,9 +9,7 @@ pub enum ExecutionMode {
 
 #[derive(Debug, Clone)]
 pub struct Config {
-    pub solana_ws_url: String,
     pub solana_rpc_url: String,
-    pub phoenix_market_address: String,
     pub laya_server_url: String,
     pub laya_confidence_threshold: f64,
     pub execution_mode: ExecutionMode,
@@ -21,7 +19,12 @@ pub struct Config {
     pub max_slippage_bps: u16,
     pub max_daily_loss: u64,
     pub kill_switch_path: String,
-    pub trade_size: u64,
+    pub jupiter_base_url: String,
+    pub base_mint: String,
+    pub quote_mint: String,
+    pub poll_interval_ms: u64,
+    pub trade_size_pct: f64,
+    pub starting_capital: u64,
 }
 
 impl Config {
@@ -31,11 +34,6 @@ impl Config {
     }
 
     pub fn from_map(vars: &HashMap<String, String>) -> anyhow::Result<Self> {
-        let get = |key: &str| -> anyhow::Result<String> {
-            vars.get(key)
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("missing required env var {key}"))
-        };
         let get_or = |key: &str, default: &str| -> String {
             vars.get(key).cloned().unwrap_or_else(|| default.to_string())
         };
@@ -51,9 +49,7 @@ impl Config {
         };
 
         Ok(Config {
-            solana_ws_url: get("SOLANA_WS_URL")?,
-            solana_rpc_url: get("SOLANA_RPC_URL")?,
-            phoenix_market_address: get("PHOENIX_MARKET_ADDRESS")?,
+            solana_rpc_url: get_or("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com"),
             laya_server_url: get_or("LAYA_SERVER_URL", "http://127.0.0.1:8787"),
             laya_confidence_threshold: get_or("LAYA_CONFIDENCE_THRESHOLD", "0.85").parse()?,
             execution_mode,
@@ -63,7 +59,12 @@ impl Config {
             max_slippage_bps: get_or("MAX_SLIPPAGE_BPS", "50").parse()?,
             max_daily_loss: get_or("MAX_DAILY_LOSS", "5000000").parse()?,
             kill_switch_path: get_or("KILL_SWITCH_PATH", "./KILL_SWITCH"),
-            trade_size: get_or("TRADE_SIZE", "1000").parse()?,
+            jupiter_base_url: get_or("JUPITER_BASE_URL", "https://quote-api.jup.ag/v6"),
+            base_mint: get_or("BASE_MINT", "So11111111111111111111111111111111111111112"),
+            quote_mint: get_or("QUOTE_MINT", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"),
+            poll_interval_ms: get_or("POLL_INTERVAL_MS", "5000").parse()?,
+            trade_size_pct: get_or("TRADE_SIZE_PCT", "0.1").parse()?,
+            starting_capital: get_or("STARTING_CAPITAL", "1000000000").parse()?,
         })
     }
 }
@@ -75,9 +76,6 @@ mod tests {
     #[test]
     fn parses_valid_env_map() {
         let mut vars = std::collections::HashMap::new();
-        vars.insert("SOLANA_WS_URL".to_string(), "wss://x".to_string());
-        vars.insert("SOLANA_RPC_URL".to_string(), "https://x".to_string());
-        vars.insert("PHOENIX_MARKET_ADDRESS".to_string(), "abc".to_string());
         vars.insert("LAYA_SERVER_URL".to_string(), "http://127.0.0.1:8787".to_string());
         vars.insert("LAYA_CONFIDENCE_THRESHOLD".to_string(), "0.85".to_string());
         vars.insert("EXECUTION_MODE".to_string(), "dry_run".to_string());
@@ -91,6 +89,48 @@ mod tests {
         assert_eq!(config.execution_mode, ExecutionMode::DryRun);
         assert_eq!(config.laya_confidence_threshold, 0.85);
         assert_eq!(config.solana_keypair_path, None);
+    }
+
+    #[test]
+    fn jupiter_streaming_config_has_sensible_defaults() {
+        let vars = std::collections::HashMap::new();
+        let config = Config::from_map(&vars).expect("should parse with all defaults");
+        assert_eq!(config.jupiter_base_url, "https://quote-api.jup.ag/v6");
+        assert_eq!(config.base_mint, "So11111111111111111111111111111111111111112");
+        assert_eq!(config.quote_mint, "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
+        assert_eq!(config.poll_interval_ms, 5000);
+    }
+
+    #[test]
+    fn jupiter_streaming_config_is_overridable() {
+        let mut vars = std::collections::HashMap::new();
+        vars.insert("JUPITER_BASE_URL".to_string(), "http://127.0.0.1:9999".to_string());
+        vars.insert("BASE_MINT".to_string(), "mintA".to_string());
+        vars.insert("QUOTE_MINT".to_string(), "mintB".to_string());
+        vars.insert("POLL_INTERVAL_MS".to_string(), "1000".to_string());
+        let config = Config::from_map(&vars).expect("should parse overrides");
+        assert_eq!(config.jupiter_base_url, "http://127.0.0.1:9999");
+        assert_eq!(config.base_mint, "mintA");
+        assert_eq!(config.quote_mint, "mintB");
+        assert_eq!(config.poll_interval_ms, 1000);
+    }
+
+    #[test]
+    fn money_management_config_has_sensible_defaults() {
+        let vars = std::collections::HashMap::new();
+        let config = Config::from_map(&vars).expect("should parse with all defaults");
+        assert_eq!(config.trade_size_pct, 0.1);
+        assert_eq!(config.starting_capital, 1_000_000_000);
+    }
+
+    #[test]
+    fn money_management_config_is_overridable() {
+        let mut vars = std::collections::HashMap::new();
+        vars.insert("TRADE_SIZE_PCT".to_string(), "0.25".to_string());
+        vars.insert("STARTING_CAPITAL".to_string(), "500".to_string());
+        let config = Config::from_map(&vars).expect("should parse overrides");
+        assert_eq!(config.trade_size_pct, 0.25);
+        assert_eq!(config.starting_capital, 500);
     }
 
     #[test]
@@ -109,18 +149,4 @@ mod tests {
         assert!(err.to_string().to_lowercase().contains("live"));
     }
 
-    #[test]
-    fn trade_size_defaults_and_is_configurable() {
-        let mut vars = std::collections::HashMap::new();
-        vars.insert("SOLANA_WS_URL".to_string(), "wss://x".to_string());
-        vars.insert("SOLANA_RPC_URL".to_string(), "https://x".to_string());
-        vars.insert("PHOENIX_MARKET_ADDRESS".to_string(), "abc".to_string());
-
-        let default_config = Config::from_map(&vars).expect("should parse with default trade size");
-        assert_eq!(default_config.trade_size, 1000);
-
-        vars.insert("TRADE_SIZE".to_string(), "250".to_string());
-        let configured = Config::from_map(&vars).expect("should parse configured trade size");
-        assert_eq!(configured.trade_size, 250);
-    }
 }

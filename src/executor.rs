@@ -101,7 +101,7 @@ pub async fn evaluate_trade(
     jupiter_base_url: &str,
     state: &Arc<RwLock<BotState>>,
 ) -> TradeEvent {
-    let trade_size = config.trade_size; // fixed per-run size, config-driven per spec
+    let trade_size = ((config.starting_capital as f64) * config.trade_size_pct) as u64; // interim: Task 4 replaces this with real equity/position awareness
     let dry_run = config.execution_mode != crate::config::ExecutionMode::Live;
 
     if kill_switch_present(&config.kill_switch_path) {
@@ -165,9 +165,7 @@ mod tests {
 
     fn test_config(kill_switch_path: &str) -> Config {
         Config {
-            solana_ws_url: "wss://x".into(),
             solana_rpc_url: "https://x".into(),
-            phoenix_market_address: "m".into(),
             laya_server_url: "http://127.0.0.1:8787".into(),
             laya_confidence_threshold: 0.85,
             execution_mode: ExecutionMode::DryRun,
@@ -177,7 +175,12 @@ mod tests {
             max_slippage_bps: 50,
             max_daily_loss: 5_000_000,
             kill_switch_path: kill_switch_path.to_string(),
-            trade_size: 1000,
+            jupiter_base_url: "https://quote-api.jup.ag/v6".into(),
+            base_mint: "So11111111111111111111111111111111111111112".into(),
+            quote_mint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".into(),
+            poll_interval_ms: 5000,
+            trade_size_pct: 0.1,
+            starting_capital: 1000,
         }
     }
 
@@ -200,27 +203,6 @@ mod tests {
 
         assert!(event.note.contains("slippage"));
         assert!(event.dry_run);
-    }
-
-    #[tokio::test]
-    async fn uses_configured_trade_size_not_a_hardcoded_value() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/quote"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "outAmount": "999900", "slippageBps": 10
-            })))
-            .mount(&server)
-            .await;
-
-        let mut config = test_config("/tmp/layatrade_test_kill_6");
-        config.trade_size = 777;
-        let mut guard = SafetyGuardState::new();
-        let state = Arc::new(RwLock::new(BotState::new()));
-
-        let event = evaluate_trade(&config, &mut guard, &server.uri(), &state).await;
-
-        assert_eq!(event.size, 777);
     }
 
     #[tokio::test]
