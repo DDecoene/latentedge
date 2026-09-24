@@ -4,6 +4,8 @@ Swap(address indexed sender, address indexed recipient, int256 amount0,
      int256 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick)
 """
 
+from typing import Any
+
 import httpx
 
 from latentedge.schema import SwapRecord
@@ -16,7 +18,7 @@ class RpcLogsError(Exception):
     pass
 
 
-def _rpc_call(client: httpx.Client, rpc_url: str, method: str, params: list) -> object:
+def _rpc_call(client: httpx.Client, rpc_url: str, method: str, params: list[Any]) -> Any:
     response = client.post(rpc_url, json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
     if response.status_code != 200:
         raise RpcLogsError(f"RPC returned HTTP {response.status_code}: {response.text}")

@@ -12,7 +12,7 @@ Q96 = 2**96
 def sqrt_price_x96_to_price(sqrt_price_x96: int, decimals0: int, decimals1: int) -> float:
     """Price of token0 in terms of token1, decimal-adjusted."""
     raw_price = (sqrt_price_x96 / Q96) ** 2
-    return raw_price * (10 ** (decimals0 - decimals1))
+    return float(raw_price * (10 ** (decimals0 - decimals1)))
 
 
 def price_to_sqrt_price_x96(price_token1_per_token0: float, decimals0: int, decimals1: int) -> int:

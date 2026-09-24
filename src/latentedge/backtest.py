@@ -1,3 +1,5 @@
+from typing import Any
+
 import numpy as np
 from pydantic import BaseModel
 
@@ -18,8 +20,8 @@ def run_backtest(
     features: np.ndarray,
     entry_prices: np.ndarray,
     exit_prices: np.ndarray,
-    entry_swaps: list[dict],
-    exit_swaps: list[dict],
+    entry_swaps: list[dict[str, Any]],
+    exit_swaps: list[dict[str, Any]],
     signal_client: SignalClient,
     guard: SafetyGuard,
     initial_equity_usd: float,

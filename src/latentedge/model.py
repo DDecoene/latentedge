@@ -6,7 +6,7 @@ import mlx.optimizers as optim
 import numpy as np
 
 
-class NetReturnRegressor(nn.Module):
+class NetReturnRegressor(nn.Module):  # type: ignore[misc]  # mlx ships no type stubs
     def __init__(self, input_dim: int):
         super().__init__()
         self.layer1 = nn.Linear(input_dim, 16)
@@ -14,7 +14,8 @@ class NetReturnRegressor(nn.Module):
 
     def __call__(self, x: mx.array) -> mx.array:
         h = nn.relu(self.layer1(x))
-        return self.layer2(h).squeeze(-1)
+        result: mx.array = self.layer2(h).squeeze(-1)
+        return result
 
 
 def _loss_fn(model: NetReturnRegressor, x: mx.array, y: mx.array) -> mx.array:

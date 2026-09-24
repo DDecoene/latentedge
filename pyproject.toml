@@ -16,6 +16,7 @@ dependencies = [
 dev = [
     "pytest>=8.3",
     "mypy>=1.11",
+    "pandas-stubs>=3.0.5.260914",
 ]
 
 [build-system]
@@ -27,3 +28,10 @@ packages = ["src/latentedge"]
 
 [tool.mypy]
 strict = true
+
+[[tool.mypy.overrides]]
+# MLX ships no type stubs; without this, subclassing mlx.nn.Module and
+# using mlx.nn/mlx.optimizers attributes fails strict checking entirely.
+module = "mlx.*"
+ignore_missing_imports = true
+follow_imports = "skip"

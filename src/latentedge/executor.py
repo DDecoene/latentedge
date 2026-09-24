@@ -1,10 +1,12 @@
+from typing import Any
+
 from latentedge import config
 from latentedge.costs import estimate_gas_cost_usd, estimate_slippage_fraction
 
 FEE_FRACTION = config.FEE_TIER_BPS / 10_000
 
 
-def simulate_fill(size_usd: float, entry_price: float, exit_price: float, entry_swap: dict, exit_swap: dict) -> float:
+def simulate_fill(size_usd: float, entry_price: float, exit_price: float, entry_swap: dict[str, Any], exit_swap: dict[str, Any]) -> float:
     if size_usd <= 0:
         return 0.0
 
