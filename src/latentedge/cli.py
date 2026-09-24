@@ -3,6 +3,7 @@ from pathlib import Path
 
 import click
 import httpx
+import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
 
@@ -24,6 +25,7 @@ from latentedge.store import read_swaps
 from latentedge.training_data import FEATURE_COLUMNS, assemble_training_data
 from latentedge.tui.app import LatentEdgeApp
 from latentedge.tui.ingest_screen import IngestScreen
+from latentedge.tui.train_screen import TrainScreen
 
 
 @click.group()
@@ -83,6 +85,7 @@ def ingest(
             chunk_size=chunk_size, max_workers=max_workers,
             flush_every_n_chunks=flush_every_n_chunks, max_retries=max_retries,
             retry_backoff_seconds=retry_backoff_seconds, ingest_fn=ingest_range,
+            train_assemble_fn=lambda p: _assemble_train_data(p, Path("data/model.safetensors")),
         )
         LatentEdgeApp(start_screen=screen).run()
         return
@@ -100,12 +103,8 @@ def ingest(
     click.echo(f"wrote {total} new swap records to {out}")
 
 
-@cli.command()
-@click.option("--swaps", type=click.Path(path_type=Path), default=Path("data/swaps.parquet"))
-@click.option("--out", type=click.Path(path_type=Path), default=Path("data/model.safetensors"))
-@click.option("--epochs", type=int, default=100)
-def train(swaps: Path, out: Path, epochs: int) -> None:
-    swap_df = read_swaps(swaps)
+def _assemble_train_data(swaps_path: Path, out_path: Path) -> tuple[np.ndarray, np.ndarray, int]:
+    swap_df = read_swaps(swaps_path)
     bar_df = build_bars(swap_df, config.BAR_INTERVAL_SECONDS)
 
     # Take-profit/stop-loss band sized from the pool's own realized
@@ -117,7 +116,6 @@ def train(swaps: Path, out: Path, epochs: int) -> None:
     assembled = assemble_training_data(
         bar_df, swap_df, return_windows=[5, 15, 30], volatility_window=15, tp_sl_fraction=tp_sl_fraction
     )
-
     train_split, _validate_split, _test_split = chronological_split(assembled, train_fraction=0.7, validate_fraction=0.15)
 
     # Standardize using train-split statistics only — computing stats
@@ -125,18 +123,34 @@ def train(swaps: Path, out: Path, epochs: int) -> None:
     # into training. The same stats are saved alongside the model so
     # SignalClient applies an identical transform at inference time.
     stats = compute_feature_stats(train_split, FEATURE_COLUMNS)
+    save_feature_stats(stats, Path(str(out_path) + ".stats.json"))
     train_split = standardize_features(train_split, FEATURE_COLUMNS, stats)
 
     x = train_split[FEATURE_COLUMNS].to_numpy(dtype="float32")
     y = train_split["net_return"].to_numpy(dtype="float32")
+    return x, y, len(FEATURE_COLUMNS)
 
-    regressor = NetReturnRegressor(input_dim=len(FEATURE_COLUMNS))
-    losses = train_model(regressor, x, y, epochs=epochs, learning_rate=0.001)
 
+@cli.command()
+@click.option("--swaps", type=click.Path(path_type=Path), default=Path("data/swaps.parquet"))
+@click.option("--out", type=click.Path(path_type=Path), default=Path("data/model.safetensors"))
+@click.option("--epochs", type=int, default=100)
+def train(swaps: Path, out: Path, epochs: int) -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
+
+    if sys.stdout.isatty():
+        screen = TrainScreen(
+            swaps_path=swaps, out_path=out, epochs=epochs,
+            assemble_fn=lambda p: _assemble_train_data(p, out),
+        )
+        LatentEdgeApp(start_screen=screen).run()
+        return
+
+    x, y, input_dim = _assemble_train_data(swaps, out)
+    regressor = NetReturnRegressor(input_dim=input_dim)
+    losses = train_model(regressor, x, y, epochs=epochs, learning_rate=0.001)
     save(regressor, out)
-    save_feature_stats(stats, Path(str(out) + ".stats.json"))
-    click.echo(f"trained {epochs} epochs, final loss {losses[-1]:.6f}, tp_sl_fraction={tp_sl_fraction:.5f}, saved to {out}")
+    click.echo(f"trained {epochs} epochs, final loss {losses[-1]:.6f}, saved to {out}")
 
 
 @cli.command()

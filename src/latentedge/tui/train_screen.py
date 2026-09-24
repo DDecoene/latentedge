@@ -16,7 +16,7 @@ from latentedge.tui.widgets import LogPanel, ProgressPanel
 DEFAULT_MODEL_OUT_PATH = Path("data/model.safetensors")
 
 
-class TrainScreen(Screen):
+class TrainScreen(Screen[None]):
     def __init__(
         self,
         swaps_path: Path,

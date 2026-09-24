@@ -121,3 +121,22 @@ def test_ingest_falls_back_to_plain_output_when_stdout_is_not_a_tty(monkeypatch:
     assert result.exit_code == 0
     assert captured["rpc_url"] == DEFAULT_RPC_URL
     assert "wrote 0 new swap records" in result.output
+
+
+def test_train_launches_dashboard_when_stdout_is_a_tty(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    launched = {"called": False}
+
+    class _FakeApp:
+        def __init__(self, start_screen):
+            launched["called"] = True
+
+        def run(self):
+            pass
+
+    monkeypatch.setattr("click.testing._NamedTextIOWrapper.isatty", lambda self: True)
+    monkeypatch.setattr("latentedge.cli.LatentEdgeApp", _FakeApp)
+
+    runner = CliRunner()
+    runner.invoke(cli, ["train", "--swaps", str(tmp_path / "swaps.parquet")])
+
+    assert launched["called"]

@@ -7,7 +7,7 @@ from textual.screen import Screen
 class LatentEdgeApp(App[None]):
     """Hosts whichever screen a long-running command starts on."""
 
-    def __init__(self, start_screen: Screen) -> None:
+    def __init__(self, start_screen: Screen[None]) -> None:
         super().__init__()
         self._start_screen = start_screen
 

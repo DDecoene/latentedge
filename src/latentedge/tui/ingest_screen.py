@@ -7,11 +7,13 @@ from collections.abc import Callable
 from pathlib import Path
 
 import httpx
+import numpy as np
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.screen import Screen
 from textual.widgets import Static
 
+from latentedge.ingest.chunked import FetchFn
 from latentedge.ingest.chunked import ingest_range as default_ingest_range
 from latentedge.ingest.rpc_logs import fetch_swaps
 from latentedge.tui.train_screen import TrainScreen
@@ -21,7 +23,7 @@ RATE_WINDOW_SIZE = 20
 STATS_REFRESH_INTERVAL_SECONDS = 1.0
 
 
-class IngestScreen(Screen):
+class IngestScreen(Screen[None]):
     BINDINGS = [
         Binding("t", "train_now", "Train now", show=False),
         Binding("q", "exit_now", "Exit", show=False),
@@ -40,8 +42,9 @@ class IngestScreen(Screen):
         flush_every_n_chunks: int,
         max_retries: int,
         retry_backoff_seconds: float,
+        train_assemble_fn: Callable[[Path], tuple[np.ndarray, np.ndarray, int]],
         ingest_fn: Callable[..., int] = default_ingest_range,
-        fetch_fn: Callable[..., list[object]] = fetch_swaps,
+        fetch_fn: FetchFn = fetch_swaps,
         time_fn: Callable[[], float] = time.monotonic,
     ) -> None:
         super().__init__()
@@ -56,6 +59,7 @@ class IngestScreen(Screen):
         self.flush_every_n_chunks = flush_every_n_chunks
         self.max_retries = max_retries
         self.retry_backoff_seconds = retry_backoff_seconds
+        self.train_assemble_fn = train_assemble_fn
         self.ingest_fn = ingest_fn
         self.fetch_fn = fetch_fn
         self.time_fn = time_fn
@@ -154,7 +158,7 @@ class IngestScreen(Screen):
     def action_train_now(self) -> None:
         if not self.is_complete:
             return
-        self.app.push_screen(TrainScreen(swaps_path=self.out_path))
+        self.app.push_screen(TrainScreen(swaps_path=self.out_path, assemble_fn=self.train_assemble_fn))
 
     def action_exit_now(self) -> None:
         if not self.is_complete:
