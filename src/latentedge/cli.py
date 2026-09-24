@@ -7,11 +7,11 @@ import pandas as pd
 from latentedge import config
 from latentedge.bars import build_bars
 from latentedge.features import compute_feature_stats, save_feature_stats, standardize_features
-from latentedge.ingest.rpc_logs import fetch_swaps
+from latentedge.ingest.chunked import DEFAULT_CHUNK_SIZE, DEFAULT_MAX_RETRIES, DEFAULT_RETRY_BACKOFF_SECONDS, ingest_range
 from latentedge.model import NetReturnRegressor, save
 from latentedge.model import train as train_model
 from latentedge.split import chronological_split
-from latentedge.store import read_swaps, write_swaps
+from latentedge.store import read_swaps
 from latentedge.training_data import FEATURE_COLUMNS, assemble_training_data
 
 
@@ -26,17 +26,29 @@ DEFAULT_RPC_URL = "https://ethereum.publicnode.com"
 @cli.command()
 @click.option("--from-block", type=int, required=True)
 @click.option("--to-block", type=int, required=True)
-@click.option("--rpc-url", type=str, default=DEFAULT_RPC_URL)
+@click.option("--rpc-url", type=str, default=DEFAULT_RPC_URL, help="An archive-capable RPC endpoint for ranges reaching back further than a few hours (e.g. an Alchemy/Infura URL) — free public endpoints gate deep history behind a paid token.")
 @click.option("--out", type=click.Path(path_type=Path), default=Path("data/swaps.parquet"))
-def ingest(from_block: int, to_block: int, rpc_url: str, out: Path) -> None:
-    # fetch_swaps already populates base_fee_wei from the same
-    # eth_getBlockByNumber call it makes for each block's timestamp — no
-    # separate backfill pass needed for RPC-log-sourced records.
+@click.option("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE, help="Blocks per eth_getLogs call — keep well under your provider's per-call limit.")
+@click.option("--max-retries", type=int, default=DEFAULT_MAX_RETRIES)
+@click.option("--retry-backoff-seconds", type=float, default=DEFAULT_RETRY_BACKOFF_SECONDS)
+def ingest(from_block: int, to_block: int, rpc_url: str, out: Path, chunk_size: int, max_retries: int, retry_backoff_seconds: float) -> None:
+    # A large range (e.g. a year of history) needs chunking to respect
+    # provider limits and resumability to survive a multi-hour run being
+    # interrupted — see ingest.chunked for the real logic; fetch_swaps
+    # already populates base_fee_wei from the same eth_getBlockByNumber
+    # call it makes for each block's timestamp, no separate backfill pass.
     out.parent.mkdir(parents=True, exist_ok=True)
+
+    def report(chunk_start: int, chunk_end: int, count: int) -> None:
+        click.echo(f"  blocks {chunk_start}-{chunk_end}: {count} swaps")
+
     with httpx.Client(timeout=30.0) as client:
-        records = fetch_swaps(config.POOL_ADDRESS, from_block, to_block, client, rpc_url)
-    write_swaps(records, out)
-    click.echo(f"wrote {len(records)} swap records to {out}")
+        total = ingest_range(
+            config.POOL_ADDRESS, from_block, to_block, out, client, rpc_url,
+            chunk_size=chunk_size, max_retries=max_retries, retry_backoff_seconds=retry_backoff_seconds,
+            on_progress=report,
+        )
+    click.echo(f"wrote {total} new swap records to {out}")
 
 
 @cli.command()
