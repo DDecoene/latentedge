@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from pathlib import Path
 
 import mlx.core as mx
@@ -23,18 +24,28 @@ def _loss_fn(model: NetReturnRegressor, x: mx.array, y: mx.array) -> mx.array:
     return mx.mean((predictions - y) ** 2)
 
 
-def train(model: NetReturnRegressor, features: np.ndarray, labels: np.ndarray, epochs: int, learning_rate: float) -> list[float]:
+def train(
+    model: NetReturnRegressor,
+    features: np.ndarray,
+    labels: np.ndarray,
+    epochs: int,
+    learning_rate: float,
+    on_epoch: Callable[[int, int, float], None] | None = None,
+) -> list[float]:
     x = mx.array(features)
     y = mx.array(labels)
     optimizer = optim.Adam(learning_rate=learning_rate)
     loss_and_grad = nn.value_and_grad(model, _loss_fn)
 
     losses: list[float] = []
-    for _ in range(epochs):
+    for epoch in range(epochs):
         loss, grads = loss_and_grad(model, x, y)
         optimizer.update(model, grads)
         mx.eval(model.parameters(), optimizer.state)
-        losses.append(float(loss))
+        loss_value = float(loss)
+        losses.append(loss_value)
+        if on_epoch is not None:
+            on_epoch(epoch + 1, epochs, loss_value)
     return losses
 
 

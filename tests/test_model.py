@@ -35,3 +35,21 @@ def test_save_and_load_round_trip_predicts_identically(tmp_path: Path):
     original_pred = regressor(mx.array(x))
     loaded_pred = loaded(mx.array(x))
     assert np.allclose(np.array(original_pred), np.array(loaded_pred), atol=1e-6)
+
+
+def test_train_calls_on_epoch_with_progress_and_loss():
+    rng = np.random.default_rng(0)
+    x = rng.normal(size=(10, 3)).astype(np.float32)
+    y = rng.normal(size=(10,)).astype(np.float32)
+
+    regressor = NetReturnRegressor(input_dim=3)
+
+    calls: list[tuple[int, int, float]] = []
+
+    def on_epoch(epoch: int, total_epochs: int, loss: float) -> None:
+        calls.append((epoch, total_epochs, loss))
+
+    train(regressor, x, y, epochs=3, learning_rate=0.001, on_epoch=on_epoch)
+
+    assert [c[:2] for c in calls] == [(1, 3), (2, 3), (3, 3)]
+    assert all(isinstance(c[2], float) for c in calls)
