@@ -3,7 +3,7 @@ use layatrade_rs::executor::{evaluate_trade, SafetyGuardState};
 use layatrade_rs::laya_client::LayaClient;
 use layatrade_rs::streamer::{run_streamer, JupiterQuotePoller};
 use layatrade_rs::tui::run_tui;
-use layatrade_rs::types::{BotState, TradeEvent};
+use layatrade_rs::types::{BotState, Position, WalletState};
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, RwLock};
 use tracing_subscriber::EnvFilter;
@@ -47,6 +47,7 @@ async fn main() -> anyhow::Result<()> {
             streamer_state,
             snapshot_tx,
             streamer_shutdown,
+            streamer_config.poll_interval_ms,
         )
         .await;
     });
@@ -56,6 +57,11 @@ async fn main() -> anyhow::Result<()> {
     let mut signal_shutdown = shutdown_tx.subscribe();
     let signal_handle = tokio::spawn(async move {
         let mut guard = SafetyGuardState::new();
+        let mut position: Option<Position> = None;
+        let mut wallet = WalletState {
+            starting_capital: signal_config.starting_capital,
+            realized_pnl: 0,
+        };
         loop {
             tokio::select! {
                 _ = signal_shutdown.recv() => break,
@@ -65,12 +71,17 @@ async fn main() -> anyhow::Result<()> {
                     signal_state.write().await.last_snapshot = Some(snapshot);
 
                     if sig.should_trade {
-                        let event: TradeEvent = evaluate_trade(
+                        let (event, new_position, new_wallet) = evaluate_trade(
                             &signal_config,
                             &mut guard,
-                            "https://quote-api.jup.ag/v6",
                             &signal_state,
+                            position,
+                            wallet,
                         ).await;
+                        position = new_position;
+                        wallet = new_wallet;
+                        signal_state.write().await.position = position;
+                        signal_state.write().await.wallet = wallet;
                         signal_state.write().await.push_trade(event);
                     }
                 }

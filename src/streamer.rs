@@ -101,6 +101,7 @@ pub async fn run_streamer<F: FetchLadder + 'static>(
     state: Arc<RwLock<BotState>>,
     snapshot_tx: mpsc::Sender<OrderBookSnapshot>,
     mut shutdown_rx: broadcast::Receiver<()>,
+    poll_interval_ms: u64,
 ) -> anyhow::Result<()> {
     let mut reconnects = 0u32;
     let mut backoff_ms: u64 = 200;
@@ -111,7 +112,7 @@ pub async fn run_streamer<F: FetchLadder + 'static>(
                 match result {
                     Ok(()) => {
                         backoff_ms = 200;
-                        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                        tokio::time::sleep(tokio::time::Duration::from_millis(poll_interval_ms)).await;
                     }
                     Err(e) => {
                         reconnects += 1;
