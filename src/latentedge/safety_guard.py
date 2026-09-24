@@ -14,7 +14,12 @@ def _day_for_timestamp(timestamp: int) -> int:
     return timestamp // DAY_SECONDS
 
 
-def _roll_to_day_if_needed(state: GuardState, timestamp: int) -> GuardState:
+def roll_to_day(state: GuardState, timestamp: int) -> GuardState:
+    """Advance the guard's day-tracking to the day `timestamp` falls on,
+    resetting the daily-loss tally and any lockout if that's a new day.
+    Public so callers settling a trade at its actual exit time (which may
+    be a later day than the entry) can attribute the result to the
+    correct day before crediting it."""
     day = _day_for_timestamp(timestamp)
     if day == state.current_day:
         return state
@@ -31,7 +36,7 @@ class SafetyGuard(BaseModel):
     full_size_return: float
 
     def size_position(self, state: GuardState, predicted_return: float, timestamp: int) -> tuple[float, GuardState]:
-        state = _roll_to_day_if_needed(state, timestamp)
+        state = roll_to_day(state, timestamp)
 
         # `not (predicted_return > 0)` rather than `<= 0` also catches
         # NaN, which fails every comparison (NaN <= 0 is False) — the
