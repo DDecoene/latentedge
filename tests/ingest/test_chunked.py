@@ -245,3 +245,34 @@ def test_ingest_range_progress_never_exceeds_what_was_actually_flushed(tmp_path:
     # so nothing should have been written or progress-marked yet.
     progress = read_progress(out_path)
     assert progress is None or progress < 190  # nowhere near chunk 15's block range
+
+
+def test_ingest_range_calls_on_retry_for_each_failed_attempt(tmp_path: Path):
+    attempts = {"count": 0}
+    lock = threading.Lock()
+    retry_calls = {"count": 0}
+    retry_lock = threading.Lock()
+
+    def flaky_fetch(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str) -> list[SwapRecord]:
+        with lock:
+            attempts["count"] += 1
+            count = attempts["count"]
+        if count < 3:
+            raise RpcLogsError("transient failure")
+        return [_record(from_block, 0)]
+
+    def on_retry() -> None:
+        with retry_lock:
+            retry_calls["count"] += 1
+
+    out_path = tmp_path / "swaps.parquet"
+    with httpx.Client() as client:
+        ingest_range(
+            pool_address="0xpool", from_block=0, to_block=99, out_path=out_path,
+            client=client, rpc_url="http://fake", chunk_size=100, max_workers=1,
+            fetch_fn=flaky_fetch, max_retries=5, retry_backoff_seconds=0.001,
+            on_retry=on_retry,
+        )
+
+    # 3 attempts total means 2 failed-then-retried attempts.
+    assert retry_calls["count"] == 2

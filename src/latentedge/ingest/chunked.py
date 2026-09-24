@@ -60,6 +60,7 @@ def _fetch_chunk_with_retries(
     rpc_url: str,
     max_retries: int,
     backoff_seconds: float,
+    on_retry: Callable[[], None] | None = None,
 ) -> list[SwapRecord]:
     last_error: Exception | None = None
     for attempt in range(max_retries):
@@ -68,6 +69,8 @@ def _fetch_chunk_with_retries(
         except Exception as exc:  # RpcLogsError et al — real transient failures
             last_error = exc
             if attempt < max_retries - 1:
+                if on_retry is not None:
+                    on_retry()
                 time.sleep(backoff_seconds * (2**attempt))
     assert last_error is not None
     raise last_error
@@ -86,6 +89,7 @@ def ingest_range(
     max_workers: int = DEFAULT_MAX_WORKERS,
     flush_every_n_chunks: int = DEFAULT_FLUSH_EVERY_N_CHUNKS,
     on_progress: Callable[[int, int, int], None] | None = None,
+    on_retry: Callable[[], None] | None = None,
     fetch_fn: FetchFn = fetch_swaps,
 ) -> int:
     """Ingest [from_block, to_block] concurrently, in chunks, flushing to
@@ -130,7 +134,8 @@ def ingest_range(
     def process_chunk(chunk_start: int) -> tuple[int, int, list[SwapRecord]]:
         chunk_end = min(chunk_start + chunk_size - 1, to_block)
         records = _fetch_chunk_with_retries(
-            fetch_fn, pool_address, chunk_start, chunk_end, client, rpc_url, max_retries, retry_backoff_seconds
+            fetch_fn, pool_address, chunk_start, chunk_end, client, rpc_url,
+            max_retries, retry_backoff_seconds, on_retry,
         )
         return chunk_start, chunk_end, records
 
