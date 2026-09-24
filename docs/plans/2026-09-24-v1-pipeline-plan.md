@@ -11,11 +11,11 @@ honestly — as a single in-process Python pipeline.
 modules (ingest → bars → labels → features/split → train → signal client
 → safety-guard → executor → backtest harness), wired together by a thin
 CLI. No services, no network boundary between components — only the
-ingestion step talks to the outside world (subgraph/RPC).
+ingestion step talks to the outside world (JSON-RPC).
 
 **Tech Stack:** Python 3.12, `uv` for dependency management, `pandas` +
 `pyarrow` for tabular data, `pydantic` for typed money-handling state,
-`httpx` for subgraph/RPC calls, `mlx` for the model, `click` for the CLI,
+`httpx` for RPC calls, `mlx` for the model, `click` for the CLI,
 `pytest` for tests, `mypy --strict` for type checking.
 
 **Spec:** `docs/specs/2026-09-24-v1-pipeline-design.md`
@@ -50,8 +50,8 @@ ingestion step talks to the outside world (subgraph/RPC).
   swaps): ingestion and the train/validate/test split must fail loudly
   with a clear error, not silently produce a near-empty split that trains
   a meaningless model.
-- **Duplicate swap records** (a retried subgraph page or overlapping RPC
-  log query returning the same swap twice): storage must dedupe on
+- **Duplicate swap records** (an overlapping or retried RPC log query
+  returning the same swap twice): storage must dedupe on
   `(tx_hash, log_index)`, or P&L/volume figures double-count real trades.
 - **NaN/Inf model predictions** (numerical instability during training or
   a malformed feature row at inference time): the signal client must
@@ -419,218 +419,50 @@ git commit -m "Add swap record schema and deduping Parquet storage"
 
 ---
 
-## Task 4: Subgraph ingestion client
+## Task 4: DROPPED — subgraph ingestion client
 
-**Files:**
-- Create: `src/latentedge/ingest/__init__.py`
-- Create: `src/latentedge/ingest/subgraph.py`
-- Create: `tests/ingest/__init__.py`
-- Create: `tests/ingest/test_subgraph.py`
-
-**Interfaces:**
-- Consumes: `schema.SwapRecord`, `config.POOL_ADDRESS`.
-- Produces: `subgraph.fetch_swaps(pool_address: str, start_timestamp: int,
-  end_timestamp: int, client: httpx.Client) -> list[SwapRecord]` — raises
-  `subgraph.SubgraphError` on any non-200 response, GraphQL error payload,
-  or a response missing expected fields. Never returns a partial result
-  silently.
-
-- [ ] **Step 1: Write the failing test (real integration test)**
-
-This is a real-service test per the spec's testing strategy — it queries
-the actual Uniswap v3 subgraph for a small, real, known block range and
-checks the decoded output has plausible shape. It does not assert an
-exact price (that would pin the test to one moment in market history);
-it asserts structural correctness — the same kind of gap that bit this
-project's data-source integration before.
-
-```python
-# tests/ingest/test_subgraph.py
-import httpx
-import pytest
-
-from latentedge import config
-from latentedge.ingest.subgraph import SubgraphError, fetch_swaps
-
-
-def test_fetch_swaps_returns_real_decoded_records():
-    # A narrow, real, historical window with known-nonzero WETH/USDC
-    # 0.05% activity (mid-2023) — chosen only to guarantee non-empty
-    # results, not to pin any specific price.
-    start = 1_688_000_000
-    end = 1_688_000_600  # 10-minute window
-    with httpx.Client(timeout=30.0) as client:
-        records = fetch_swaps(config.POOL_ADDRESS, start, end, client)
-
-    assert len(records) > 0
-    for r in records:
-        assert start <= r.timestamp <= end
-        assert r.liquidity > 0
-        assert r.sqrt_price_x96 > 0
-        assert r.tx_hash.startswith("0x")
-
-
-def test_fetch_swaps_raises_on_malformed_pool_address():
-    with httpx.Client(timeout=30.0) as client:
-        with pytest.raises(SubgraphError):
-            fetch_swaps("not-an-address", 0, 1, client)
-```
-
-- [ ] **Step 2: Run test to verify it fails**
-
-Run: `uv run pytest tests/ingest/test_subgraph.py -v`
-Expected: FAIL with `ModuleNotFoundError: No module named 'latentedge.ingest'`
-
-- [ ] **Step 3: Write the implementation**
-
-```python
-# src/latentedge/ingest/__init__.py
-```
-
-```python
-# src/latentedge/ingest/subgraph.py
-"""Uniswap v3 subgraph client, via The Graph's decentralized network."""
-
-import httpx
-
-from latentedge.schema import SwapRecord
-
-# The Graph's decentralized-network gateway endpoint for the Uniswap v3
-# mainnet subgraph. Confirm this is current at implementation time —
-# subgraph endpoints are the kind of thing that needs verifying against
-# the real service, not assumed from a plan written earlier.
-SUBGRAPH_URL = "https://gateway.thegraph.com/api/subgraphs/id/5zvR82QoaXYFyDEKLZ9t6v9adgnptxYpKpSbxtgVENFV"
-
-QUERY = """
-query Swaps($pool: String!, $start: Int!, $end: Int!, $skip: Int!) {
-  swaps(
-    where: { pool: $pool, timestamp_gte: $start, timestamp_lt: $end }
-    orderBy: timestamp
-    orderDirection: asc
-    first: 1000
-    skip: $skip
-  ) {
-    transaction { id, gasUsed, gasPrice }
-    logIndex
-    timestamp
-    sqrtPriceX96
-    tick
-    amount0
-    amount1
-  }
-}
-"""
-
-
-class SubgraphError(Exception):
-    pass
-
-
-def fetch_swaps(pool_address: str, start_timestamp: int, end_timestamp: int, client: httpx.Client) -> list[SwapRecord]:
-    records: list[SwapRecord] = []
-    skip = 0
-    while True:
-        response = client.post(
-            SUBGRAPH_URL,
-            json={
-                "query": QUERY,
-                "variables": {
-                    "pool": pool_address.lower(),
-                    "start": start_timestamp,
-                    "end": end_timestamp,
-                    "skip": skip,
-                },
-            },
-        )
-        if response.status_code != 200:
-            raise SubgraphError(f"subgraph returned HTTP {response.status_code}: {response.text}")
-
-        payload = response.json()
-        if "errors" in payload:
-            raise SubgraphError(f"subgraph returned errors: {payload['errors']}")
-
-        try:
-            swaps = payload["data"]["swaps"]
-        except (KeyError, TypeError) as exc:
-            raise SubgraphError(f"unexpected subgraph response shape: {payload}") from exc
-
-        if not swaps:
-            break
-
-        for swap in swaps:
-            records.append(
-                SwapRecord(
-                    block_number=0,  # not needed downstream; subgraph omits it from this query
-                    timestamp=int(swap["timestamp"]),
-                    tx_hash=swap["transaction"]["id"],
-                    log_index=int(swap["logIndex"]),
-                    sqrt_price_x96=int(swap["sqrtPriceX96"]),
-                    tick=int(swap["tick"]),
-                    liquidity=0,  # populated by a follow-up pool-state query in Task 5
-                    amount0=float(swap["amount0"]),
-                    amount1=float(swap["amount1"]),
-                    base_fee_wei=0,  # populated separately; see 3.1 of the spec
-                )
-            )
-
-        if len(swaps) < 1000:
-            break
-        skip += 1000
-
-    return records
-```
-
-Note for the implementer: the Uniswap v3 subgraph's `Swap` entity does not
-expose in-range `liquidity` or block base fee directly on the swap itself
-in all subgraph versions — confirm the exact field names against the live
-schema when running this test for the first time (introspect the schema
-or check the subgraph's docs page), and adjust the query and the
-`liquidity`/`base_fee_wei` population accordingly. If the field truly
-isn't available from the subgraph, capturing it via a follow-up
-`eth_call` to the pool's `slot0`/`liquidity()` at that block (Task 6) is
-the fallback — this is exactly the kind of thing Task 4's own test is
-designed to catch before it becomes a labeling-time surprise.
-
-- [ ] **Step 4: Run test to verify it passes**
-
-Run: `uv run pytest tests/ingest/test_subgraph.py -v`
-Expected: PASS. If the live subgraph's schema differs from what's assumed
-above (field names, endpoint, auth requirements), fix the query against
-the real response before moving on — do not mock around a real API
-mismatch.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add src/latentedge/ingest/__init__.py src/latentedge/ingest/subgraph.py tests/ingest/__init__.py tests/ingest/test_subgraph.py
-git commit -m "Add Uniswap v3 subgraph ingestion client"
-```
+Dropped during implementation (see the ledger for the full ruling). The
+Graph's decentralized-network gateway turned out to require a paid/metered
+API key — not the anonymous public service the spec assumed. Since Task
+6's direct `eth_getLogs` RPC path already decodes everything the subgraph
+would have provided (price, tick, liquidity, all present in the raw `Swap`
+event) and Task 5 already covers the one remaining gap (base fee) via a
+plain RPC call, the subgraph bought nothing that RPC didn't already cover
+— it was supposed to be the *simpler* option, and stopped being one.
+Ingestion is RPC-only from here. Task 5 (pool-state backfill) now runs
+**after** Task 6 (RPC ingestion) instead of before it, and its scope
+narrows to base-fee-only backfill — see Task 5 below for the fields as
+actually implemented, and Task 6 for the ingestion path that replaces
+this one.
 
 ---
 
-## Task 5: Pool state backfill (liquidity + base fee)
+## Task 5: Pool state backfill (base fee only)
+
+Runs **after** Task 6 now (RPC ingestion already populates `liquidity`
+directly from the raw `Swap` event — see Task 4's drop note). This task's
+scope narrows to the one field RPC logs don't carry: block base fee.
 
 **Files:**
 - Create: `src/latentedge/ingest/pool_state.py`
 - Create: `tests/ingest/test_pool_state.py`
 
 **Interfaces:**
-- Consumes: `list[SwapRecord]` (with `liquidity=0`, `base_fee_wei=0` from
-  Task 4), `config.POOL_ADDRESS`.
-- Produces: `pool_state.backfill_liquidity_and_gas(records:
-  list[SwapRecord], client: httpx.Client) -> list[SwapRecord]` — returns a
-  new list with `liquidity` and `base_fee_wei` populated per-record from
-  an archive RPC provider, via `eth_call` to the pool's `liquidity()` and
-  `eth_getBlockByNumber` for the base fee, at each record's block.
+- Consumes: `list[SwapRecord]` (with `base_fee_wei=0`, `liquidity` already
+  populated, from Task 6).
+- Produces: `pool_state.backfill_base_fee(records: list[SwapRecord],
+  client: httpx.Client, rpc_url: str) -> list[SwapRecord]` — returns a new
+  list with `base_fee_wei` populated per-record via `eth_getBlockByNumber`
+  at each record's block. Leaves every other field, including `liquidity`,
+  untouched.
 
 - [ ] **Step 1: Write the failing test (real integration test)**
 
 ```python
 # tests/ingest/test_pool_state.py
 import httpx
-import pytest
 
-from latentedge.ingest.pool_state import backfill_liquidity_and_gas
+from latentedge.ingest.pool_state import backfill_base_fee
 from latentedge.schema import SwapRecord
 
 RPC_URL = "https://eth.llamarpc.com"  # free public archive-capable endpoint; swap for a paid provider if this proves unreliable
@@ -644,22 +476,22 @@ def _bare_record(block_number: int, timestamp: int) -> SwapRecord:
         log_index=0,
         sqrt_price_x96=1,
         tick=0,
-        liquidity=0,
+        liquidity=123,  # already populated by Task 6; must survive untouched
         amount0=0.0,
         amount1=0.0,
         base_fee_wei=0,
     )
 
 
-def test_backfill_populates_liquidity_and_base_fee():
+def test_backfill_populates_base_fee_and_preserves_liquidity():
     # A real, past mainnet block known to be well within archive range.
     record = _bare_record(block_number=17_500_000, timestamp=1_688_000_000)
     with httpx.Client(timeout=30.0) as client:
-        result = backfill_liquidity_and_gas([record], client)
+        result = backfill_base_fee([record], client, rpc_url=RPC_URL)
 
     assert len(result) == 1
-    assert result[0].liquidity > 0
     assert result[0].base_fee_wei > 0
+    assert result[0].liquidity == 123
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -671,16 +503,15 @@ Expected: FAIL with `ModuleNotFoundError: No module named 'latentedge.ingest.poo
 
 ```python
 # src/latentedge/ingest/pool_state.py
-"""Backfills per-block pool liquidity and base fee via a JSON-RPC archive node."""
+"""Backfills per-block base fee via a JSON-RPC archive node.
+
+Liquidity is populated directly from the raw Swap event during RPC
+ingestion (see ingest.rpc_logs) and is never re-fetched here.
+"""
 
 import httpx
 
-from latentedge import config
 from latentedge.schema import SwapRecord
-
-# Uniswap v3 pool `liquidity()` selector — first 4 bytes of
-# keccak256("liquidity()").
-LIQUIDITY_SELECTOR = "0x1a686502"
 
 
 class PoolStateError(Exception):
@@ -697,27 +528,17 @@ def _rpc_call(client: httpx.Client, rpc_url: str, method: str, params: list) -> 
     return payload["result"]
 
 
-def backfill_liquidity_and_gas(
-    records: list[SwapRecord],
-    client: httpx.Client,
-    rpc_url: str = "https://eth.llamarpc.com",
-) -> list[SwapRecord]:
+def backfill_base_fee(records: list[SwapRecord], client: httpx.Client, rpc_url: str) -> list[SwapRecord]:
     updated: list[SwapRecord] = []
+    block_cache: dict[int, int] = {}
+
     for record in records:
-        block_hex = hex(record.block_number)
+        if record.block_number not in block_cache:
+            block_hex = hex(record.block_number)
+            block = _rpc_call(client, rpc_url, "eth_getBlockByNumber", [block_hex, False])
+            block_cache[record.block_number] = int(block["baseFeePerGas"], 16)
 
-        liquidity_hex = _rpc_call(
-            client,
-            rpc_url,
-            "eth_call",
-            [{"to": config.POOL_ADDRESS, "data": LIQUIDITY_SELECTOR}, block_hex],
-        )
-        liquidity = int(liquidity_hex, 16)
-
-        block = _rpc_call(client, rpc_url, "eth_getBlockByNumber", [block_hex, False])
-        base_fee_wei = int(block["baseFeePerGas"], 16)
-
-        updated.append(record.model_copy(update={"liquidity": liquidity, "base_fee_wei": base_fee_wei}))
+        updated.append(record.model_copy(update={"base_fee_wei": block_cache[record.block_number]}))
     return updated
 ```
 
@@ -733,15 +554,20 @@ the real service.
 
 ```bash
 git add src/latentedge/ingest/pool_state.py tests/ingest/test_pool_state.py
-git commit -m "Backfill per-block liquidity and base fee from an archive RPC"
+git commit -m "Backfill per-block base fee from an archive RPC"
 ```
 
 ---
 
-## Task 6: Direct RPC fallback ingestion (eth_getLogs)
+## Task 6: Direct RPC ingestion (eth_getLogs)
+
+First task to touch the `ingest` package now that Task 4 is dropped — its
+`__init__.py` marker files are created here.
 
 **Files:**
+- Create: `src/latentedge/ingest/__init__.py`
 - Create: `src/latentedge/ingest/rpc_logs.py`
+- Create: `tests/ingest/__init__.py`
 - Create: `tests/ingest/test_rpc_logs.py`
 
 **Interfaces:**
@@ -870,7 +696,7 @@ def fetch_swaps(pool_address: str, from_block: int, to_block: int, client: httpx
                 liquidity=liquidity,
                 amount0=amount0,
                 amount1=amount1,
-                base_fee_wei=0,  # populate via ingest.pool_state.backfill_liquidity_and_gas
+                base_fee_wei=0,  # populate via ingest.pool_state.backfill_base_fee
             )
         )
 
@@ -888,8 +714,8 @@ in word offsets.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/latentedge/ingest/rpc_logs.py tests/ingest/test_rpc_logs.py
-git commit -m "Add direct eth_getLogs fallback ingestion"
+git add src/latentedge/ingest/__init__.py src/latentedge/ingest/rpc_logs.py tests/ingest/__init__.py tests/ingest/test_rpc_logs.py
+git commit -m "Add direct eth_getLogs RPC ingestion"
 ```
 
 ---
@@ -2211,8 +2037,8 @@ import pandas as pd
 from latentedge import config
 from latentedge.bars import build_bars
 from latentedge.features import compute_features
-from latentedge.ingest.pool_state import backfill_liquidity_and_gas
-from latentedge.ingest.subgraph import fetch_swaps
+from latentedge.ingest.pool_state import backfill_base_fee
+from latentedge.ingest.rpc_logs import fetch_swaps
 from latentedge.labeling import label_bars
 from latentedge.model import NetReturnRegressor, save, train as train_model
 from latentedge.split import chronological_split
@@ -2224,15 +2050,19 @@ def cli() -> None:
     """latentedge: ingest, train, and backtest the v1 WETH/USDC pipeline."""
 
 
+DEFAULT_RPC_URL = "https://eth.llamarpc.com"
+
+
 @cli.command()
-@click.option("--start", type=int, required=True, help="Unix timestamp, inclusive.")
-@click.option("--end", type=int, required=True, help="Unix timestamp, exclusive.")
+@click.option("--from-block", type=int, required=True)
+@click.option("--to-block", type=int, required=True)
+@click.option("--rpc-url", type=str, default=DEFAULT_RPC_URL)
 @click.option("--out", type=click.Path(path_type=Path), default=Path("data/swaps.parquet"))
-def ingest(start: int, end: int, out: Path) -> None:
+def ingest(from_block: int, to_block: int, rpc_url: str, out: Path) -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
     with httpx.Client(timeout=30.0) as client:
-        records = fetch_swaps(config.POOL_ADDRESS, start, end, client)
-        records = backfill_liquidity_and_gas(records, client)
+        records = fetch_swaps(config.POOL_ADDRESS, from_block, to_block, client, rpc_url)
+        records = backfill_base_fee(records, client, rpc_url)
     write_swaps(records, out)
     click.echo(f"wrote {len(records)} swap records to {out}")
 
