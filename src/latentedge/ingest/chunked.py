@@ -20,15 +20,26 @@ from pathlib import Path
 
 import httpx
 
-from latentedge.ingest.rpc_logs import fetch_swaps
+from latentedge.ingest.rpc_logs import RateLimitError, fetch_swaps
 from latentedge.schema import SwapRecord
 from latentedge.store import write_swaps
 
 DEFAULT_CHUNK_SIZE = 10  # Alchemy's free-tier eth_getLogs cap; verified against the real service
-DEFAULT_MAX_RETRIES = 3
+DEFAULT_MAX_RETRIES = 5
 DEFAULT_RETRY_BACKOFF_SECONDS = 2.0
-DEFAULT_MAX_WORKERS = 8
-DEFAULT_FLUSH_EVERY_N_CHUNKS = 200
+# A rate limit retried on the same short schedule as a generic transient
+# error just re-triggers the same limit (observed for real against
+# Alchemy's free tier) — back off substantially longer for it.
+RATE_LIMIT_BACKOFF_MULTIPLIER = 5.0
+# Lower than earlier default (8): fewer concurrent workers means fewer
+# simultaneous requests competing for the same per-second compute-unit
+# budget, observed for real to matter more than backoff tuning alone.
+DEFAULT_MAX_WORKERS = 4
+# Lower than earlier default (200): a chunk that ultimately can't
+# recover from a rate limit no longer loses unflushed progress (see
+# ingest_range's finally-block flush), but flushing more often still
+# bounds how much work a mid-run interruption could repeat on resume.
+DEFAULT_FLUSH_EVERY_N_CHUNKS = 50
 
 FetchFn = Callable[[str, int, int, httpx.Client, str], list[SwapRecord]]
 
@@ -71,7 +82,10 @@ def _fetch_chunk_with_retries(
             if attempt < max_retries - 1:
                 if on_retry is not None:
                     on_retry()
-                time.sleep(backoff_seconds * (2**attempt))
+                sleep_seconds = backoff_seconds * (2**attempt)
+                if isinstance(exc, RateLimitError):
+                    sleep_seconds *= RATE_LIMIT_BACKOFF_MULTIPLIER
+                time.sleep(sleep_seconds)
     assert last_error is not None
     raise last_error
 
@@ -169,11 +183,15 @@ def ingest_range(
         finally:
             # A chunk that exhausted its retries raises out of
             # future.result() above; cancel whatever hasn't started yet
-            # rather than let the pool keep firing more requests.
+            # rather than let the pool keep firing more requests. Flush
+            # here too (not only on the success path below) — an
+            # exception propagating past this block must never discard
+            # chunks that already succeeded since the last flush; a
+            # rate-limited chunk failing after hundreds of real,
+            # already-fetched chunks would otherwise lose all of them.
             for f in futures:
                 f.cancel()
-
-    with lock:
-        flush()
+            with lock:
+                flush()
 
     return total_written

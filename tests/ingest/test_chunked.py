@@ -6,7 +6,7 @@ import httpx
 import pytest
 
 from latentedge.ingest.chunked import ingest_range, read_progress
-from latentedge.ingest.rpc_logs import RpcLogsError
+from latentedge.ingest.rpc_logs import RateLimitError, RpcLogsError
 from latentedge.schema import SwapRecord
 from latentedge.store import read_swaps
 
@@ -247,6 +247,37 @@ def test_ingest_range_progress_never_exceeds_what_was_actually_flushed(tmp_path:
     assert progress is None or progress < 190  # nowhere near chunk 15's block range
 
 
+def test_ingest_range_backs_off_longer_for_rate_limit_errors(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    # A rate-limited request retried on the same short schedule as a
+    # generic transient error just re-triggers the same limit — this
+    # was observed for real against a live provider (see the on_retry
+    # ledger in this project's memory). Rate limits must back off
+    # noticeably longer.
+    sleeps: list[float] = []
+    monkeypatch.setattr("latentedge.ingest.chunked.time.sleep", lambda seconds: sleeps.append(seconds))
+
+    attempts = {"count": 0}
+
+    def rate_limited_fetch(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str) -> list[SwapRecord]:
+        attempts["count"] += 1
+        if attempts["count"] < 3:
+            raise RateLimitError("simulated rate limit")
+        return [_record(from_block, 0)]
+
+    out_path = tmp_path / "swaps.parquet"
+    with httpx.Client() as client:
+        ingest_range(
+            pool_address="0xpool", from_block=0, to_block=99, out_path=out_path,
+            client=client, rpc_url="http://fake", chunk_size=100, max_workers=1,
+            fetch_fn=rate_limited_fetch, max_retries=5, retry_backoff_seconds=1.0,
+        )
+
+    # Two retries happened (attempts 1 and 2 failed); both backoffs must
+    # be well beyond the plain (non-rate-limited) schedule of 1s, 2s.
+    assert len(sleeps) == 2
+    assert all(s >= 5.0 for s in sleeps)
+
+
 def test_ingest_range_calls_on_retry_for_each_failed_attempt(tmp_path: Path):
     attempts = {"count": 0}
     lock = threading.Lock()
@@ -276,3 +307,34 @@ def test_ingest_range_calls_on_retry_for_each_failed_attempt(tmp_path: Path):
 
     # 3 attempts total means 2 failed-then-retried attempts.
     assert retry_calls["count"] == 2
+
+
+def test_ingest_range_flushes_completed_chunks_before_raising_on_a_later_failure(tmp_path: Path):
+    # Regression test: a single chunk exhausting its retries must not
+    # discard every chunk that already succeeded since the last flush —
+    # otherwise a real run that fetches hundreds of chunks successfully
+    # loses all of them the moment one chunk hits a rate limit it can't
+    # recover from in time.
+    call_count = {"n": 0}
+
+    def succeed_then_fail(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str) -> list[SwapRecord]:
+        call_count["n"] += 1
+        if call_count["n"] > 5:
+            raise RpcLogsError("simulated persistent rate limit")
+        return [_record(from_block, 0)]
+
+    out_path = tmp_path / "swaps.parquet"
+    with httpx.Client() as client:
+        with pytest.raises(RpcLogsError):
+            ingest_range(
+                pool_address="0xpool", from_block=0, to_block=99, out_path=out_path,
+                client=client, rpc_url="http://fake", chunk_size=10, max_workers=1,
+                flush_every_n_chunks=100,  # never reached — only the failure-path flush matters here
+                max_retries=1, fetch_fn=succeed_then_fail,
+            )
+
+    # The 5 chunks that succeeded before the 6th chunk's failure must
+    # have been written to disk and their watermark recorded, even
+    # though the whole call ultimately raised.
+    assert read_progress(out_path) == 49  # end of the 5th chunk (blocks 0-49)
+    assert len(read_swaps(out_path)) == 5

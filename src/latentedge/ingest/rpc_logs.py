@@ -18,8 +18,19 @@ class RpcLogsError(Exception):
     pass
 
 
+class RateLimitError(RpcLogsError):
+    """The provider rejected a request for exceeding its rate/throughput
+    limit — either an HTTP 429, or (observed on Alchemy) an HTTP 200
+    whose JSON-RPC batch response carries a {"code": 429, ...} error on
+    individual entries. Retried with a longer backoff than other
+    errors, since a short retry just re-triggers the same limit.
+    """
+
+
 def _rpc_call(client: httpx.Client, rpc_url: str, method: str, params: list[Any]) -> Any:
     response = client.post(rpc_url, json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
+    if response.status_code == 429:
+        raise RateLimitError(f"RPC rate limited (HTTP 429): {response.text}")
     if response.status_code != 200:
         raise RpcLogsError(f"RPC returned HTTP {response.status_code}: {response.text}")
     payload = response.json()
@@ -53,6 +64,8 @@ def _batch_fetch_blocks(block_numbers: list[int], client: httpx.Client, rpc_url:
             for block_number in batch
         ]
         response = client.post(rpc_url, json=payload)
+        if response.status_code == 429:
+            raise RateLimitError(f"RPC rate limited (HTTP 429): {response.text}")
         if response.status_code != 200:
             raise RpcLogsError(f"RPC returned HTTP {response.status_code}: {response.text}")
 
@@ -64,6 +77,8 @@ def _batch_fetch_blocks(block_numbers: list[int], client: httpx.Client, rpc_url:
             if entry is None:
                 raise RpcLogsError(f"batch response missing block {block_number}")
             if "error" in entry:
+                if entry["error"].get("code") == 429:
+                    raise RateLimitError(f"RPC rate limited for block {block_number}: {entry['error']}")
                 raise RpcLogsError(f"RPC error for block {block_number}: {entry['error']}")
 
             block = entry["result"]

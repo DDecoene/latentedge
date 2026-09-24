@@ -1,8 +1,9 @@
 import httpx
+import pytest
 
 from latentedge import config
-from latentedge.ingest.rpc_logs import fetch_swaps, get_latest_block
-from latentedge.ingest.rpc_logs import _batch_fetch_blocks
+from latentedge.ingest.rpc_logs import RateLimitError, fetch_swaps, get_latest_block
+from latentedge.ingest.rpc_logs import _batch_fetch_blocks, _rpc_call
 
 RPC_URL = "https://ethereum.publicnode.com"
 
@@ -79,3 +80,42 @@ def test_get_latest_block_returns_a_plausible_recent_block_number():
     # Two separate calls a moment apart won't return the exact same
     # block on a live chain — assert they're close instead of equal.
     assert abs(latest - reference) < 20
+
+
+def _mock_client(handler) -> httpx.Client:
+    return httpx.Client(transport=httpx.MockTransport(handler))
+
+
+def test_rpc_call_raises_rate_limit_error_on_http_429():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, text="rate limited")
+
+    with _mock_client(handler) as client:
+        with pytest.raises(RateLimitError):
+            _rpc_call(client, RPC_URL, "eth_blockNumber", [])
+
+
+def test_batch_fetch_blocks_raises_rate_limit_error_on_http_429():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, text="rate limited")
+
+    with _mock_client(handler) as client:
+        with pytest.raises(RateLimitError):
+            _batch_fetch_blocks([1, 2, 3], client, RPC_URL)
+
+
+def test_batch_fetch_blocks_raises_rate_limit_error_on_embedded_429_code():
+    # Real observed behavior (Alchemy): the HTTP status is 200, but an
+    # individual entry in the JSON-RPC batch response carries a
+    # {"code": 429, ...} error when compute-unit throughput is exceeded.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=[
+                {"jsonrpc": "2.0", "id": 1, "error": {"code": 429, "message": "compute units exceeded"}},
+            ],
+        )
+
+    with _mock_client(handler) as client:
+        with pytest.raises(RateLimitError):
+            _batch_fetch_blocks([1], client, RPC_URL)
