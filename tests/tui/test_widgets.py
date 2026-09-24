@@ -1,7 +1,9 @@
 import pytest
 from textual.app import App, ComposeResult
 
-from latentedge.tui.widgets import ProgressPanel, StatsPanel, format_eta
+from textual.widgets import RichLog
+
+from latentedge.tui.widgets import LogPanel, ProgressPanel, StatsPanel, format_eta
 
 
 class _ProgressPanelHarness(App[None]):
@@ -74,3 +76,34 @@ async def test_stats_panel_renders_label_value_rows():
     assert "File size: 12.3 MB" in text
     assert "Free disk: 45.6 GB" in text
     assert "Retries: 2" in text
+
+
+class _LogPanelHarness(App[None]):
+    def compose(self) -> ComposeResult:
+        yield LogPanel(id="log")
+
+
+@pytest.mark.asyncio
+async def test_log_panel_appends_lines():
+    app = _LogPanelHarness()
+    async with app.run_test() as pilot:
+        panel = app.query_one(LogPanel)
+        panel.log_line("blocks 0-9: 3 swaps")
+        panel.log_line("blocks 10-19: 0 swaps")
+        await pilot.pause()
+        rich_log = app.query_one(RichLog)
+
+    assert len(rich_log.lines) == 2
+
+
+@pytest.mark.asyncio
+async def test_log_panel_caps_scrollback():
+    app = _LogPanelHarness()
+    async with app.run_test() as pilot:
+        panel = app.query_one(LogPanel)
+        for i in range(2500):
+            panel.log_line(f"line {i}")
+        await pilot.pause()
+        rich_log = app.query_one(RichLog)
+
+    assert len(rich_log.lines) <= 2000

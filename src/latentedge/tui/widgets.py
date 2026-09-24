@@ -3,7 +3,9 @@
 from textual.app import ComposeResult
 from textual.containers import Vertical
 from textual.widget import Widget
-from textual.widgets import ProgressBar, Static
+from textual.widgets import ProgressBar, RichLog, Static
+
+MAX_LOG_LINES = 2000
 
 
 def format_eta(seconds_remaining: float | None) -> str:
@@ -56,3 +58,13 @@ class StatsPanel(Widget):
     def update_stats(self, rows: list[tuple[str, str]]) -> None:
         text = "\n".join(f"{label}: {value}" for label, value in rows)
         self.query_one(f"#{self.id}-body", Static).update(text)
+
+
+class LogPanel(Widget):
+    """A bounded scrolling feed of recent discrete events."""
+
+    def compose(self) -> ComposeResult:
+        yield RichLog(max_lines=MAX_LOG_LINES, id=f"{self.id}-body")
+
+    def log_line(self, text: str) -> None:
+        self.query_one(f"#{self.id}-body", RichLog).write(text)
