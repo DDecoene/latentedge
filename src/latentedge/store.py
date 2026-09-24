@@ -13,7 +13,14 @@ DEDUPE_KEYS = ["tx_hash", "log_index"]
 BIG_INT_COLUMNS = ["sqrt_price_x96", "liquidity"]
 
 
+class EmptyIngestError(Exception):
+    pass
+
+
 def write_swaps(records: list[SwapRecord], path: Path) -> None:
+    if not records:
+        raise EmptyIngestError("no swap records to write — an empty block range or a data-source issue upstream, not a valid ingest result")
+
     new_df = pd.DataFrame([r.model_dump() for r in records])
     for column in BIG_INT_COLUMNS:
         new_df[column] = new_df[column].astype(str)

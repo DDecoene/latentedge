@@ -1,9 +1,10 @@
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from latentedge.schema import SwapRecord
-from latentedge.store import read_swaps, write_swaps
+from latentedge.store import EmptyIngestError, read_swaps, write_swaps
 
 
 def _record(tx_hash: str, log_index: int, timestamp: int) -> SwapRecord:
@@ -36,3 +37,15 @@ def test_write_dedupes_on_tx_hash_and_log_index(tmp_path: Path):
     df = read_swaps(path)
     assert len(df) == 2
     assert set(df["tx_hash"]) == {"0xabc", "0xdef"}
+
+
+def test_write_empty_swaps_raises_clear_error_instead_of_writing_nothing(tmp_path: Path):
+    # Regression: an empty result (e.g. a block range with no real swaps)
+    # used to write silently, producing a file that read_swaps would
+    # later choke on with an opaque KeyError far from the actual cause.
+    # This fails loudly, at the point where the problem actually is —
+    # matching the plan's Review Focus item on empty/near-empty history.
+    path = tmp_path / "swaps.parquet"
+    with pytest.raises(EmptyIngestError):
+        write_swaps([], path)
+    assert not path.exists()
