@@ -8,7 +8,14 @@ from dotenv import load_dotenv
 from latentedge import config
 from latentedge.bars import build_bars
 from latentedge.features import compute_feature_stats, save_feature_stats, standardize_features
-from latentedge.ingest.chunked import DEFAULT_CHUNK_SIZE, DEFAULT_MAX_RETRIES, DEFAULT_RETRY_BACKOFF_SECONDS, ingest_range
+from latentedge.ingest.chunked import (
+    DEFAULT_CHUNK_SIZE,
+    DEFAULT_FLUSH_EVERY_N_CHUNKS,
+    DEFAULT_MAX_RETRIES,
+    DEFAULT_MAX_WORKERS,
+    DEFAULT_RETRY_BACKOFF_SECONDS,
+    ingest_range,
+)
 from latentedge.model import NetReturnRegressor, save
 from latentedge.model import train as train_model
 from latentedge.split import chronological_split
@@ -42,15 +49,28 @@ DEFAULT_RPC_URL = "https://ethereum.publicnode.com"
     help="An archive-capable RPC endpoint for ranges reaching back further than a few hours (e.g. an Alchemy/Infura URL) — free public endpoints gate deep history behind a paid token. Falls back to the LATENTEDGE_RPC_URL env var (or a .env file) if omitted, so a provider key never needs to appear as a bare CLI argument.",
 )
 @click.option("--out", type=click.Path(path_type=Path), default=Path("data/swaps.parquet"))
-@click.option("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE, help="Blocks per eth_getLogs call — keep well under your provider's per-call limit.")
+@click.option("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE, help="Blocks per eth_getLogs call — keep at or under your provider's per-call limit (10 on Alchemy's free tier).")
+@click.option("--max-workers", type=int, default=DEFAULT_MAX_WORKERS, help="Concurrent chunk requests — at a small chunk size, a large range needs this to finish in a reasonable time.")
+@click.option("--flush-every-n-chunks", type=int, default=DEFAULT_FLUSH_EVERY_N_CHUNKS, help="Batches writes to the output file — writing after every chunk would mean rewriting the whole file hundreds of thousands of times over a large range.")
 @click.option("--max-retries", type=int, default=DEFAULT_MAX_RETRIES)
 @click.option("--retry-backoff-seconds", type=float, default=DEFAULT_RETRY_BACKOFF_SECONDS)
-def ingest(from_block: int, to_block: int, rpc_url: str, out: Path, chunk_size: int, max_retries: int, retry_backoff_seconds: float) -> None:
+def ingest(
+    from_block: int,
+    to_block: int,
+    rpc_url: str,
+    out: Path,
+    chunk_size: int,
+    max_workers: int,
+    flush_every_n_chunks: int,
+    max_retries: int,
+    retry_backoff_seconds: float,
+) -> None:
     # A large range (e.g. a year of history) needs chunking to respect
-    # provider limits and resumability to survive a multi-hour run being
-    # interrupted — see ingest.chunked for the real logic; fetch_swaps
-    # already populates base_fee_wei from the same eth_getBlockByNumber
-    # call it makes for each block's timestamp, no separate backfill pass.
+    # provider limits, concurrency to finish in a reasonable time, and
+    # resumability to survive a multi-hour run being interrupted — see
+    # ingest.chunked for the real logic; fetch_swaps already populates
+    # base_fee_wei from the same eth_getBlockByNumber call it makes for
+    # each block's timestamp, no separate backfill pass.
     out.parent.mkdir(parents=True, exist_ok=True)
 
     def report(chunk_start: int, chunk_end: int, count: int) -> None:
@@ -60,6 +80,7 @@ def ingest(from_block: int, to_block: int, rpc_url: str, out: Path, chunk_size: 
         total = ingest_range(
             config.POOL_ADDRESS, from_block, to_block, out, client, rpc_url,
             chunk_size=chunk_size, max_retries=max_retries, retry_backoff_seconds=retry_backoff_seconds,
+            max_workers=max_workers, flush_every_n_chunks=flush_every_n_chunks,
             on_progress=report,
         )
     click.echo(f"wrote {total} new swap records to {out}")
