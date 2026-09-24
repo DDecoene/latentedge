@@ -42,6 +42,15 @@ pub fn render_lines(state: &BotState) -> DashboardLines {
         lines.push("!!! KILL SWITCH ACTIVE !!!".to_string());
     }
 
+    match &state.position {
+        Some(p) => lines.push(format!("position: holding size={} entry_cost={}", p.size, p.entry_cost)),
+        None => lines.push("position: flat".to_string()),
+    }
+    lines.push(format!(
+        "wallet: equity={} (starting_capital={} realized_pnl={})",
+        state.wallet.equity(), state.wallet.starting_capital, state.wallet.realized_pnl
+    ));
+
     lines.push(format!("recent trades ({})", state.recent_trades.len()));
     for trade in state.recent_trades.iter().rev().take(10) {
         lines.push(format!(
@@ -181,5 +190,29 @@ mod tests {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let key = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
         assert!(!is_quit_key(key));
+    }
+
+    #[test]
+    fn shows_flat_when_no_position() {
+        let state = BotState::new();
+        let lines = render_lines(&state);
+        assert!(lines.lines.iter().any(|l| l.to_lowercase().contains("flat")));
+    }
+
+    #[test]
+    fn shows_position_size_and_entry_cost_when_holding() {
+        let mut state = BotState::new();
+        state.position = Some(crate::types::Position { size: 5_000_000, entry_cost: 1000 });
+        let lines = render_lines(&state);
+        assert!(lines.lines.iter().any(|l| l.contains("5000000") || l.contains("5_000_000")));
+        assert!(lines.lines.iter().any(|l| l.contains("1000")));
+    }
+
+    #[test]
+    fn shows_current_equity() {
+        let mut state = BotState::new();
+        state.wallet = crate::types::WalletState { starting_capital: 1000, realized_pnl: 250 };
+        let lines = render_lines(&state);
+        assert!(lines.lines.iter().any(|l| l.to_lowercase().contains("equity") && l.contains("1250")));
     }
 }
