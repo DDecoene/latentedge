@@ -55,10 +55,10 @@ impl Config {
             laya_confidence_threshold: get_or("LAYA_CONFIDENCE_THRESHOLD", "0.85").parse()?,
             execution_mode,
             solana_keypair_path: vars.get("SOLANA_KEYPAIR_PATH").cloned().filter(|s| !s.is_empty()),
-            max_trade_size: get_or("MAX_TRADE_SIZE", "500000000").parse()?,
+            max_trade_size: get_or("MAX_TRADE_SIZE", "200000000").parse()?,
             max_trades_per_window: get_or("MAX_TRADES_PER_WINDOW", "5").parse()?,
             max_slippage_bps: get_or("MAX_SLIPPAGE_BPS", "50").parse()?,
-            max_daily_loss: get_or("MAX_DAILY_LOSS", "500000000").parse()?,
+            max_daily_loss: get_or("MAX_DAILY_LOSS", "50000000").parse()?,
             kill_switch_path: get_or("KILL_SWITCH_PATH", "./KILL_SWITCH"),
             jupiter_base_url: get_or("JUPITER_BASE_URL", "https://quote-api.jup.ag/v6"),
             base_mint: get_or("BASE_MINT", "So11111111111111111111111111111111111111112"),
@@ -198,8 +198,13 @@ mod tests {
             "MAX_TRADE_SIZE default ({}) must exceed a default buy's spend ({})",
             config.max_trade_size, default_buy_spend
         );
-        assert_eq!(config.max_trade_size, 500_000_000);
-        assert_eq!(config.max_daily_loss, 500_000_000);
+        // Reviewed and tightened from an earlier fix (500_000_000 each):
+        // half of starting capital is too loose for a live safety rail,
+        // even though it correctly unblocked the default buy. 2x the
+        // default buy and 5% of starting capital are meaningful caps
+        // while still comfortably clearing a default trade.
+        assert_eq!(config.max_trade_size, 200_000_000);
+        assert_eq!(config.max_daily_loss, 50_000_000);
     }
 
     #[test]

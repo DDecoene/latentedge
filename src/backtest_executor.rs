@@ -5,11 +5,20 @@ use crate::phoenix_decode::decode_from_ladder_json;
 use crate::types::{Position, TradeEvent, WalletState};
 use chrono::{DateTime, Utc};
 
+/// Matches `JupiterQuotePoller::fetch`'s convention exactly: `ask` is the
+/// base-atom amount received for spending 1 USDC (1_000_000 quote atoms)
+/// — i.e. lamports-per-USDC, the inverse of a USD-per-SOL spot price —
+/// not a scaled USD price. Feeding Laya anything else would mean the
+/// backtest answers a different question than live does.
 pub fn synthetic_ladder_json(spot_price: f64, cost_bps: u32) -> String {
-    let price_atoms = (spot_price * 1_000_000.0).round().max(0.0) as u64;
-    let cost_atoms = ((price_atoms as f64) * (cost_bps as f64) / 10_000.0).round().max(1.0) as u64;
-    let bid = price_atoms.saturating_sub(cost_atoms);
-    let ask = price_atoms.saturating_add(cost_atoms);
+    let ask = if spot_price > 0.0 {
+        (1_000_000_000.0 / spot_price).round().max(0.0) as u64
+    } else {
+        u64::MAX
+    };
+    let cost_frac = cost_bps as f64 / 10_000.0;
+    let impact_atoms = ((ask as f64) * cost_frac).round().max(1.0) as u64;
+    let bid = ask.saturating_sub(impact_atoms);
     serde_json::json!({
         "bids": [[bid, 1]],
         "asks": [[ask, 1]],
@@ -116,6 +125,12 @@ pub struct BacktestState {
     pub equity_curve: Vec<f64>,
     pub wins: u32,
     pub losses: u32,
+    /// Ticks where Laya returned `confidence == 0.0` — this includes both
+    /// a genuine zero-confidence answer and a failed/timed-out call
+    /// (`LayaClient::get_signal` collapses both to the same value), so a
+    /// high count here is a signal to check the Laya server's health or
+    /// latency, not proof the strategy itself was simply inactive.
+    pub zero_confidence_predicts: u32,
 }
 
 impl BacktestState {
@@ -129,6 +144,7 @@ impl BacktestState {
             equity_curve: Vec::new(),
             wins: 0,
             losses: 0,
+            zero_confidence_predicts: 0,
         }
     }
 
@@ -157,6 +173,26 @@ impl BacktestState {
         }
         (self.wallet.starting_capital as f64) * (current / initial)
     }
+
+    /// `wallet.equity()` alone ignores an open position — a buy never
+    /// debits the wallet, it only records `Position`, so while holding,
+    /// `wallet.equity()` is stale (last updated at the previous sell).
+    /// This marks the open position to the last-replayed price: the
+    /// capital that bought it (`entry_cost`) is backed out and replaced
+    /// with what that position is worth right now.
+    pub fn mark_to_market_equity(&self) -> u64 {
+        let Some(p) = self.position else {
+            return self.wallet.equity();
+        };
+        if self.prices.is_empty() {
+            return self.wallet.equity();
+        }
+        let last_index = self.current_index.saturating_sub(1).min(self.prices.len() - 1);
+        let spot_price = self.prices[last_index].1.max(0.0);
+        let sol_amount = p.size as f64 / BASE_ATOMS_PER_UNIT;
+        let position_value = (sol_amount * spot_price * QUOTE_ATOMS_PER_UNIT) as u64;
+        ((self.wallet.equity() as i64) - (p.entry_cost as i64) + (position_value as i64)).max(0) as u64
+    }
 }
 
 pub async fn advance_one_tick(
@@ -170,11 +206,16 @@ pub async fn advance_one_tick(
     }
     let (timestamp, spot_price) = state.prices[state.current_index];
     let raw_json = synthetic_ladder_json(spot_price, config.backtest_cost_bps);
-    let mut snapshot = decode_from_ladder_json("backtest", state.current_index as u64, &raw_json)
+    let market = format!("{}/{}", config.base_mint, config.quote_mint);
+    let slot = timestamp.timestamp().max(0) as u64;
+    let mut snapshot = decode_from_ladder_json(&market, slot, &raw_json)
         .expect("synthetic ladder must always be valid — bid<ask guaranteed by construction");
     snapshot.timestamp = timestamp;
 
     let sig = laya.get_signal(&snapshot).await;
+    if sig.confidence == 0.0 {
+        state.zero_confidence_predicts += 1;
+    }
 
     if sig.should_trade {
         let prev_realized = state.wallet.realized_pnl;
@@ -194,8 +235,8 @@ pub async fn advance_one_tick(
         state.trades.push(event);
     }
 
-    state.equity_curve.push(state.wallet.equity() as f64);
     state.current_index += 1;
+    state.equity_curve.push(state.mark_to_market_equity() as f64);
     true
 }
 
@@ -230,6 +271,24 @@ mod tests {
         let raw = synthetic_ladder_json(0.0, 15);
         let snapshot = decode_from_ladder_json("backtest", 0, &raw).expect("must still be valid");
         assert!(snapshot.bids[0].0 < snapshot.asks[0].0);
+    }
+
+    #[test]
+    fn ladder_matches_the_live_pollers_convention() {
+        // Live's JupiterQuotePoller::fetch quotes spending 1 USDC
+        // (1_000_000 quote atoms) into base_mint and uses the returned
+        // base-atom amount as `ask` — i.e. ask = lamports of SOL per 1
+        // USDC, the inverse of a USD-per-SOL spot price, not a scaled
+        // USD price. At $100/SOL, 1 USDC buys 0.01 SOL = 10_000_000
+        // lamports. The backtest must feed Laya the same magnitude and
+        // direction, or it's answering a different question than live.
+        let raw = synthetic_ladder_json(100.0, 15);
+        let snapshot = decode_from_ladder_json("backtest", 0, &raw).expect("must be valid");
+        let (ask, _) = snapshot.asks[0];
+        assert!(
+            (9_900_000..=10_100_000).contains(&ask),
+            "ask should be ~10_000_000 lamports (1 USDC worth of SOL at $100), got {ask}"
+        );
     }
 
     #[test]
@@ -422,5 +481,92 @@ mod tests {
         assert!(state.position.is_some());
         assert_eq!(state.trades.len(), 1);
         assert_eq!(state.trades[0].side, "buy");
+    }
+
+    #[test]
+    fn mark_to_market_equals_wallet_equity_when_flat() {
+        let state = BacktestState::new(sample_prices(), flat_wallet(1000));
+        assert_eq!(state.mark_to_market_equity(), 1000);
+    }
+
+    #[test]
+    fn mark_to_market_reflects_an_open_positions_current_value() {
+        let mut state = BacktestState::new(vec![(Utc::now(), 100.0), (Utc::now(), 110.0)], flat_wallet(1_000_000_000));
+        // Bought 1 SOL for $100 (entry_cost 100_000_000); price is now $110.
+        state.position = Some(Position { size: 1_000_000_000, entry_cost: 100_000_000 });
+        state.current_index = 2; // both ticks "replayed" — last price is prices[1] = 110.0
+
+        // 1000 (unchanged wallet.equity()) - 100 (entry_cost) + 110 (current value) = 1010
+        assert_eq!(state.mark_to_market_equity(), 1_010_000_000);
+    }
+
+    #[test]
+    fn mark_to_market_matches_wallet_equity_at_the_unchanged_entry_price() {
+        let mut state = BacktestState::new(vec![(Utc::now(), 100.0)], flat_wallet(1_000_000_000));
+        state.position = Some(Position { size: 1_000_000_000, entry_cost: 100_000_000 });
+        state.current_index = 1; // last price is prices[0] = 100.0, same as the buy price
+
+        // Converting cash to SOL and back at the same price changes nothing.
+        assert_eq!(state.mark_to_market_equity(), 1_000_000_000);
+    }
+
+    #[tokio::test]
+    async fn advance_one_tick_pushes_mark_to_market_equity_not_stale_wallet_equity() {
+        // Tick 1: high confidence, buys and opens a position. Tick 2: low
+        // confidence, no trade — the position stays open while the price
+        // rises to 110. If equity_curve read the stale wallet.equity()
+        // instead of the mark-to-market value, tick 2 would wrongly still
+        // show 1_000_000_000 even though the open position is now worth
+        // more.
+        let buy_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/predict"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"confidence": 0.99})))
+            .mount(&buy_server)
+            .await;
+        let hold_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/predict"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"confidence": 0.1})))
+            .mount(&hold_server)
+            .await;
+
+        let buy_laya = LayaClient::new(buy_server.uri(), 0.85);
+        let hold_laya = LayaClient::new(hold_server.uri(), 0.85);
+        let mut config = test_config();
+        config.backtest_cost_bps = 0;
+        let mut guard = SafetyGuardState::new();
+        let mut state = BacktestState::new(
+            vec![(Utc::now(), 100.0), (Utc::now(), 110.0)],
+            flat_wallet(1_000_000_000),
+        );
+
+        advance_one_tick(&mut state, &config, &mut guard, &buy_laya).await; // buys
+        assert_eq!(state.equity_curve[0], 1_000_000_000.0, "buying alone doesn't change equity");
+
+        advance_one_tick(&mut state, &config, &mut guard, &hold_laya).await; // below threshold: still holding
+        assert!(state.position.is_some(), "position must still be open");
+        assert_eq!(
+            state.equity_curve[1], 1_010_000_000.0,
+            "equity_curve must mark the open position to the new price, not repeat stale wallet.equity()"
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_confidence_predicts_are_counted() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/predict"))
+            .respond_with(ResponseTemplate::new(500)) // a failed call collapses to confidence 0.0
+            .mount(&server)
+            .await;
+        let laya = LayaClient::new(server.uri(), 0.85);
+        let config = test_config();
+        let mut guard = SafetyGuardState::new();
+        let mut state = BacktestState::new(vec![(Utc::now(), 100.0)], flat_wallet(1_000_000_000));
+
+        advance_one_tick(&mut state, &config, &mut guard, &laya).await;
+
+        assert_eq!(state.zero_confidence_predicts, 1);
     }
 }

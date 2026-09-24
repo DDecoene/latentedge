@@ -7,22 +7,30 @@ use layatrade_rs::laya_client::LayaClient;
 use layatrade_rs::types::WalletState;
 
 fn format_summary(state: &BacktestState) -> String {
+    let position_note = if state.position.is_some() {
+        " (a position was still open at the end — marked to the last replayed price)"
+    } else {
+        ""
+    };
     format!(
         "Backtest complete: {}/{} ticks replayed\n\
-         Final equity: {} (started at {})\n\
+         Final equity: {} (mark-to-market, started at {}){}\n\
          Buy & hold would be worth: {:.0}\n\
          Trades: {} (wins {} / losses {}, win rate {:.1}%)\n\
-         Realized P&L: {}",
+         Realized P&L: {}\n\
+         Zero-confidence Laya predicts: {} (includes any failed/timed-out calls, not just genuine zero answers)",
         state.current_index,
         state.prices.len(),
-        state.wallet.equity(),
+        state.mark_to_market_equity(),
         state.wallet.starting_capital,
+        position_note,
         state.buy_and_hold_equity(),
         state.trades.len(),
         state.wins,
         state.losses,
         state.win_rate() * 100.0,
         state.wallet.realized_pnl,
+        state.zero_confidence_predicts,
     )
 }
 

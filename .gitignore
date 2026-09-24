@@ -4,3 +4,5 @@
 /laya_server/.venv
 __pycache__/
 *.pyc
+/backtest_cache/
+/logs/
