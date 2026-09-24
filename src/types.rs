@@ -32,6 +32,30 @@ pub struct StreamHealth {
     pub reconnect_count: u32,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct Position {
+    pub size: u64,
+    pub entry_cost: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct WalletState {
+    pub starting_capital: u64,
+    pub realized_pnl: i64,
+}
+
+impl WalletState {
+    pub fn equity(&self) -> u64 {
+        (self.starting_capital as i64 + self.realized_pnl).max(0) as u64
+    }
+}
+
+impl Default for WalletState {
+    fn default() -> Self {
+        Self { starting_capital: 0, realized_pnl: 0 }
+    }
+}
+
 const MAX_RECENT_TRADES: usize = 20;
 
 #[derive(Debug, Default)]
@@ -41,6 +65,8 @@ pub struct BotState {
     pub stream_health: Option<StreamHealth>,
     pub recent_trades: VecDeque<TradeEvent>,
     pub kill_switch_active: bool,
+    pub position: Option<Position>,
+    pub wallet: WalletState,
 }
 
 impl BotState {
@@ -76,5 +102,26 @@ mod tests {
         assert_eq!(state.recent_trades.len(), 20);
         // oldest trades dropped, newest kept
         assert_eq!(state.recent_trades.back().unwrap().size, 24);
+    }
+
+    #[test]
+    fn bot_state_position_defaults_to_none() {
+        let state = BotState::new();
+        assert!(state.position.is_none());
+    }
+
+    #[test]
+    fn wallet_equity_reflects_realized_pnl() {
+        let wallet = WalletState { starting_capital: 1000, realized_pnl: 250 };
+        assert_eq!(wallet.equity(), 1250);
+
+        let losing_wallet = WalletState { starting_capital: 1000, realized_pnl: -400 };
+        assert_eq!(losing_wallet.equity(), 600);
+    }
+
+    #[test]
+    fn wallet_equity_never_goes_negative() {
+        let wallet = WalletState { starting_capital: 1000, realized_pnl: -5000 };
+        assert_eq!(wallet.equity(), 0);
     }
 }
