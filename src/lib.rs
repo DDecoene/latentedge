@@ -1,3 +1,4 @@
+pub mod backtest_executor;
 pub mod config;
 pub mod historical_data;
 pub mod executor;
