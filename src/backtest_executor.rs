@@ -1,7 +1,9 @@
 use crate::config::Config;
 use crate::executor::SafetyGuardState;
+use crate::laya_client::LayaClient;
+use crate::phoenix_decode::decode_from_ladder_json;
 use crate::types::{Position, TradeEvent, WalletState};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 
 pub fn synthetic_ladder_json(spot_price: f64, cost_bps: u32) -> String {
     let price_atoms = (spot_price * 1_000_000.0).round().max(0.0) as u64;
@@ -104,10 +106,102 @@ pub fn evaluate_backtest_trade(
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct BacktestState {
+    pub prices: Vec<(DateTime<Utc>, f64)>,
+    pub current_index: usize,
+    pub position: Option<Position>,
+    pub wallet: WalletState,
+    pub trades: Vec<TradeEvent>,
+    pub equity_curve: Vec<f64>,
+    pub wins: u32,
+    pub losses: u32,
+}
+
+impl BacktestState {
+    pub fn new(prices: Vec<(DateTime<Utc>, f64)>, wallet: WalletState) -> Self {
+        Self {
+            prices,
+            current_index: 0,
+            position: None,
+            wallet,
+            trades: Vec::new(),
+            equity_curve: Vec::new(),
+            wins: 0,
+            losses: 0,
+        }
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.current_index >= self.prices.len()
+    }
+
+    pub fn win_rate(&self) -> f64 {
+        let total = self.wins + self.losses;
+        if total == 0 {
+            0.0
+        } else {
+            self.wins as f64 / total as f64
+        }
+    }
+
+    pub fn buy_and_hold_equity(&self) -> f64 {
+        if self.prices.is_empty() {
+            return self.wallet.starting_capital as f64;
+        }
+        let initial = self.prices[0].1;
+        let last_index = self.current_index.min(self.prices.len() - 1);
+        let current = self.prices[last_index].1;
+        if initial <= 0.0 {
+            return self.wallet.starting_capital as f64;
+        }
+        (self.wallet.starting_capital as f64) * (current / initial)
+    }
+}
+
+pub async fn advance_one_tick(
+    state: &mut BacktestState,
+    config: &Config,
+    guard: &mut SafetyGuardState,
+    laya: &LayaClient,
+) -> bool {
+    if state.is_finished() {
+        return false;
+    }
+    let (timestamp, spot_price) = state.prices[state.current_index];
+    let raw_json = synthetic_ladder_json(spot_price, config.backtest_cost_bps);
+    let mut snapshot = decode_from_ladder_json("backtest", state.current_index as u64, &raw_json)
+        .expect("synthetic ladder must always be valid — bid<ask guaranteed by construction");
+    snapshot.timestamp = timestamp;
+
+    let sig = laya.get_signal(&snapshot).await;
+
+    if sig.should_trade {
+        let prev_realized = state.wallet.realized_pnl;
+        let (event, new_position, new_wallet) =
+            evaluate_backtest_trade(config, guard, state.position, state.wallet, spot_price);
+        let is_sell = event.side == "sell";
+        state.position = new_position;
+        state.wallet = new_wallet;
+        if is_sell {
+            let delta = state.wallet.realized_pnl - prev_realized;
+            if delta > 0 {
+                state.wins += 1;
+            } else if delta < 0 {
+                state.losses += 1;
+            }
+        }
+        state.trades.push(event);
+    }
+
+    state.equity_curve.push(state.wallet.equity() as f64);
+    state.current_index += 1;
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::phoenix_decode::decode_from_ladder_json;
 
     fn test_config() -> Config {
         Config::from_map(&std::collections::HashMap::new()).expect("defaults must parse")
@@ -258,5 +352,75 @@ mod tests {
         let (event, _position, _wallet) =
             evaluate_backtest_trade(&config, &mut guard, None, wallet, 100.0);
         assert_eq!(event.size, 0);
+    }
+
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn sample_prices() -> Vec<(DateTime<Utc>, f64)> {
+        vec![(Utc::now(), 100.0), (Utc::now(), 101.0), (Utc::now(), 99.0)]
+    }
+
+    #[test]
+    fn new_state_starts_flat_and_unfinished() {
+        let state = BacktestState::new(sample_prices(), flat_wallet(1000));
+        assert!(state.position.is_none());
+        assert!(!state.is_finished());
+        assert_eq!(state.current_index, 0);
+    }
+
+    #[test]
+    fn win_rate_is_zero_with_no_closed_trades() {
+        let state = BacktestState::new(sample_prices(), flat_wallet(1000));
+        assert_eq!(state.win_rate(), 0.0);
+    }
+
+    #[test]
+    fn buy_and_hold_equity_tracks_price_change_from_the_first_tick() {
+        let mut state = BacktestState::new(sample_prices(), flat_wallet(1000));
+        state.current_index = 1; // price moved 100 -> 101
+        let expected = 1000.0 * (101.0 / 100.0);
+        assert!((state.buy_and_hold_equity() - expected).abs() < 0.001);
+    }
+
+    #[tokio::test]
+    async fn advance_one_tick_finishes_after_the_last_price_point() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/predict"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"confidence": 0.1})))
+            .mount(&server)
+            .await;
+        let laya = LayaClient::new(server.uri(), 0.85);
+        let config = test_config();
+        let mut guard = SafetyGuardState::new();
+        let mut state = BacktestState::new(vec![(Utc::now(), 100.0)], flat_wallet(1_000_000_000));
+
+        assert!(advance_one_tick(&mut state, &config, &mut guard, &laya).await);
+        assert!(state.is_finished());
+        assert_eq!(state.equity_curve.len(), 1);
+
+        assert!(!advance_one_tick(&mut state, &config, &mut guard, &laya).await);
+    }
+
+    #[tokio::test]
+    async fn advance_one_tick_opens_a_position_when_laya_says_trade() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/predict"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"confidence": 0.99})))
+            .mount(&server)
+            .await;
+        let laya = LayaClient::new(server.uri(), 0.85);
+        let mut config = test_config();
+        config.backtest_cost_bps = 0;
+        let mut guard = SafetyGuardState::new();
+        let mut state = BacktestState::new(vec![(Utc::now(), 100.0)], flat_wallet(1_000_000_000));
+
+        advance_one_tick(&mut state, &config, &mut guard, &laya).await;
+
+        assert!(state.position.is_some());
+        assert_eq!(state.trades.len(), 1);
+        assert_eq!(state.trades[0].side, "buy");
     }
 }
