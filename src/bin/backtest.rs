@@ -1,4 +1,4 @@
-use layatrade_rs::backtest_executor::BacktestState;
+use layatrade_rs::backtest_executor::{format_usd, format_usd_signed, BacktestState};
 use layatrade_rs::backtest_tui::run_backtest_tui;
 use layatrade_rs::config::Config;
 use layatrade_rs::executor::SafetyGuardState;
@@ -15,21 +15,21 @@ fn format_summary(state: &BacktestState) -> String {
     format!(
         "Backtest complete: {}/{} ticks replayed\n\
          Final equity: {} (mark-to-market, started at {}){}\n\
-         Buy & hold would be worth: {:.0}\n\
+         Buy & hold would be worth: {}\n\
          Trades: {} (wins {} / losses {}, win rate {:.1}%)\n\
          Realized P&L: {}\n\
          Zero-confidence Laya predicts: {} (includes any failed/timed-out calls, not just genuine zero answers)",
         state.current_index,
         state.prices.len(),
-        state.mark_to_market_equity(),
-        state.wallet.starting_capital,
+        format_usd(state.mark_to_market_equity()),
+        format_usd(state.wallet.starting_capital),
         position_note,
-        state.buy_and_hold_equity(),
+        format_usd(state.buy_and_hold_equity().round().max(0.0) as u64),
         state.trades.len(),
         state.wins,
         state.losses,
         state.win_rate() * 100.0,
-        state.wallet.realized_pnl,
+        format_usd_signed(state.wallet.realized_pnl),
         state.zero_confidence_predicts,
     )
 }
@@ -76,16 +76,16 @@ mod tests {
     fn summary_reflects_whatever_portion_of_the_replay_completed() {
         let mut state = BacktestState::new(
             vec![(Utc::now(), 100.0), (Utc::now(), 110.0), (Utc::now(), 90.0)],
-            WalletState { starting_capital: 1000, realized_pnl: 0 },
+            WalletState { starting_capital: 1_000_000_000, realized_pnl: 0 },
         );
         // Simulate stopping after only the first tick (an early quit):
         state.current_index = 1;
-        state.equity_curve.push(1000.0);
+        state.equity_curve.push(1_000_000_000.0);
 
         let summary = format_summary(&state);
 
-        assert!(summary.contains("1"), "must reflect the actual tick count reached: {summary}");
-        assert!(summary.contains(&state.wallet.equity().to_string()));
+        assert!(summary.contains("1/3 ticks"), "must reflect the actual tick count reached: {summary}");
+        assert!(summary.contains(&format_usd(state.mark_to_market_equity())));
         assert!(summary.contains(&format!("{:.1}", state.win_rate() * 100.0)));
     }
 }

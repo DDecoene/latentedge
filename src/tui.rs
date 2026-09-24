@@ -73,19 +73,27 @@ pub(crate) fn is_quit_key(key: crossterm::event::KeyEvent) -> bool {
         || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
 }
 
-/// Raw mode is disabled on drop, so it's restored on every exit path —
-/// including an early `?` return — not just the happy path.
+/// Raw mode and the alternate screen are both torn down on drop, so
+/// they're restored on every exit path — including an early `?` return —
+/// not just the happy path. Without the alternate screen, the TUI draws
+/// directly over whatever was already in the scrollback, so anything
+/// there (a previous command's output, a shell prompt) stays visible
+/// "behind" and around the drawn widgets; the alternate screen gives the
+/// TUI its own blank buffer, restoring the original screen untouched on
+/// exit.
 pub(crate) struct RawModeGuard;
 
 impl RawModeGuard {
     pub(crate) fn new() -> anyhow::Result<Self> {
         crossterm::terminal::enable_raw_mode()?;
+        crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen)?;
         Ok(Self)
     }
 }
 
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
         let _ = crossterm::terminal::disable_raw_mode();
     }
 }
@@ -103,6 +111,7 @@ pub async fn run_tui(
     let _raw_mode = RawModeGuard::new()?;
     let backend = CrosstermBackend::new(std::io::stdout());
     let mut terminal = Terminal::new(backend)?;
+    terminal.clear()?;
 
     loop {
         let snapshot = { render_lines(&*state.read().await) };

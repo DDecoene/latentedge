@@ -1,4 +1,4 @@
-use crate::backtest_executor::{advance_one_tick, BacktestState};
+use crate::backtest_executor::{advance_one_tick, format_sol, format_usd, format_usd_signed, BacktestState};
 use crate::config::Config;
 use crate::executor::SafetyGuardState;
 use crate::laya_client::LayaClient;
@@ -71,17 +71,21 @@ fn render_backtest_frame(frame: &mut ratatui::Frame, state: &BacktestState) {
     frame.render_widget(chart, layout[0]);
 
     let position_line = match &state.position {
-        Some(p) => format!("position: holding size={} entry_cost={}", p.size, p.entry_cost),
+        Some(p) => format!(
+            "position: holding {} (cost {})",
+            format_sol(p.size),
+            format_usd(p.entry_cost)
+        ),
         None => "position: flat".to_string(),
     };
     let lines = vec![
         format!(
-            "tick {}/{} equity={} (mark-to-market) buy_and_hold={:.0} realized_pnl={}",
+            "tick {}/{} equity={} (mark-to-market) buy_and_hold={} realized_pnl={}",
             state.current_index,
             state.prices.len(),
-            state.mark_to_market_equity(),
-            state.buy_and_hold_equity(),
-            state.wallet.realized_pnl
+            format_usd(state.mark_to_market_equity()),
+            format_usd(state.buy_and_hold_equity().round().max(0.0) as u64),
+            format_usd_signed(state.wallet.realized_pnl)
         ),
         position_line,
         format!(
@@ -106,6 +110,7 @@ pub async fn run_backtest_tui(
     let _raw_mode = RawModeGuard::new()?;
     let backend = CrosstermBackend::new(std::io::stdout());
     let mut terminal = Terminal::new(backend)?;
+    terminal.clear()?;
 
     loop {
         terminal.draw(|frame| render_backtest_frame(frame, state))?;

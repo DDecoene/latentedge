@@ -29,6 +29,42 @@ pub fn synthetic_ladder_json(spot_price: f64, cost_bps: u32) -> String {
 const QUOTE_ATOMS_PER_UNIT: f64 = 1_000_000.0; // USDC-style, 6 decimals
 const BASE_ATOMS_PER_UNIT: f64 = 1_000_000_000.0; // SOL-style, 9 decimals
 
+fn with_thousands_separators(digits: &str) -> String {
+    let mut result = String::new();
+    let len = digits.len();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (len - i) % 3 == 0 {
+            result.push(',');
+        }
+        result.push(c);
+    }
+    result
+}
+
+/// Formats a non-negative quote-atom amount as a dollar string, e.g.
+/// `1_616_662_039` -> `"$1,616.66"`. Integer cents arithmetic, no
+/// floating-point rounding.
+pub fn format_usd(quote_atoms: u64) -> String {
+    let dollars = quote_atoms / 1_000_000;
+    let cents = (quote_atoms % 1_000_000) / 10_000;
+    format!("${}.{:02}", with_thousands_separators(&dollars.to_string()), cents)
+}
+
+/// Formats a signed quote-atom P&L, e.g. `-32_372_821` -> `"-$32.37"`.
+pub fn format_usd_signed(quote_atoms: i64) -> String {
+    if quote_atoms < 0 {
+        format!("-{}", format_usd(quote_atoms.unsigned_abs()))
+    } else {
+        format_usd(quote_atoms as u64)
+    }
+}
+
+/// Formats a base-atom amount as a SOL quantity, e.g.
+/// `1_000_000_000` -> `"1.0000 SOL"`.
+pub fn format_sol(base_atoms: u64) -> String {
+    format!("{:.4} SOL", base_atoms as f64 / BASE_ATOMS_PER_UNIT)
+}
+
 fn backtest_refusal_event(trade_size: u64, price: u64, note: String) -> TradeEvent {
     TradeEvent { timestamp: Utc::now(), side: "none".to_string(), size: trade_size, price, dry_run: true, note }
 }
@@ -125,6 +161,11 @@ pub struct BacktestState {
     pub equity_curve: Vec<f64>,
     pub wins: u32,
     pub losses: u32,
+    /// The simulated calendar date `advance_one_tick` last reset the
+    /// guard's daily-loss counter for. Without this, "daily" loss is a
+    /// lifetime cap for the whole replay: once tripped, every later tick
+    /// refuses forever, even 60 simulated days later.
+    last_reset_date: Option<chrono::NaiveDate>,
     /// Ticks where Laya returned `confidence == 0.0` — this includes both
     /// a genuine zero-confidence answer and a failed/timed-out call
     /// (`LayaClient::get_signal` collapses both to the same value), so a
@@ -144,6 +185,7 @@ impl BacktestState {
             equity_curve: Vec::new(),
             wins: 0,
             losses: 0,
+            last_reset_date: None,
             zero_confidence_predicts: 0,
         }
     }
@@ -205,6 +247,13 @@ pub async fn advance_one_tick(
         return false;
     }
     let (timestamp, spot_price) = state.prices[state.current_index];
+
+    let today = timestamp.date_naive();
+    if state.last_reset_date != Some(today) {
+        guard.reset_daily_loss();
+        state.last_reset_date = Some(today);
+    }
+
     let raw_json = synthetic_ladder_json(spot_price, config.backtest_cost_bps);
     let market = format!("{}/{}", config.base_mint, config.quote_mint);
     let slot = timestamp.timestamp().max(0) as u64;
@@ -250,6 +299,27 @@ mod tests {
 
     fn flat_wallet(starting_capital: u64) -> WalletState {
         WalletState { starting_capital, realized_pnl: 0 }
+    }
+
+    #[test]
+    fn format_usd_adds_thousands_separators_and_cents() {
+        assert_eq!(format_usd(1_616_662_039), "$1,616.66");
+        assert_eq!(format_usd(1_000_000_000), "$1,000.00");
+        assert_eq!(format_usd(500_000), "$0.50");
+        assert_eq!(format_usd(0), "$0.00");
+    }
+
+    #[test]
+    fn format_usd_signed_shows_a_leading_minus_for_losses() {
+        assert_eq!(format_usd_signed(-32_372_821), "-$32.37");
+        assert_eq!(format_usd_signed(100_000_000), "$100.00");
+        assert_eq!(format_usd_signed(0), "$0.00");
+    }
+
+    #[test]
+    fn format_sol_shows_four_decimals() {
+        assert_eq!(format_sol(1_000_000_000), "1.0000 SOL");
+        assert_eq!(format_sol(996_762_717), "0.9968 SOL");
     }
 
     #[test]
@@ -568,5 +638,47 @@ mod tests {
         advance_one_tick(&mut state, &config, &mut guard, &laya).await;
 
         assert_eq!(state.zero_confidence_predicts, 1);
+    }
+
+    #[tokio::test]
+    async fn daily_loss_cap_resets_on_the_next_simulated_calendar_day() {
+        use chrono::TimeZone;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/predict"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"confidence": 0.99})))
+            .mount(&server)
+            .await;
+        let laya = LayaClient::new(server.uri(), 0.85);
+        let mut config = test_config();
+        config.backtest_cost_bps = 0;
+        let mut guard = SafetyGuardState::new();
+
+        let day1 = Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
+        let day2 = Utc.with_ymd_and_hms(2026, 1, 2, 12, 0, 0).unwrap();
+        let prices = vec![
+            (day1, 100.0), // buys 1 SOL for $100
+            (day1, 1.0),   // sells at a catastrophic loss — trips the daily cap, same day
+            (day1, 1.0),   // still day 1: must be refused
+            (day2, 1.0),   // day 2: the cap must have reset, buy must succeed
+        ];
+        let mut state = BacktestState::new(prices, flat_wallet(1_000_000_000));
+
+        advance_one_tick(&mut state, &config, &mut guard, &laya).await; // buy
+        advance_one_tick(&mut state, &config, &mut guard, &laya).await; // sell, huge loss
+        assert!(
+            guard.daily_loss_accrued() >= config.max_daily_loss,
+            "the loss must have breached the cap for this test to be meaningful"
+        );
+
+        advance_one_tick(&mut state, &config, &mut guard, &laya).await; // still day 1
+        assert_eq!(state.trades[2].side, "none", "same-day trading must still be refused");
+
+        advance_one_tick(&mut state, &config, &mut guard, &laya).await; // day 2
+        assert_eq!(
+            state.trades[3].side, "buy",
+            "a new simulated day must reset the cap and allow trading again"
+        );
+        assert_eq!(guard.daily_loss_accrued(), 0);
     }
 }

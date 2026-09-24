@@ -77,6 +77,15 @@ impl SafetyGuardState {
         self.daily_loss_accrued += amount;
     }
 
+    /// Nothing calls this automatically — the live bot has no notion of
+    /// calendar-day rollover built in yet, so `daily_loss_accrued`
+    /// otherwise never clears for the life of the process. The backtest
+    /// calls this on every simulated day boundary; a live deployment
+    /// would need the same, on a real wall-clock day change.
+    pub fn reset_daily_loss(&mut self) {
+        self.daily_loss_accrued = 0;
+    }
+
     pub fn daily_loss_accrued(&self) -> u64 {
         self.daily_loss_accrued
     }
@@ -497,6 +506,19 @@ mod tests {
         guard.record_loss(config.max_daily_loss);
         let result = guard.check(&config, 1);
         assert!(result.unwrap_err().contains("daily loss"));
+    }
+
+    #[test]
+    fn reset_daily_loss_clears_the_accrued_amount() {
+        let config = test_config("/tmp/layatrade_test_kill_16");
+        let mut guard = SafetyGuardState::new();
+        guard.record_loss(config.max_daily_loss);
+        assert!(guard.check(&config, 1).is_err(), "cap must be breached before reset");
+
+        guard.reset_daily_loss();
+
+        assert_eq!(guard.daily_loss_accrued(), 0);
+        assert!(guard.check(&config, 1).is_ok(), "trading must resume after the daily reset");
     }
 
     #[test]
