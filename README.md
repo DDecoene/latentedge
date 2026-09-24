@@ -1,49 +1,40 @@
-# (unnamed) — an ML pattern-recognition trading project
+# latentedge — an ML pattern-recognition trading project
 
-## What this actually is
+## What this is
 
-The real goal is learning ML — this is a toy project, not a revenue target. But
-it's being pursued as if it were a genuine attempt at a live trading edge: no
-scoping down the ML rigor (data quality, labeling discipline, walk-forward
-validation, honest out-of-sample evaluation) just because it's "only" a
-learning exercise.
+A research project looking for a trading edge on Uniswap using a model
+trained specifically for this task, not a general-purpose one prompted with
+market data. It's driven by learning ML properly — but pursued with the
+rigor of a genuine attempt at an edge, not a toy exercise: real data
+discipline, honest labeling, walk-forward validation, and no claiming
+success without out-of-sample evidence.
 
-The thesis: there are signals in market data that only a model can pick up —
-patterns that fit to real-world structure rather than an explicit rule a human
-wrote down. We're trying to find one, and to build the muscle of doing ML
-properly along the way.
+The core thesis: there are patterns in market data that a model can learn to
+recognize even when no human has written down the rule — something that
+fits to real-world structure rather than an explicit heuristic. This project
+tries to find one.
 
 ## Decided so far
 
-- **Execution venue: Uniswap.** Moving off Solana/Jupiter. This is an AMM, not
-  an order book — price comes from pool reserves/tick math, not bid/ask
-  levels, so the whole signal → decision → execution pipeline needs
-  rethinking around that.
-- **Not reusing the previous code.** The prior version (Solana/Jupiter +
-  "Laya", a general-purpose text classifier misapplied to numeric market
-  data) has been deleted. Its architecture shape is worth repeating —
-  signal client / executor / safety-guard / backtest-harness split,
-  position-sizing and daily-loss risk limits, wallet/P&L/equity-curve
-  accounting in the backtester — but none of the integration code (order-book
-  decoding, Solana tx signing, atom/decimal math) survives the move to an
-  EVM/AMM target.
-- **The model should be genuinely trained for this**, not a general-purpose
-  model prompted with market data. Local inference on the Mac (MLX or
-  similar) is the deployment target.
+- **Execution venue: Uniswap.** An AMM, not an order book — price comes from
+  pool reserves/tick math, so the signal → decision → execution pipeline is
+  built around that, not bid/ask levels.
+- **The model is purpose-trained**, not a general-purpose model prompted
+  with numbers. Local inference on the Mac (MLX or similar).
+- **Architecture shape**: a signal client, an executor, a safety-guard
+  (position sizing, daily-loss limits), and a backtest harness that tracks
+  wallet/P&L/win-rate/equity curve honestly.
 
 ## Open questions
 
-- What data source and resolution for training (see discussion — CEX minute
-  klines were floated as training data, decoupled from the execution venue
-  decision)?
-- What exactly gets labeled / predicted, and over what horizon?
-- What's the project/repo name (dropping "layatrade" since Laya is gone)?
-- How much of "signal transfers across markets" is actually true here, and
-  how do we test that assumption rather than assume it?
-- What does v1 scope down to — a single Uniswap pool/pair to start?
+- Data source and resolution for training.
+- What exactly gets labeled / predicted, and over what horizon.
+- How much a learned signal actually transfers across markets/pairs — an
+  assumption to test, not take for granted.
+- v1 scope: which single pool/pair to start with.
 
 ## Non-goals (for now)
 
-- Real money. This stays a research/backtest project until (if ever) there's
-  real out-of-sample evidence of an edge.
-- Multi-chain/multi-venue generality. Pick one pair on one venue first.
+- Real money. This stays a research/backtest project until there's real
+  out-of-sample evidence of an edge.
+- Multi-chain/multi-venue generality. One pair on one venue first.
