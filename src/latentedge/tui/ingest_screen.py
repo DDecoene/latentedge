@@ -7,16 +7,15 @@ from collections.abc import Callable
 from pathlib import Path
 
 import httpx
-import numpy as np
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.screen import Screen
 from textual.widgets import Static
 
-from latentedge.ingest.chunked import FetchFn
+from latentedge.ingest.chunked import FetchFn, read_progress
 from latentedge.ingest.chunked import ingest_range as default_ingest_range
 from latentedge.ingest.rpc_logs import fetch_swaps
-from latentedge.tui.train_screen import TrainScreen
+from latentedge.tui.train_screen import DEFAULT_MODEL_OUT_PATH, TrainAssembleFn, TrainScreen
 from latentedge.tui.widgets import LogPanel, ProgressPanel, StatsPanel
 
 RATE_WINDOW_SIZE = 20
@@ -42,7 +41,9 @@ class IngestScreen(Screen[None]):
         flush_every_n_chunks: int,
         max_retries: int,
         retry_backoff_seconds: float,
-        train_assemble_fn: Callable[[Path], tuple[np.ndarray, np.ndarray, int]],
+        train_assemble_fn: TrainAssembleFn,
+        model_out_path: Path = DEFAULT_MODEL_OUT_PATH,
+        train_epochs: int = 100,
         ingest_fn: Callable[..., int] = default_ingest_range,
         fetch_fn: FetchFn = fetch_swaps,
         time_fn: Callable[[], float] = time.monotonic,
@@ -60,6 +61,8 @@ class IngestScreen(Screen[None]):
         self.max_retries = max_retries
         self.retry_backoff_seconds = retry_backoff_seconds
         self.train_assemble_fn = train_assemble_fn
+        self.model_out_path = model_out_path
+        self.train_epochs = train_epochs
         self.ingest_fn = ingest_fn
         self.fetch_fn = fetch_fn
         self.time_fn = time_fn
@@ -78,8 +81,19 @@ class IngestScreen(Screen[None]):
 
     def on_mount(self) -> None:
         total = max(self.to_block - self.from_block + 1, 0)
+
+        # A resumed run's already-fetched blocks count toward completed so
+        # the bar doesn't restart at 0% — mirrors ingest_range's own
+        # resume-from-watermark logic in ingest.chunked.
+        resume_from = read_progress(self.out_path)
+        start_block = self.from_block
+        if resume_from is not None and resume_from + 1 > start_block:
+            start_block = min(resume_from + 1, self.to_block + 1)
+        completed = max(start_block - self.from_block, 0)
+        unit_label = f"resuming from block {start_block}" if completed > 0 else "starting..."
+
         self.query_one("#ingest-progress", ProgressPanel).update_progress(
-            completed=0, total=total, unit_label="starting...",
+            completed=completed, total=total, unit_label=unit_label,
             rate_per_sec=0.0, rate_unit="blocks/sec",
         )
         self.set_interval(STATS_REFRESH_INTERVAL_SECONDS, self._refresh_disk_stats)
@@ -146,6 +160,11 @@ class IngestScreen(Screen[None]):
         self.is_complete = True
         self.total_written = total
         self._refresh_disk_stats()
+        range_total = max(self.to_block - self.from_block + 1, 0)
+        self.query_one("#ingest-progress", ProgressPanel).update_progress(
+            completed=range_total, total=range_total, unit_label="complete",
+            rate_per_sec=0.0, rate_unit="blocks/sec",
+        )
         self.query_one("#ingest-action-bar", Static).update(
             f"Ingestion complete — wrote {total} swaps to {self.out_path}. "
             "[T] Train now   [Q] Exit"
@@ -154,13 +173,17 @@ class IngestScreen(Screen[None]):
     def _handle_error(self, message: str) -> None:
         self.error = message
         self.query_one("#ingest-log", LogPanel).log_line(f"ERROR: {message}")
+        self.query_one("#ingest-action-bar", Static).update(f"Ingestion failed: {message}. [Q] Exit")
 
     def action_train_now(self) -> None:
         if not self.is_complete:
             return
-        self.app.push_screen(TrainScreen(swaps_path=self.out_path, assemble_fn=self.train_assemble_fn))
+        self.app.push_screen(TrainScreen(
+            swaps_path=self.out_path, out_path=self.model_out_path, epochs=self.train_epochs,
+            assemble_fn=self.train_assemble_fn,
+        ))
 
     def action_exit_now(self) -> None:
-        if not self.is_complete:
+        if not (self.is_complete or self.error is not None):
             return
         self.app.exit()

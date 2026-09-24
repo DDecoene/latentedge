@@ -6,30 +6,37 @@ from pathlib import Path
 
 import numpy as np
 from textual.app import ComposeResult
+from textual.binding import Binding
 from textual.screen import Screen
+from textual.widgets import Static
 from textual_plotext import PlotextPlot
 
+from latentedge.features import save_feature_stats
 from latentedge.model import NetReturnRegressor, save
 from latentedge.model import train as default_train
 from latentedge.tui.widgets import LogPanel, ProgressPanel
 
 DEFAULT_MODEL_OUT_PATH = Path("data/model.safetensors")
 
+TrainAssembleFn = Callable[[Path], tuple[np.ndarray, np.ndarray, int, dict[str, tuple[float, float]]]]
+
 
 class TrainScreen(Screen[None]):
+    BINDINGS = [
+        Binding("q", "exit_now", "Exit", show=False),
+    ]
+
     def __init__(
         self,
         swaps_path: Path,
+        assemble_fn: TrainAssembleFn,
         out_path: Path = DEFAULT_MODEL_OUT_PATH,
         epochs: int = 100,
         learning_rate: float = 0.001,
-        assemble_fn: Callable[[Path], tuple[np.ndarray, np.ndarray, int]] | None = None,
         train_fn: Callable[..., list[float]] = default_train,
         time_fn: Callable[[], float] = time.monotonic,
     ) -> None:
         super().__init__()
-        if assemble_fn is None:
-            raise ValueError("assemble_fn is required (see Task 10 for the real pipeline implementation)")
         self.swaps_path = swaps_path
         self.out_path = out_path
         self.epochs = epochs
@@ -48,6 +55,7 @@ class TrainScreen(Screen[None]):
         yield ProgressPanel(id="train-progress")
         yield PlotextPlot(id="train-loss-plot")
         yield LogPanel(id="train-log")
+        yield Static("", id="train-action-bar")
 
     def on_mount(self) -> None:
         self.query_one("#train-progress", ProgressPanel).update_progress(
@@ -61,7 +69,7 @@ class TrainScreen(Screen[None]):
             self.app.call_from_thread(self._handle_epoch, epoch, total_epochs, loss)
 
         try:
-            features, labels, input_dim = self.assemble_fn(self.swaps_path)
+            features, labels, input_dim, stats = self.assemble_fn(self.swaps_path)
             model = NetReturnRegressor(input_dim=input_dim)
             losses = self.train_fn(
                 model, features, labels, epochs=self.epochs,
@@ -69,6 +77,11 @@ class TrainScreen(Screen[None]):
             )
             self.out_path.parent.mkdir(parents=True, exist_ok=True)
             save(model, self.out_path)
+            # Saved only after the model itself is safely on disk — an
+            # earlier failure or interrupted run must never leave a stats
+            # file that doesn't match the model SignalClient will load
+            # alongside it.
+            save_feature_stats(stats, Path(str(self.out_path) + ".stats.json"))
         except Exception as exc:
             self.app.call_from_thread(self._handle_error, str(exc))
             return
@@ -81,7 +94,7 @@ class TrainScreen(Screen[None]):
             rate = 0.0
         else:
             elapsed = self.time_fn() - self._rate_start_time
-            rate = epoch / elapsed if elapsed > 0 else 0.0
+            rate = (epoch - 1) / elapsed if elapsed > 0 else 0.0
 
         self.query_one("#train-progress", ProgressPanel).update_progress(
             completed=epoch, total=total_epochs, unit_label=f"epoch {epoch}, loss {loss:.6f}",
@@ -101,7 +114,16 @@ class TrainScreen(Screen[None]):
         self.query_one("#train-log", LogPanel).log_line(
             f"training complete — final loss {final_loss:.6f}, saved to {self.out_path}"
         )
+        self.query_one("#train-action-bar", Static).update(
+            f"Training complete — final loss {final_loss:.6f}, saved to {self.out_path}. [Q] Exit"
+        )
 
     def _handle_error(self, message: str) -> None:
         self.error = message
         self.query_one("#train-log", LogPanel).log_line(f"ERROR: {message}")
+        self.query_one("#train-action-bar", Static).update(f"Training failed: {message}. [Q] Exit")
+
+    def action_exit_now(self) -> None:
+        if not (self.is_complete or self.error is not None):
+            return
+        self.app.exit()

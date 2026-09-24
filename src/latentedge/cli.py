@@ -85,9 +85,12 @@ def ingest(
             chunk_size=chunk_size, max_workers=max_workers,
             flush_every_n_chunks=flush_every_n_chunks, max_retries=max_retries,
             retry_backoff_seconds=retry_backoff_seconds, ingest_fn=ingest_range,
-            train_assemble_fn=lambda p: _assemble_train_data(p, Path("data/model.safetensors")),
+            train_assemble_fn=_assemble_train_data,
         )
         LatentEdgeApp(start_screen=screen).run()
+        if screen.error is not None:
+            click.echo(f"ingest failed: {screen.error}", err=True)
+            raise SystemExit(1)
         return
 
     def report(chunk_start: int, chunk_end: int, count: int) -> None:
@@ -103,7 +106,7 @@ def ingest(
     click.echo(f"wrote {total} new swap records to {out}")
 
 
-def _assemble_train_data(swaps_path: Path, out_path: Path) -> tuple[np.ndarray, np.ndarray, int]:
+def _assemble_train_data(swaps_path: Path) -> tuple[np.ndarray, np.ndarray, int, dict[str, tuple[float, float]]]:
     swap_df = read_swaps(swaps_path)
     bar_df = build_bars(swap_df, config.BAR_INTERVAL_SECONDS)
 
@@ -120,15 +123,15 @@ def _assemble_train_data(swaps_path: Path, out_path: Path) -> tuple[np.ndarray, 
 
     # Standardize using train-split statistics only — computing stats
     # from validate/test data would leak information about those splits
-    # into training. The same stats are saved alongside the model so
-    # SignalClient applies an identical transform at inference time.
+    # into training. The caller saves these stats alongside the model,
+    # after the model itself is safely on disk, so SignalClient never
+    # sees a stats file that doesn't match the model next to it.
     stats = compute_feature_stats(train_split, FEATURE_COLUMNS)
-    save_feature_stats(stats, Path(str(out_path) + ".stats.json"))
     train_split = standardize_features(train_split, FEATURE_COLUMNS, stats)
 
     x = train_split[FEATURE_COLUMNS].to_numpy(dtype="float32")
     y = train_split["net_return"].to_numpy(dtype="float32")
-    return x, y, len(FEATURE_COLUMNS)
+    return x, y, len(FEATURE_COLUMNS), stats
 
 
 @cli.command()
@@ -141,15 +144,19 @@ def train(swaps: Path, out: Path, epochs: int) -> None:
     if sys.stdout.isatty():
         screen = TrainScreen(
             swaps_path=swaps, out_path=out, epochs=epochs,
-            assemble_fn=lambda p: _assemble_train_data(p, out),
+            assemble_fn=_assemble_train_data,
         )
         LatentEdgeApp(start_screen=screen).run()
+        if screen.error is not None:
+            click.echo(f"train failed: {screen.error}", err=True)
+            raise SystemExit(1)
         return
 
-    x, y, input_dim = _assemble_train_data(swaps, out)
+    x, y, input_dim, stats = _assemble_train_data(swaps)
     regressor = NetReturnRegressor(input_dim=input_dim)
     losses = train_model(regressor, x, y, epochs=epochs, learning_rate=0.001)
     save(regressor, out)
+    save_feature_stats(stats, Path(str(out) + ".stats.json"))
     click.echo(f"trained {epochs} epochs, final loss {losses[-1]:.6f}, saved to {out}")
 
 

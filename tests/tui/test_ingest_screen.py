@@ -33,7 +33,7 @@ async def test_ingest_screen_reaches_complete_state(tmp_path: Path):
         client_factory=lambda: httpx.Client(), rpc_url="http://fake",
         chunk_size=10, max_workers=1, flush_every_n_chunks=1,
         max_retries=1, retry_backoff_seconds=0.001, fetch_fn=_fake_fetch,
-        train_assemble_fn=lambda p: (None, None, 0),
+        train_assemble_fn=lambda p: (None, None, 0, {}),
     )
     app = LatentEdgeApp(start_screen=screen)
 
@@ -52,7 +52,7 @@ async def test_ingest_screen_reaches_complete_state(tmp_path: Path):
 
 @pytest.mark.asyncio
 async def test_ingest_screen_progress_starts_from_resumed_block(tmp_path: Path):
-    # Regression for Review Focus: resumed runs must not restart the bar at 0%.
+    # Regression test: resumed runs must not restart the progress bar at 0%.
     out_path = tmp_path / "swaps.parquet"
     with httpx.Client() as client:
         ingest_range(
@@ -61,24 +61,36 @@ async def test_ingest_screen_progress_starts_from_resumed_block(tmp_path: Path):
             fetch_fn=_fake_fetch,
         )
 
+    release_fetch = threading.Event()
+
+    def gated_fetch(pool_address, from_block, to_block, client, rpc_url):
+        release_fetch.wait()
+        return [_record(from_block)]
+
     screen = IngestScreen(
         pool_address="0xpool", from_block=0, to_block=29, out_path=out_path,
         client_factory=lambda: httpx.Client(), rpc_url="http://fake",
         chunk_size=10, max_workers=1, flush_every_n_chunks=1,
-        max_retries=1, retry_backoff_seconds=0.001, fetch_fn=_fake_fetch,
-        train_assemble_fn=lambda p: (None, None, 0),
+        max_retries=1, retry_backoff_seconds=0.001, fetch_fn=gated_fetch,
+        train_assemble_fn=lambda p: (None, None, 0, {}),
     )
     app = LatentEdgeApp(start_screen=screen)
 
-    async with app.run_test() as pilot:
-        await pilot.pause()
-        # Immediately after start, completed-so-far must already reflect
-        # the resumed watermark (block 9), not 0 — checked below via
-        # total_written, the stable observable contract.
-        for _ in range(50):
-            await pilot.pause(0.01)
-            if screen.is_complete:
-                break
+    try:
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            # Before any new chunk has been fetched, the bar must already
+            # reflect the resumed watermark (10 of 30 blocks), not 0%.
+            detail_text = str(app.screen.query_one("#ingest-progress-detail").content)
+            assert "33%" in detail_text
+
+            release_fetch.set()
+            for _ in range(50):
+                await pilot.pause(0.01)
+                if screen.is_complete:
+                    break
+    finally:
+        release_fetch.set()
 
     assert screen.is_complete
     assert screen.total_written == 2  # only blocks [10,29] were new
@@ -86,14 +98,14 @@ async def test_ingest_screen_progress_starts_from_resumed_block(tmp_path: Path):
 
 @pytest.mark.asyncio
 async def test_ingest_screen_handles_zero_length_range_without_hanging(tmp_path: Path):
-    # Review Focus: from_block > to_block must complete immediately.
+    # An empty range (from_block > to_block) must complete immediately, not hang.
     out_path = tmp_path / "swaps.parquet"
     screen = IngestScreen(
         pool_address="0xpool", from_block=10, to_block=5, out_path=out_path,
         client_factory=lambda: httpx.Client(), rpc_url="http://fake",
         chunk_size=10, max_workers=1, flush_every_n_chunks=1,
         max_retries=1, retry_backoff_seconds=0.001, fetch_fn=_fake_fetch,
-        train_assemble_fn=lambda p: (None, None, 0),
+        train_assemble_fn=lambda p: (None, None, 0, {}),
     )
     app = LatentEdgeApp(start_screen=screen)
 
@@ -102,14 +114,49 @@ async def test_ingest_screen_handles_zero_length_range_without_hanging(tmp_path:
             await pilot.pause(0.01)
             if screen.is_complete:
                 break
+        detail_text = str(app.screen.query_one("#ingest-progress-detail").content)
 
     assert screen.is_complete
     assert screen.total_written == 0
+    assert "complete" in detail_text
+
+
+@pytest.mark.asyncio
+async def test_ingest_screen_resumed_run_with_nothing_left_reaches_full_bar(tmp_path: Path):
+    # A resumed range where every block is already ingested must reach
+    # 100% immediately, not sit at 0% while the footer claims completion.
+    out_path = tmp_path / "swaps.parquet"
+    with httpx.Client() as client:
+        ingest_range(
+            pool_address="0xpool", from_block=0, to_block=19, out_path=out_path,
+            client=client, rpc_url="http://fake", chunk_size=10, max_workers=1,
+            fetch_fn=_fake_fetch,
+        )
+
+    screen = IngestScreen(
+        pool_address="0xpool", from_block=0, to_block=19, out_path=out_path,
+        client_factory=lambda: httpx.Client(), rpc_url="http://fake",
+        chunk_size=10, max_workers=1, flush_every_n_chunks=1,
+        max_retries=1, retry_backoff_seconds=0.001, fetch_fn=_fake_fetch,
+        train_assemble_fn=lambda p: (None, None, 0, {}),
+    )
+    app = LatentEdgeApp(start_screen=screen)
+
+    async with app.run_test() as pilot:
+        for _ in range(50):
+            await pilot.pause(0.01)
+            if screen.is_complete:
+                break
+        detail_text = str(app.screen.query_one("#ingest-progress-detail").content)
+
+    assert screen.is_complete
+    assert screen.total_written == 0
+    assert "100%" in detail_text
 
 
 @pytest.mark.asyncio
 async def test_ingest_screen_logs_error_on_exhausted_retries_without_crashing(tmp_path: Path):
-    # Review Focus: a mid-run failure must surface in the log, not crash the app.
+    # A mid-run failure must surface in the log, not crash the app.
     def always_fails(pool_address, from_block, to_block, client, rpc_url):
         raise RuntimeError("permanent failure")
 
@@ -119,7 +166,7 @@ async def test_ingest_screen_logs_error_on_exhausted_retries_without_crashing(tm
         client_factory=lambda: httpx.Client(), rpc_url="http://fake",
         chunk_size=10, max_workers=1, flush_every_n_chunks=1,
         max_retries=1, retry_backoff_seconds=0.001, fetch_fn=always_fails,
-        train_assemble_fn=lambda p: (None, None, 0),
+        train_assemble_fn=lambda p: (None, None, 0, {}),
     )
     app = LatentEdgeApp(start_screen=screen)
 
@@ -128,9 +175,25 @@ async def test_ingest_screen_logs_error_on_exhausted_retries_without_crashing(tm
             await pilot.pause(0.01)
             if screen.is_complete or screen.error is not None:
                 break
+        action_bar_text = str(app.screen.query_one("#ingest-action-bar").content)
+
+        # T must stay disabled after a failure — there's no completed
+        # ingest to train on.
+        await pilot.press("t")
+        await pilot.pause()
+        screen_after_t = app.screen
+
+        # Q must exit the app after a failure, so the user isn't stuck
+        # on a half-drawn screen with no way out.
+        await pilot.press("q")
+        await pilot.pause()
+        still_running = app.is_running
 
     assert screen.error is not None
     assert "permanent failure" in screen.error
+    assert "Exit" in action_bar_text
+    assert not isinstance(screen_after_t, TrainScreen)
+    assert not still_running
 
 
 @pytest.mark.asyncio
@@ -141,7 +204,7 @@ async def test_ingest_screen_shows_completion_prompt(tmp_path: Path):
         client_factory=lambda: httpx.Client(), rpc_url="http://fake",
         chunk_size=10, max_workers=1, flush_every_n_chunks=1,
         max_retries=1, retry_backoff_seconds=0.001, fetch_fn=_fake_fetch,
-        train_assemble_fn=lambda p: (None, None, 0),
+        train_assemble_fn=lambda p: (None, None, 0, {}),
     )
     app = LatentEdgeApp(start_screen=screen)
 
@@ -159,18 +222,19 @@ async def test_ingest_screen_shows_completion_prompt(tmp_path: Path):
 
 
 def _fake_assemble(swaps_path: Path):
-    return [[0.0]], [0.0], 1
+    return [[0.0]], [0.0], 1, {}
 
 
 @pytest.mark.asyncio
 async def test_ingest_screen_train_key_pushes_train_screen(tmp_path: Path):
     out_path = tmp_path / "swaps.parquet"
+    model_out_path = tmp_path / "model.safetensors"
     screen = IngestScreen(
         pool_address="0xpool", from_block=0, to_block=9, out_path=out_path,
         client_factory=lambda: httpx.Client(), rpc_url="http://fake",
         chunk_size=10, max_workers=1, flush_every_n_chunks=1,
         max_retries=1, retry_backoff_seconds=0.001, fetch_fn=_fake_fetch,
-        train_assemble_fn=_fake_assemble,
+        train_assemble_fn=_fake_assemble, model_out_path=model_out_path,
     )
     app = LatentEdgeApp(start_screen=screen)
 
@@ -185,6 +249,10 @@ async def test_ingest_screen_train_key_pushes_train_screen(tmp_path: Path):
 
     assert isinstance(active_screen, TrainScreen)
     assert active_screen.swaps_path == out_path
+    # Must use the configured model path, not TrainScreen's own default —
+    # otherwise pushing T here would write over the real
+    # data/model.safetensors on disk.
+    assert active_screen.out_path == model_out_path
 
 
 @pytest.mark.asyncio
@@ -204,7 +272,7 @@ async def test_ingest_screen_train_key_ignored_before_completion(tmp_path: Path)
         client_factory=lambda: httpx.Client(), rpc_url="http://fake",
         chunk_size=10, max_workers=1, flush_every_n_chunks=1,
         max_retries=1, retry_backoff_seconds=0.001, fetch_fn=gated_fetch,
-        train_assemble_fn=lambda p: (None, None, 0),
+        train_assemble_fn=lambda p: (None, None, 0, {}),
     )
     app = LatentEdgeApp(start_screen=screen)
 
