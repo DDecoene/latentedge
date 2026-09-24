@@ -62,20 +62,28 @@ def fetch_swaps(pool_address: str, from_block: int, to_block: int, client: httpx
     )
 
     records: list[SwapRecord] = []
-    block_timestamp_cache: dict[int, int] = {}
+    # Cache both the timestamp and base fee from a single block fetch —
+    # eth_getBlockByNumber's response already carries baseFeePerGas, so
+    # there's no need for a second round-trip per block (see
+    # ingest.pool_state.backfill_base_fee, kept as a fallback utility for
+    # records sourced without it, e.g. pre-London blocks with no base fee).
+    block_cache: dict[int, tuple[int, int]] = {}
 
     for log in logs:
         block_number = int(log["blockNumber"], 16)
-        if block_number not in block_timestamp_cache:
+        if block_number not in block_cache:
             block = _rpc_call(client, rpc_url, "eth_getBlockByNumber", [log["blockNumber"], False])
-            block_timestamp_cache[block_number] = int(block["timestamp"], 16)
+            timestamp = int(block["timestamp"], 16)
+            base_fee_wei = int(block["baseFeePerGas"], 16) if "baseFeePerGas" in block else 0
+            block_cache[block_number] = (timestamp, base_fee_wei)
+        timestamp, base_fee_wei = block_cache[block_number]
 
         amount0, amount1, sqrt_price_x96, liquidity, tick = _decode_swap_data(log["data"])
 
         records.append(
             SwapRecord(
                 block_number=block_number,
-                timestamp=block_timestamp_cache[block_number],
+                timestamp=timestamp,
                 tx_hash=log["transactionHash"],
                 log_index=int(log["logIndex"], 16),
                 sqrt_price_x96=sqrt_price_x96,
@@ -83,7 +91,7 @@ def fetch_swaps(pool_address: str, from_block: int, to_block: int, client: httpx
                 liquidity=liquidity,
                 amount0=amount0,
                 amount1=amount1,
-                base_fee_wei=0,  # populate via ingest.pool_state.backfill_base_fee
+                base_fee_wei=base_fee_wei,
             )
         )
 

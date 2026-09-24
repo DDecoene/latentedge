@@ -1,3 +1,7 @@
+import json
+from pathlib import Path
+
+import numpy as np
 import pandas as pd
 
 
@@ -17,3 +21,68 @@ def compute_features(bars: pd.DataFrame, return_windows: list[int], volatility_w
     result.loc[had_swap, "bars_since_swap"] = 0
 
     return result
+
+
+def shift_features_for_labeling(df: pd.DataFrame, feature_columns: list[str]) -> pd.DataFrame:
+    """Shift feature columns back by one bar so a label at row t pairs
+    only with data known strictly before that bar began.
+
+    A bar's own features (return_n, volatility, ...) reflect swap data up
+    to and including that bar's close, but the triple-barrier label at
+    the same bar enters at the bar's *start* — the first swap at or after
+    t, which can be earlier than the bar's own close. Pairing a label
+    with its own bar's features leaks up to one bar's worth of
+    post-entry price action into the inputs. Shifting closes that gap.
+    """
+    result = df.copy()
+    result[feature_columns] = result[feature_columns].shift(1)
+    return result
+
+
+def compute_feature_stats(df: pd.DataFrame, feature_columns: list[str]) -> dict[str, tuple[float, float]]:
+    """Per-column (mean, std) computed from a training split, for later
+    standardization at both train and inference time. Must be computed
+    from the train split only — computing from validate/test data would
+    leak information about those splits into training."""
+    stats: dict[str, tuple[float, float]] = {}
+    for column in feature_columns:
+        mean = float(df[column].mean())
+        std = float(df[column].std())
+        if not np.isfinite(std) or std == 0.0:
+            std = 1.0
+        stats[column] = (mean, std)
+    return stats
+
+
+def standardize_features(df: pd.DataFrame, feature_columns: list[str], stats: dict[str, tuple[float, float]]) -> pd.DataFrame:
+    """Z-score each feature column using precomputed (mean, std) stats.
+
+    Without this, features on wildly different scales (e.g. a ~1e10
+    volume figure alongside a ~1e-2 return figure) make gradient descent
+    effectively ignore the small-scale features — verified empirically to
+    produce a model that predicts a constant, absurdly large value
+    regardless of input.
+    """
+    result = df.copy()
+    for column in feature_columns:
+        mean, std = stats[column]
+        result[column] = (result[column] - mean) / std
+    return result
+
+
+def save_feature_stats(stats: dict[str, tuple[float, float]], path: Path) -> None:
+    path.write_text(json.dumps(stats))
+
+
+def load_feature_stats(path: Path) -> dict[str, tuple[float, float]]:
+    raw: dict[str, list[float]] = json.loads(path.read_text())
+    return {column: (values[0], values[1]) for column, values in raw.items()}
+
+
+def stats_to_arrays(stats: dict[str, tuple[float, float]], feature_columns: list[str]) -> tuple[np.ndarray, np.ndarray]:
+    """Stats as parallel (means, stds) arrays in feature_columns order —
+    for standardizing a raw numpy feature matrix (SignalClient's input
+    shape) rather than a named DataFrame."""
+    means = np.array([stats[column][0] for column in feature_columns])
+    stds = np.array([stats[column][1] for column in feature_columns])
+    return means, stds

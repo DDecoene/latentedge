@@ -1,5 +1,6 @@
 import pandas as pd
 
+from latentedge import config
 from latentedge.uniswap_math import sqrt_price_x96_to_weth_usdc_price
 
 
@@ -9,7 +10,10 @@ def build_bars(swaps: pd.DataFrame, interval_seconds: int) -> pd.DataFrame:
 
     df = swaps.copy()
     df["price_usdc_per_weth"] = df["sqrt_price_x96"].apply(sqrt_price_x96_to_weth_usdc_price)
-    df["volume_usdc"] = df["amount0"].abs()
+    # amount0 is decoded from the raw Swap event in token0's (USDC's) raw
+    # 6-decimal units, not human dollars — confirmed against live RPC data.
+    # A bare abs(amount0) would be 1,000,000x too large.
+    df["volume_usdc"] = df["amount0"].abs() / (10**config.TOKEN0_DECIMALS)
     df["bar_start"] = (df["timestamp"] // interval_seconds) * interval_seconds
 
     first_bar = int(df["bar_start"].min())

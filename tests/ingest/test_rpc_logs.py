@@ -39,3 +39,8 @@ def test_fetch_swaps_decodes_real_logs():
         assert r.sqrt_price_x96 > 0
         assert r.tx_hash.startswith("0x")
         assert from_block <= r.block_number <= to_block
+        # base_fee_wei comes from the same eth_getBlockByNumber call
+        # already made for the timestamp — no separate backfill pass
+        # needed for records sourced this way (avoids fetching each
+        # block twice).
+        assert r.base_fee_wei > 0
