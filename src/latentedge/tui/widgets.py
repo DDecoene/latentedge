@@ -45,3 +45,14 @@ class ProgressPanel(Widget):
         detail.update(
             f"{percent}% — {unit_label} — {rate_per_sec:.1f} {rate_unit} — ETA {format_eta(eta_seconds)}"
         )
+
+
+class StatsPanel(Widget):
+    """A small label/value table for point-in-time stats (file size, retries, ...)."""
+
+    def compose(self) -> ComposeResult:
+        yield Static("", id=f"{self.id}-body")
+
+    def update_stats(self, rows: list[tuple[str, str]]) -> None:
+        text = "\n".join(f"{label}: {value}" for label, value in rows)
+        self.query_one(f"#{self.id}-body", Static).update(text)

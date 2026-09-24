@@ -1,7 +1,7 @@
 import pytest
 from textual.app import App, ComposeResult
 
-from latentedge.tui.widgets import ProgressPanel, format_eta
+from latentedge.tui.widgets import ProgressPanel, StatsPanel, format_eta
 
 
 class _ProgressPanelHarness(App[None]):
@@ -51,3 +51,26 @@ def test_format_eta_formats_minutes_and_seconds():
 
 def test_format_eta_formats_hours():
     assert format_eta(3725) == "1:02:05"
+
+
+class _StatsPanelHarness(App[None]):
+    def compose(self) -> ComposeResult:
+        yield StatsPanel(id="stats")
+
+
+@pytest.mark.asyncio
+async def test_stats_panel_renders_label_value_rows():
+    app = _StatsPanelHarness()
+    async with app.run_test() as pilot:
+        panel = app.query_one(StatsPanel)
+        panel.update_stats([
+            ("File size", "12.3 MB"),
+            ("Free disk", "45.6 GB"),
+            ("Retries", "2"),
+        ])
+        await pilot.pause()
+        text = str(app.query_one("#stats-body").content)
+
+    assert "File size: 12.3 MB" in text
+    assert "Free disk: 45.6 GB" in text
+    assert "Retries: 2" in text
