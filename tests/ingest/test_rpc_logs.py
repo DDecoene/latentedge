@@ -1,7 +1,7 @@
 import httpx
 
 from latentedge import config
-from latentedge.ingest.rpc_logs import fetch_swaps
+from latentedge.ingest.rpc_logs import fetch_swaps, get_latest_block
 from latentedge.ingest.rpc_logs import _batch_fetch_blocks
 
 RPC_URL = "https://ethereum.publicnode.com"
@@ -69,3 +69,13 @@ def test_batch_fetch_blocks_matches_individually_fetched_results():
             expected_base_fee = int(individual_block["baseFeePerGas"], 16)
 
             assert batched[block_number] == (expected_timestamp, expected_base_fee)
+
+
+def test_get_latest_block_returns_a_plausible_recent_block_number():
+    with httpx.Client(timeout=30.0) as client:
+        latest = get_latest_block(client, RPC_URL)
+        reference = _latest_block_number(client)
+
+    # Two separate calls a moment apart won't return the exact same
+    # block on a live chain — assert they're close instead of equal.
+    assert abs(latest - reference) < 20

@@ -142,3 +142,85 @@ def test_train_launches_dashboard_when_stdout_is_a_tty(monkeypatch: pytest.Monke
     runner.invoke(cli, ["train", "--swaps", str(tmp_path / "swaps.parquet")])
 
     assert launched["called"]
+
+
+def test_ingest_without_block_range_derives_it_from_days_and_chain_head(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    monkeypatch.setattr("latentedge.cli.get_latest_block", lambda client, rpc_url: 1_000_000)
+    captured: dict[str, int] = {}
+
+    def fake_ingest_range(pool_address, from_block, to_block, out, client, rpc_url, **kwargs):
+        captured["from_block"] = from_block
+        captured["to_block"] = to_block
+        return 0
+
+    monkeypatch.setattr("latentedge.cli.ingest_range", fake_ingest_range)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["ingest", "--days", "1", "--out", str(tmp_path / "swaps.parquet")],
+    )
+
+    assert result.exit_code == 0, result.output
+    # 1 day of 12s blocks, minus the safety buffer behind the head.
+    assert captured["to_block"] == 1_000_000 - 5
+    assert captured["from_block"] == 1_000_000 - 5 - 7200 + 1
+
+
+def test_ingest_days_falls_back_to_env_var_when_flag_omitted(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    monkeypatch.setattr("latentedge.cli.get_latest_block", lambda client, rpc_url: 1_000_000)
+    captured: dict[str, int] = {}
+
+    def fake_ingest_range(pool_address, from_block, to_block, out, client, rpc_url, **kwargs):
+        captured["from_block"] = from_block
+        captured["to_block"] = to_block
+        return 0
+
+    monkeypatch.setattr("latentedge.cli.ingest_range", fake_ingest_range)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["ingest", "--out", str(tmp_path / "swaps.parquet")],
+        env={"LATENTEDGE_INGEST_DAYS": "2"},
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["to_block"] == 1_000_000 - 5
+    assert captured["from_block"] == 1_000_000 - 5 - 14400 + 1
+
+
+def test_ingest_explicit_block_range_takes_priority_over_days(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    def unexpected_call(client, rpc_url):
+        raise AssertionError("get_latest_block should not be called when an explicit range is given")
+
+    monkeypatch.setattr("latentedge.cli.get_latest_block", unexpected_call)
+    captured: dict[str, int] = {}
+
+    def fake_ingest_range(pool_address, from_block, to_block, out, client, rpc_url, **kwargs):
+        captured["from_block"] = from_block
+        captured["to_block"] = to_block
+        return 0
+
+    monkeypatch.setattr("latentedge.cli.ingest_range", fake_ingest_range)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["ingest", "--from-block", "10", "--to-block", "20", "--out", str(tmp_path / "swaps.parquet")],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["from_block"] == 10
+    assert captured["to_block"] == 20
+
+
+def test_ingest_rejects_only_one_of_from_block_to_block(tmp_path: Path):
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["ingest", "--from-block", "10", "--out", str(tmp_path / "swaps.parquet")],
+    )
+
+    assert result.exit_code != 0
+    assert "--from-block and --to-block" in result.output

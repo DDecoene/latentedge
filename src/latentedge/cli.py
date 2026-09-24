@@ -18,6 +18,7 @@ from latentedge.ingest.chunked import (
     DEFAULT_RETRY_BACKOFF_SECONDS,
     ingest_range,
 )
+from latentedge.ingest.rpc_logs import get_latest_block
 from latentedge.model import NetReturnRegressor, save
 from latentedge.model import train as train_model
 from latentedge.split import chronological_split
@@ -44,8 +45,15 @@ DEFAULT_RPC_URL = "https://ethereum.publicnode.com"
 
 
 @cli.command()
-@click.option("--from-block", type=int, required=True)
-@click.option("--to-block", type=int, required=True)
+@click.option("--from-block", type=int, default=None, help="Start of the block range. Omit together with --to-block to derive the range from --days instead.")
+@click.option("--to-block", type=int, default=None, help="End of the block range. Omit together with --from-block to derive the range from --days instead.")
+@click.option(
+    "--days",
+    type=float,
+    default=config.DEFAULT_INGEST_DAYS,
+    envvar="LATENTEDGE_INGEST_DAYS",
+    help="How many most-recent days of blocks to ingest, ending near the current chain head — used only when --from-block/--to-block are both omitted. Falls back to the LATENTEDGE_INGEST_DAYS env var (or a .env file), letting a small test run (e.g. 1 day) be tried before committing to a full history pull.",
+)
 @click.option(
     "--rpc-url",
     type=str,
@@ -60,8 +68,9 @@ DEFAULT_RPC_URL = "https://ethereum.publicnode.com"
 @click.option("--max-retries", type=int, default=DEFAULT_MAX_RETRIES)
 @click.option("--retry-backoff-seconds", type=float, default=DEFAULT_RETRY_BACKOFF_SECONDS)
 def ingest(
-    from_block: int,
-    to_block: int,
+    from_block: int | None,
+    to_block: int | None,
+    days: float,
     rpc_url: str,
     out: Path,
     chunk_size: int,
@@ -76,6 +85,17 @@ def ingest(
     # ingest.chunked for the real logic; fetch_swaps already populates
     # base_fee_wei from the same eth_getBlockByNumber call it makes for
     # each block's timestamp, no separate backfill pass.
+    if (from_block is None) != (to_block is None):
+        raise click.UsageError("--from-block and --to-block must be given together, or both omitted to use --days instead.")
+
+    if from_block is None:
+        with httpx.Client(timeout=30.0) as client:
+            head = get_latest_block(client, rpc_url)
+        to_block = head - config.HEAD_BLOCK_SAFETY_BUFFER
+        blocks_in_range = max(int(days * 86400 / config.AVG_BLOCK_SECONDS), 1)
+        from_block = to_block - blocks_in_range + 1
+    assert to_block is not None  # guaranteed by the from_block/to_block XOR check above
+
     out.parent.mkdir(parents=True, exist_ok=True)
 
     if sys.stdout.isatty():

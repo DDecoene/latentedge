@@ -28,6 +28,11 @@ def _rpc_call(client: httpx.Client, rpc_url: str, method: str, params: list[Any]
     return payload["result"]
 
 
+def get_latest_block(client: httpx.Client, rpc_url: str) -> int:
+    result: str = _rpc_call(client, rpc_url, "eth_blockNumber", [])
+    return int(result, 16)
+
+
 BLOCK_BATCH_SIZE = 100
 
 
