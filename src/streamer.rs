@@ -11,22 +11,58 @@ pub trait FetchLadder: Send + Sync {
     async fn fetch(&self) -> anyhow::Result<(u64, String)>;
 }
 
-/// Placeholder fetcher wiring real Solana WS RPC + phoenix-sdk decoding;
-/// see this module's note on replacing it with a live subscription before
-/// enabling real trading.
-///
-/// The error message deliberately omits `rpc_url`: that URL often carries
-/// an RPC provider's API key (e.g. Helius), and this error is logged on
-/// every failed poll — including it here would write the key to the log
-/// file repeatedly for the life of the process.
-pub struct RpcPollFetcher {
-    pub rpc_url: String,
+#[derive(serde::Deserialize)]
+struct JupiterQuoteResponse {
+    #[serde(rename = "outAmount")]
+    out_amount: String,
+    #[serde(rename = "priceImpactPct")]
+    price_impact_pct: String,
 }
 
+/// Polls Jupiter's quote endpoint for a fixed reference size, deriving a
+/// synthetic single-level bid/ask spread. Jupiter has no push/WS feed, so
+/// this is polling, not streaming; run_streamer's existing backoff covers
+/// fetch failures the same way it covered a dropped WS connection before.
+pub struct JupiterQuotePoller {
+    pub jupiter_base_url: String,
+    pub base_mint: String,
+    pub quote_mint: String,
+}
+
+const REFERENCE_QUOTE_ATOMS: u64 = 1_000_000; // 1 USDC at 6 decimals
+
 #[async_trait::async_trait]
-impl FetchLadder for RpcPollFetcher {
+impl FetchLadder for JupiterQuotePoller {
     async fn fetch(&self) -> anyhow::Result<(u64, String)> {
-        anyhow::bail!("RpcPollFetcher fetch not yet implemented — see this module's note")
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(500))
+            .build()?;
+        let url = format!(
+            "{}/quote?inputMint={}&outputMint={}&amount={}",
+            self.jupiter_base_url, self.quote_mint, self.base_mint, REFERENCE_QUOTE_ATOMS
+        );
+        let response = client.get(url).send().await?.error_for_status()?;
+        let quote: JupiterQuoteResponse = response.json().await?;
+
+        let ask_price: u64 = quote.out_amount.parse()?;
+        let price_impact: f64 = quote.price_impact_pct.parse().unwrap_or(0.0);
+        let impact_atoms = ((ask_price as f64) * price_impact).round() as u64;
+        // Guarantee bid < ask even when priceImpactPct is 0 or unparsable,
+        // since phoenix_decode::validate_ladder rejects a crossed book.
+        let bid_price = ask_price.saturating_sub(impact_atoms.max(1));
+
+        let raw_json = serde_json::json!({
+            "bids": [[bid_price, 1]],
+            "asks": [[ask_price, 1]],
+        })
+        .to_string();
+
+        let slot = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        Ok((slot, raw_json))
     }
 }
 
@@ -128,11 +164,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rpc_poll_fetcher_error_never_includes_the_rpc_url() {
-        let fetcher = RpcPollFetcher {
-            rpc_url: "wss://mainnet.helius-rpc.com/?api-key=SECRET123".to_string(),
+    async fn jupiter_quote_poller_produces_a_valid_ladder() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/quote"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "outAmount": "5000000",
+                "priceImpactPct": "0.001"
+            })))
+            .mount(&server)
+            .await;
+
+        let poller = JupiterQuotePoller {
+            jupiter_base_url: server.uri(),
+            base_mint: "base".to_string(),
+            quote_mint: "quote".to_string(),
         };
-        let err = fetcher.fetch().await.unwrap_err();
-        assert!(!err.to_string().contains("SECRET123"));
+
+        let (slot, raw_json) = poller.fetch().await.expect("fetch should succeed");
+        assert!(slot > 0);
+        let snapshot = decode_from_ladder_json("m", slot, &raw_json)
+            .expect("poller output must be a valid, uncrossed ladder");
+        assert!(snapshot.bids[0].0 < snapshot.asks[0].0);
+    }
+
+    #[tokio::test]
+    async fn jupiter_quote_poller_errors_instead_of_panicking_on_bad_response() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/quote"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let poller = JupiterQuotePoller {
+            jupiter_base_url: server.uri(),
+            base_mint: "base".to_string(),
+            quote_mint: "quote".to_string(),
+        };
+
+        assert!(poller.fetch().await.is_err());
     }
 }

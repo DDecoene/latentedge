@@ -1,7 +1,7 @@
 use layatrade_rs::config::Config;
 use layatrade_rs::executor::{evaluate_trade, SafetyGuardState};
 use layatrade_rs::laya_client::LayaClient;
-use layatrade_rs::streamer::{run_streamer, RpcPollFetcher};
+use layatrade_rs::streamer::{run_streamer, JupiterQuotePoller};
 use layatrade_rs::tui::run_tui;
 use layatrade_rs::types::{BotState, TradeEvent};
 use std::sync::Arc;
@@ -31,7 +31,11 @@ async fn main() -> anyhow::Result<()> {
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
     let (snapshot_tx, mut snapshot_rx) = mpsc::channel(16);
 
-    let fetcher = Arc::new(RpcPollFetcher { rpc_url: config.solana_rpc_url.clone() });
+    let fetcher = Arc::new(JupiterQuotePoller {
+        jupiter_base_url: config.jupiter_base_url.clone(),
+        base_mint: config.base_mint.clone(),
+        quote_mint: config.quote_mint.clone(),
+    });
 
     let streamer_state = state.clone();
     let streamer_config = config.clone();
@@ -39,7 +43,7 @@ async fn main() -> anyhow::Result<()> {
     let streamer_handle = tokio::spawn(async move {
         let _ = run_streamer(
             fetcher,
-            streamer_config.phoenix_market_address,
+            format!("{}/{}", streamer_config.base_mint, streamer_config.quote_mint),
             streamer_state,
             snapshot_tx,
             streamer_shutdown,
