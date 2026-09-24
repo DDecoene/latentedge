@@ -1,3 +1,0 @@
-laya-mlx
-fastapi
-uvicorn[standard]
