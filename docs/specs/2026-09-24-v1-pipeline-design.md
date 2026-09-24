@@ -1,6 +1,6 @@
 # latentedge v1 pipeline — design spec
 
-Status: draft, awaiting review.
+Status: approved 2026-09-24.
 
 ## 1. Goal and scope
 
