@@ -1,4 +1,5 @@
 pub mod backtest_executor;
+pub mod backtest_tui;
 pub mod config;
 pub mod historical_data;
 pub mod executor;
