@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
-from latentedge.cli import cli
+from latentedge.cli import DEFAULT_RPC_URL, cli
 
 
 def test_cli_exposes_expected_subcommands():
@@ -66,3 +66,58 @@ def test_cli_loads_dotenv_file_from_current_directory(tmp_path: Path, monkeypatc
     runner.invoke(cli, ["ingest", "--from-block", "1", "--to-block", "2"])
 
     assert captured["rpc_url"] == "https://example-from-dotenv.invalid"
+
+
+def test_ingest_launches_dashboard_when_stdout_is_a_tty(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    launched = {"called": False}
+
+    class _FakeApp:
+        def __init__(self, start_screen):
+            launched["called"] = True
+            self.start_screen = start_screen
+
+        def run(self):
+            pass
+
+    # CliRunner.invoke() replaces sys.stdout with its own capture stream
+    # (click.testing._NamedTextIOWrapper) for the duration of the call,
+    # so patching the pre-invoke stdout object's isatty has no effect on
+    # what the command actually sees — patch the class instead.
+    monkeypatch.setattr("click.testing._NamedTextIOWrapper.isatty", lambda self: True)
+    monkeypatch.setattr("latentedge.cli.LatentEdgeApp", _FakeApp)
+
+    runner = CliRunner()
+    runner.invoke(
+        cli,
+        ["ingest", "--from-block", "1", "--to-block", "2", "--out", str(tmp_path / "swaps.parquet")],
+    )
+
+    assert launched["called"]
+
+
+def test_ingest_falls_back_to_plain_output_when_stdout_is_not_a_tty(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    # CliRunner's captured stdout is never a real TTY, so this is
+    # actually today's default behavior for every other CLI test in
+    # this file too — this test makes that fallback explicit.
+    # load_dotenv() sets real os.environ entries with no per-test
+    # cleanup, so an earlier test in this file (or elsewhere in the
+    # run) can leak LATENTEDGE_RPC_URL into this one; clear it so the
+    # default is deterministic regardless of test order.
+    monkeypatch.delenv("LATENTEDGE_RPC_URL", raising=False)
+    captured: dict[str, str] = {}
+
+    def fake_ingest_range(pool_address, from_block, to_block, out, client, rpc_url, **kwargs):
+        captured["rpc_url"] = rpc_url
+        return 0
+
+    monkeypatch.setattr("latentedge.cli.ingest_range", fake_ingest_range)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["ingest", "--from-block", "1", "--to-block", "2", "--out", str(tmp_path / "swaps.parquet")],
+    )
+
+    assert result.exit_code == 0
+    assert captured["rpc_url"] == DEFAULT_RPC_URL
+    assert "wrote 0 new swap records" in result.output

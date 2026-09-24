@@ -1,3 +1,4 @@
+import sys
 from pathlib import Path
 
 import click
@@ -21,6 +22,8 @@ from latentedge.model import train as train_model
 from latentedge.split import chronological_split
 from latentedge.store import read_swaps
 from latentedge.training_data import FEATURE_COLUMNS, assemble_training_data
+from latentedge.tui.app import LatentEdgeApp
+from latentedge.tui.ingest_screen import IngestScreen
 
 
 @click.group()
@@ -72,6 +75,17 @@ def ingest(
     # base_fee_wei from the same eth_getBlockByNumber call it makes for
     # each block's timestamp, no separate backfill pass.
     out.parent.mkdir(parents=True, exist_ok=True)
+
+    if sys.stdout.isatty():
+        screen = IngestScreen(
+            pool_address=config.POOL_ADDRESS, from_block=from_block, to_block=to_block,
+            out_path=out, client_factory=lambda: httpx.Client(timeout=30.0), rpc_url=rpc_url,
+            chunk_size=chunk_size, max_workers=max_workers,
+            flush_every_n_chunks=flush_every_n_chunks, max_retries=max_retries,
+            retry_backoff_seconds=retry_backoff_seconds, ingest_fn=ingest_range,
+        )
+        LatentEdgeApp(start_screen=screen).run()
+        return
 
     def report(chunk_start: int, chunk_end: int, count: int) -> None:
         click.echo(f"  blocks {chunk_start}-{chunk_end}: {count} swaps")
