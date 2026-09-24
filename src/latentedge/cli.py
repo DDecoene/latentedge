@@ -47,11 +47,14 @@ def train(swaps: Path, out: Path, epochs: int) -> None:
     labeled = label_bars(bar_df, swap_df, tp_sl_fraction=0.01)
     labeled = labeled[~labeled["excluded"]].reset_index(drop=True)
     featured = compute_features(labeled, return_windows=[5, 15, 30], volatility_window=15)
-    featured = featured.dropna().reset_index(drop=True)
-
-    train_split, _validate_split, _test_split = chronological_split(featured, train_fraction=0.7, validate_fraction=0.15)
 
     feature_columns = ["return_5", "return_15", "return_30", "volatility", "volume_usdc", "bars_since_swap"]
+    # A bare dropna() drops on the "reason" column too, which is
+    # legitimately None for every non-excluded row — that wipes the
+    # entire frame. Target the columns that actually matter for training.
+    featured = featured.dropna(subset=feature_columns + ["net_return"]).reset_index(drop=True)
+
+    train_split, _validate_split, _test_split = chronological_split(featured, train_fraction=0.7, validate_fraction=0.15)
     x = train_split[feature_columns].to_numpy(dtype="float32")
     y = train_split["net_return"].to_numpy(dtype="float32")
 
