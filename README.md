@@ -30,12 +30,18 @@ tries to find one.
   pool's own data — not a CEX proxy — sidesteps the question of whether a
   signal learned elsewhere transfers to this venue. Sourced via a subgraph
   or archive-node `eth_getLogs`, whichever proves simpler in practice.
-- **Label: net-profitable trade outcome, not raw price direction.** Triple-
+- **Label: net-profitable trade outcome, not raw price direction — and a
+  regression target (net return), not a binary classification.** Triple-
   barrier labeling (take-profit / stop-loss / time-limit) over a 30-minute
   horizon, with the bracket outcome computed net of the pool's fee tier and
-  an estimated slippage from pool depth at trade size. This ties the label
-  to what a real trade would actually earn, matching the safety-guard/
-  position-sizing already in the architecture.
+  an estimated slippage from pool depth at trade size. Regression over
+  classification because magnitude is what position sizing needs, and P&L
+  — not label accuracy — is the metric that actually matters.
+- **Stack: Python throughout, MLX for the model.** No second language, no
+  service boundary — everything from ingestion through the backtest
+  harness runs in-process. MLX is Python-first and best-tuned for Apple
+  Silicon; the project's real goal is learning ML, and Python is where
+  that ecosystem actually lives (see the spec for the full rationale).
 - **v1 pool: WETH/USDC, 0.05% fee tier.** The most liquid, longest-history,
   most-traded Uniswap v3 pool. Deliberately the hardest market to find an
   edge in, chosen so pipeline correctness (data, labeling, backtest
