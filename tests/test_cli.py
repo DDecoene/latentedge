@@ -100,10 +100,12 @@ def test_ingest_falls_back_to_plain_output_when_stdout_is_not_a_tty(monkeypatch:
     # actually today's default behavior for every other CLI test in
     # this file too — this test makes that fallback explicit.
     # load_dotenv() sets real os.environ entries with no per-test
-    # cleanup, so an earlier test in this file (or elsewhere in the
-    # run) can leak LATENTEDGE_RPC_URL into this one; clear it so the
-    # default is deterministic regardless of test order.
+    # cleanup, and reads a real .env file from the current directory if
+    # one exists (e.g. a developer's own RPC provider key) — clear the
+    # env var and run from an empty tmp_path so the default is
+    # deterministic regardless of test order or the real repo checkout.
     monkeypatch.delenv("LATENTEDGE_RPC_URL", raising=False)
+    monkeypatch.chdir(tmp_path)
     captured: dict[str, str] = {}
 
     def fake_ingest_range(pool_address, from_block, to_block, out, client, rpc_url, **kwargs):
