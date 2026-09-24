@@ -18,7 +18,10 @@ pub async fn fetch_or_load_cached(
         }
     }
 
-    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10)).build()?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .user_agent("layatrade-rs-backtest/0.1")
+        .build()?;
     let url = format!("{coingecko_base_url}/coins/solana/market_chart?vs_currency=usd&days={days}");
     let mut request = client.get(url);
     if let Some(key) = api_key {
@@ -116,6 +119,30 @@ mod tests {
 
         let result = fetch_or_load_cached(&server.uri(), Some("my-key"), 90, &cache_path).await;
         assert!(result.is_ok(), "request must have sent the header to match the mock: {result:?}");
+        std::fs::remove_file(&cache_path).ok();
+    }
+
+    #[tokio::test]
+    async fn sends_a_user_agent_header() {
+        // reqwest sends no User-Agent by default; CoinGecko's real API
+        // (confirmed against the live endpoint) returns 403 without one.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/coins/solana/market_chart"))
+            .and(wiremock::matchers::header_exists("User-Agent"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "prices": [[1700000000000i64, 150.5]],
+                "market_caps": [],
+                "total_volumes": []
+            })))
+            .mount(&server)
+            .await;
+
+        let cache_path = std::env::temp_dir().join(format!("layatrade_test_cache_ua_{}.json", std::process::id()));
+        std::fs::remove_file(&cache_path).ok();
+
+        let result = fetch_or_load_cached(&server.uri(), None, 90, &cache_path).await;
+        assert!(result.is_ok(), "request must send a User-Agent header to match the mock: {result:?}");
         std::fs::remove_file(&cache_path).ok();
     }
 }
