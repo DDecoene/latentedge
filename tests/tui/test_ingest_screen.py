@@ -1,3 +1,4 @@
+import threading
 from pathlib import Path
 
 import httpx
@@ -8,6 +9,7 @@ from latentedge.schema import SwapRecord
 from latentedge.store import read_swaps
 from latentedge.tui.app import LatentEdgeApp
 from latentedge.tui.ingest_screen import IngestScreen
+from latentedge.tui.train_screen import TrainScreen
 
 
 def _record(block_number: int) -> SwapRecord:
@@ -125,3 +127,84 @@ async def test_ingest_screen_logs_error_on_exhausted_retries_without_crashing(tm
 
     assert screen.error is not None
     assert "permanent failure" in screen.error
+
+
+@pytest.mark.asyncio
+async def test_ingest_screen_shows_completion_prompt(tmp_path: Path):
+    out_path = tmp_path / "swaps.parquet"
+    screen = IngestScreen(
+        pool_address="0xpool", from_block=0, to_block=9, out_path=out_path,
+        client_factory=lambda: httpx.Client(), rpc_url="http://fake",
+        chunk_size=10, max_workers=1, flush_every_n_chunks=1,
+        max_retries=1, retry_backoff_seconds=0.001, fetch_fn=_fake_fetch,
+    )
+    app = LatentEdgeApp(start_screen=screen)
+
+    async with app.run_test() as pilot:
+        for _ in range(50):
+            await pilot.pause(0.01)
+            if screen.is_complete:
+                break
+        action_bar = app.screen.query_one("#ingest-action-bar")
+        text = str(action_bar.content)
+
+    assert "Train now" in text
+    assert "Exit" in text
+    assert str(out_path) in text or "1" in text  # swap count or path present
+
+
+@pytest.mark.asyncio
+async def test_ingest_screen_train_key_pushes_train_screen(tmp_path: Path):
+    out_path = tmp_path / "swaps.parquet"
+    screen = IngestScreen(
+        pool_address="0xpool", from_block=0, to_block=9, out_path=out_path,
+        client_factory=lambda: httpx.Client(), rpc_url="http://fake",
+        chunk_size=10, max_workers=1, flush_every_n_chunks=1,
+        max_retries=1, retry_backoff_seconds=0.001, fetch_fn=_fake_fetch,
+    )
+    app = LatentEdgeApp(start_screen=screen)
+
+    async with app.run_test() as pilot:
+        for _ in range(50):
+            await pilot.pause(0.01)
+            if screen.is_complete:
+                break
+        await pilot.press("t")
+        await pilot.pause()
+        active_screen = app.screen
+
+    assert isinstance(active_screen, TrainScreen)
+    assert active_screen.swaps_path == out_path
+
+
+@pytest.mark.asyncio
+async def test_ingest_screen_train_key_ignored_before_completion(tmp_path: Path):
+    # A fetch gated on an Event, so completion is deterministically held
+    # back until the test explicitly releases it — a fixed time.sleep
+    # raced against the pilot's own event-loop-idle wait and was flaky.
+    release_fetch = threading.Event()
+
+    def gated_fetch(pool_address, from_block, to_block, client, rpc_url):
+        release_fetch.wait()
+        return [_record(from_block)]
+
+    out_path = tmp_path / "swaps.parquet"
+    screen = IngestScreen(
+        pool_address="0xpool", from_block=0, to_block=9, out_path=out_path,
+        client_factory=lambda: httpx.Client(), rpc_url="http://fake",
+        chunk_size=10, max_workers=1, flush_every_n_chunks=1,
+        max_retries=1, retry_backoff_seconds=0.001, fetch_fn=gated_fetch,
+    )
+    app = LatentEdgeApp(start_screen=screen)
+
+    try:
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert not screen.is_complete
+            await pilot.press("t")
+            await pilot.pause()
+            active_screen = app.screen
+    finally:
+        release_fetch.set()
+
+    assert not isinstance(active_screen, TrainScreen)

@@ -8,10 +8,13 @@ from pathlib import Path
 
 import httpx
 from textual.app import ComposeResult
+from textual.binding import Binding
 from textual.screen import Screen
+from textual.widgets import Static
 
 from latentedge.ingest.chunked import ingest_range as default_ingest_range
 from latentedge.ingest.rpc_logs import fetch_swaps
+from latentedge.tui.train_screen import TrainScreen
 from latentedge.tui.widgets import LogPanel, ProgressPanel, StatsPanel
 
 RATE_WINDOW_SIZE = 20
@@ -19,6 +22,11 @@ STATS_REFRESH_INTERVAL_SECONDS = 1.0
 
 
 class IngestScreen(Screen):
+    BINDINGS = [
+        Binding("t", "train_now", "Train now", show=False),
+        Binding("q", "exit_now", "Exit", show=False),
+    ]
+
     def __init__(
         self,
         pool_address: str,
@@ -62,6 +70,7 @@ class IngestScreen(Screen):
         yield ProgressPanel(id="ingest-progress")
         yield StatsPanel(id="ingest-stats")
         yield LogPanel(id="ingest-log")
+        yield Static("", id="ingest-action-bar")
 
     def on_mount(self) -> None:
         total = max(self.to_block - self.from_block + 1, 0)
@@ -133,7 +142,21 @@ class IngestScreen(Screen):
         self.is_complete = True
         self.total_written = total
         self._refresh_disk_stats()
+        self.query_one("#ingest-action-bar", Static).update(
+            f"Ingestion complete — wrote {total} swaps to {self.out_path}. "
+            "[T] Train now   [Q] Exit"
+        )
 
     def _handle_error(self, message: str) -> None:
         self.error = message
         self.query_one("#ingest-log", LogPanel).log_line(f"ERROR: {message}")
+
+    def action_train_now(self) -> None:
+        if not self.is_complete:
+            return
+        self.app.push_screen(TrainScreen(swaps_path=self.out_path))
+
+    def action_exit_now(self) -> None:
+        if not self.is_complete:
+            return
+        self.app.exit()
