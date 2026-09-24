@@ -59,7 +59,13 @@ impl Config {
             base_mint: get_or("BASE_MINT", "So11111111111111111111111111111111111111112"),
             quote_mint: get_or("QUOTE_MINT", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"),
             poll_interval_ms: get_or("POLL_INTERVAL_MS", "5000").parse()?,
-            trade_size_pct: get_or("TRADE_SIZE_PCT", "0.1").parse()?,
+            trade_size_pct: {
+                let pct: f64 = get_or("TRADE_SIZE_PCT", "0.1").parse()?;
+                if !(pct > 0.0 && pct <= 1.0) {
+                    anyhow::bail!("TRADE_SIZE_PCT must be in (0, 1], got {pct}");
+                }
+                pct
+            },
             starting_capital: get_or("STARTING_CAPITAL", "1000000000").parse()?,
         })
     }
@@ -127,6 +133,22 @@ mod tests {
         let config = Config::from_map(&vars).expect("should parse overrides");
         assert_eq!(config.trade_size_pct, 0.25);
         assert_eq!(config.starting_capital, 500);
+    }
+
+    #[test]
+    fn rejects_trade_size_pct_outside_zero_to_one() {
+        let mut too_high = std::collections::HashMap::new();
+        too_high.insert("TRADE_SIZE_PCT".to_string(), "10".to_string());
+        let err = Config::from_map(&too_high).unwrap_err();
+        assert!(err.to_string().contains("TRADE_SIZE_PCT"));
+
+        let mut negative = std::collections::HashMap::new();
+        negative.insert("TRADE_SIZE_PCT".to_string(), "-0.1".to_string());
+        assert!(Config::from_map(&negative).is_err());
+
+        let mut zero = std::collections::HashMap::new();
+        zero.insert("TRADE_SIZE_PCT".to_string(), "0".to_string());
+        assert!(Config::from_map(&zero).is_err());
     }
 
     #[test]

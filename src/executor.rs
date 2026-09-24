@@ -93,18 +93,26 @@ fn kill_switch_present(path: &str) -> bool {
 }
 
 const QUOTE_TIMEOUT: Duration = Duration::from_millis(500);
+const SWAP_TIMEOUT: Duration = Duration::from_millis(3000);
 
+/// Returns the typed quote fields alongside the raw response JSON: the
+/// raw value is what actually gets POSTed to /swap in live mode, so the
+/// swap executes against the exact quote that passed every guard, not a
+/// second, unchecked one.
 async fn fetch_quote(
     jupiter_base_url: &str,
     input_mint: &str,
     output_mint: &str,
     amount: u64,
-) -> Option<JupiterQuote> {
+    slippage_bps: u16,
+) -> Option<(JupiterQuote, serde_json::Value)> {
     let client = reqwest::Client::builder().timeout(QUOTE_TIMEOUT).build().ok()?;
     let url = format!(
-        "{jupiter_base_url}/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount}"
+        "{jupiter_base_url}/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount}&slippageBps={slippage_bps}"
     );
-    client.get(url).send().await.ok()?.json::<JupiterQuote>().await.ok()
+    let raw: serde_json::Value = client.get(url).send().await.ok()?.json().await.ok()?;
+    let quote: JupiterQuote = serde_json::from_value(raw.clone()).ok()?;
+    Some((quote, raw))
 }
 
 fn refusal_event(trade_size: u64, price: u64, dry_run: bool, note: String) -> TradeEvent {
@@ -140,20 +148,14 @@ fn sign_swap_transaction(
     Ok(signed)
 }
 
-/// Fetches a swap transaction from Jupiter for the already-approved
-/// quote, signs it, and submits it. Only reachable from live mode, after
-/// every guard has already passed. NOTE for the implementer: verify
-/// `RpcClient`'s exact method name/signature for submitting a
-/// `VersionedTransaction` against the currently pinned `solana-client`
-/// version before relying on this in production — the Solana RPC client
-/// surface for versioned transactions has changed across versions, and
-/// this path is not exercised by an automated test against a real
-/// network (see this task's tests: they cover local signing only).
+/// Signs and submits the swap for the quote that already passed every
+/// guard — `quote_response` must be the exact raw JSON `fetch_quote`
+/// returned, not a re-fetched one, so the on-chain transaction executes
+/// against the same price/slippage terms the caller approved. Only
+/// reachable from live mode, after every guard has already passed.
 async fn submit_live_swap(
     config: &Config,
-    input_mint: &str,
-    output_mint: &str,
-    amount: u64,
+    quote_response: &serde_json::Value,
 ) -> anyhow::Result<String> {
     let keypair_path = config
         .solana_keypair_path
@@ -162,17 +164,11 @@ async fn submit_live_swap(
     let keypair = solana_sdk::signer::keypair::read_keypair_file(keypair_path)
         .map_err(|e| anyhow::anyhow!("failed to read keypair file: {e}"))?;
 
-    let client = reqwest::Client::builder().timeout(QUOTE_TIMEOUT).build()?;
-    let quote_url = format!(
-        "{}/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount}",
-        config.jupiter_base_url
-    );
-    let quote: serde_json::Value = client.get(quote_url).send().await?.json().await?;
-
+    let client = reqwest::Client::builder().timeout(SWAP_TIMEOUT).build()?;
     let swap_response: JupiterSwapResponse = client
         .post(format!("{}/swap", config.jupiter_base_url))
         .json(&serde_json::json!({
-            "quoteResponse": quote,
+            "quoteResponse": quote_response,
             "userPublicKey": keypair.pubkey().to_string(),
             "wrapAndUnwrapSol": true,
         }))
@@ -183,8 +179,8 @@ async fn submit_live_swap(
 
     let signed = sign_swap_transaction(&swap_response.swap_transaction, &keypair)?;
 
-    let rpc_client = solana_client::rpc_client::RpcClient::new(config.solana_rpc_url.clone());
-    let signature = rpc_client.send_and_confirm_transaction(&signed)?;
+    let rpc_client = solana_client::nonblocking::rpc_client::RpcClient::new(config.solana_rpc_url.clone());
+    let signature = rpc_client.send_and_confirm_transaction(&signed).await?;
     Ok(signature.to_string())
 }
 
@@ -224,11 +220,27 @@ pub async fn evaluate_trade(
         Some(_) => (config.base_mint.as_str(), config.quote_mint.as_str()),
     };
 
-    let Some(quote) = fetch_quote(&config.jupiter_base_url, input_mint, output_mint, trade_size).await else {
+    let Some((quote, raw_quote)) =
+        fetch_quote(&config.jupiter_base_url, input_mint, output_mint, trade_size, config.max_slippage_bps).await
+    else {
         return (refusal_event(trade_size, 0, dry_run, "refused: quote fetch failed".to_string()), position, wallet);
     };
 
-    let quote_price: u64 = quote.out_amount.parse().unwrap_or(0);
+    let quote_price: u64 = match quote.out_amount.parse() {
+        Ok(price) if price > 0 => price,
+        _ => {
+            return (
+                refusal_event(
+                    trade_size,
+                    0,
+                    dry_run,
+                    "refused: quote returned a zero or unparsable amount".to_string(),
+                ),
+                position,
+                wallet,
+            );
+        }
+    };
     let realized_slippage_bps = slippage_bps_from_impact(&quote.price_impact_pct);
     if realized_slippage_bps > config.max_slippage_bps {
         return (
@@ -249,9 +261,17 @@ pub async fn evaluate_trade(
     guard.record_trade();
 
     if !dry_run {
-        if let Err(e) = submit_live_swap(config, input_mint, output_mint, trade_size).await {
+        if let Err(e) = submit_live_swap(config, &raw_quote).await {
             return (
-                refusal_event(trade_size, quote_price, dry_run, format!("refused: live submission failed: {e}")),
+                refusal_event(
+                    trade_size,
+                    quote_price,
+                    dry_run,
+                    format!(
+                        "LIVE SUBMISSION FAILED — wallet state may be inconsistent with the \
+                         chain, verify manually before continuing: {e}"
+                    ),
+                ),
                 position,
                 wallet,
             );
@@ -591,6 +611,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn next_buy_size_decompounds_after_a_losing_round_trip() {
+        let server = MockServer::start().await;
+        // 10% of a shrunk 900 equity = 90, not 100 — a mock that only
+        // matches amount=90 proves sizing shrinks with a realized loss,
+        // the symmetric case to next_buy_size_compounds_with_grown_equity.
+        Mock::given(method("GET"))
+            .and(path("/quote"))
+            .and(wiremock::matchers::query_param("amount", "90"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "outAmount": "5000000", "priceImpactPct": "0.001"
+            })))
+            .mount(&server)
+            .await;
+
+        let mut config = test_config("/tmp/layatrade_test_kill_15");
+        config.jupiter_base_url = server.uri();
+        config.trade_size_pct = 0.1;
+        let mut guard = SafetyGuardState::new();
+        let state = Arc::new(RwLock::new(BotState::new()));
+
+        // Equity already shrank to 900 from a prior losing round trip.
+        let shrunk_wallet = WalletState { starting_capital: 1000, realized_pnl: -100 };
+        let (event, _position, _wallet) =
+            evaluate_trade(&config, &mut guard, &state, None, shrunk_wallet).await;
+
+        assert_eq!(event.side, "buy");
+        assert_eq!(event.size, 90);
+    }
+
+    #[tokio::test]
     async fn equity_floor_holds_when_wallet_has_large_realized_losses() {
         let wallet = WalletState { starting_capital: 1000, realized_pnl: -5000 };
         assert_eq!(wallet.equity(), 0);
@@ -671,5 +721,83 @@ mod tests {
         let signed = sign_swap_transaction(&encoded, &keypair)
             .expect("a well-formed swap transaction should sign cleanly");
         assert!(signed.verify_with_results().iter().all(|ok| *ok));
+    }
+
+    #[tokio::test]
+    async fn fetch_quote_sends_slippage_bps_matching_config() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/quote"))
+            .and(wiremock::matchers::query_param("slippageBps", "50"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "outAmount": "5000000", "priceImpactPct": "0.001"
+            })))
+            .mount(&server)
+            .await;
+
+        // No mock registered without the slippageBps param, so a request
+        // missing it 404s and fetch_quote returns None — proving the
+        // param is actually sent, not just documented.
+        let result = fetch_quote(&server.uri(), "in", "out", 100, 50).await;
+        assert!(result.is_some(), "fetch_quote must send slippageBps=50 to match the mock");
+    }
+
+    #[tokio::test]
+    async fn submit_live_swap_reuses_the_approved_quote_without_refetching() {
+        use solana_sdk::message::{v0, VersionedMessage};
+        use solana_sdk::signer::keypair::Keypair;
+        use solana_sdk::signer::Signer;
+        use solana_sdk::transaction::VersionedTransaction;
+
+        let keypair = Keypair::new();
+        let blockhash = solana_sdk::hash::Hash::default();
+        let message = VersionedMessage::V0(
+            v0::Message::try_compile(&keypair.pubkey(), &[], &[], blockhash).unwrap(),
+        );
+        let unsigned_tx = VersionedTransaction {
+            signatures: vec![solana_sdk::signature::Signature::default()],
+            message,
+        };
+        let serialized = bincode::serialize(&unsigned_tx).unwrap();
+        let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &serialized);
+
+        let keypair_file = tempfile_with_keypair(&keypair);
+
+        let server = MockServer::start().await;
+        // Deliberately no /quote mock: submit_live_swap must not re-fetch
+        // a quote — it already has the approved one from evaluate_trade.
+        Mock::given(method("GET"))
+            .and(path("/quote"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/swap"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "swapTransaction": encoded
+            })))
+            .mount(&server)
+            .await;
+
+        let mut config = test_config("/tmp/layatrade_test_kill_14");
+        config.jupiter_base_url = server.uri();
+        config.solana_keypair_path = Some(keypair_file.clone());
+
+        let approved_quote = serde_json::json!({"outAmount": "5000000", "priceImpactPct": "0.001"});
+        // This will fail at the RpcClient submission step (no real
+        // network available in a unit test) — that's expected and fine;
+        // the point of this test is the wiremock .expect(0) above, which
+        // fails the test if /quote is ever called.
+        let _ = submit_live_swap(&config, &approved_quote).await;
+
+        server.verify().await;
+        std::fs::remove_file(&keypair_file).ok();
+    }
+
+    fn tempfile_with_keypair(keypair: &solana_sdk::signer::keypair::Keypair) -> String {
+        let path = format!("/tmp/layatrade_test_keypair_{}.json", std::process::id());
+        std::fs::write(&path, serde_json::to_string(&keypair.to_bytes().to_vec()).unwrap()).unwrap();
+        path
     }
 }
