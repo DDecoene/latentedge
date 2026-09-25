@@ -25,3 +25,10 @@ GAS_USED_PER_SWAP = 150_000
 AVG_BLOCK_SECONDS = 12.0
 DEFAULT_INGEST_DAYS = 365.0
 HEAD_BLOCK_SAFETY_BUFFER = 5
+
+# WETH/USDC 0.05% pool deployment block — no swap history is possible
+# before it, so a --days window that turns out to already be fully
+# ingested stops walking backward here rather than requesting
+# pre-deployment blocks. Found by binary-searching eth_getCode against
+# an archive RPC endpoint.
+POOL_CREATION_BLOCK = 12_376_729

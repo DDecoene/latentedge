@@ -266,3 +266,41 @@ def test_ingest_shows_plain_language_error_when_plain_mode_ingest_fails_to_conne
     assert result.exit_code != 0
     assert "Traceback" not in result.output
     assert "internet connection" in result.output
+
+
+def test_ingest_days_window_walks_back_past_already_ingested_blocks(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    # A chain head high enough to stay well above the pool's real
+    # deployment block (config.POOL_CREATION_BLOCK) so this test
+    # exercises the backward walk itself, not the floor clamp.
+    monkeypatch.setattr("latentedge.cli.get_latest_block", lambda client, rpc_url: 13_000_000)
+
+    out_path = tmp_path / "swaps.parquet"
+    naive_to = 13_000_000 - 5
+    blocks_in_range = 7200  # 1 day at 12s/block
+    naive_from = naive_to - blocks_in_range + 1
+
+    from latentedge.ingest.progress import write_progress
+
+    write_progress(out_path, [(naive_from, naive_to)])  # the whole naive window is already ingested
+
+    captured: dict[str, int] = {}
+
+    def fake_ingest_range(pool_address, from_block, to_block, out, client, rpc_url, **kwargs):
+        captured["from_block"] = from_block
+        captured["to_block"] = to_block
+        return 0
+
+    monkeypatch.setattr("latentedge.cli.ingest_range", fake_ingest_range)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["ingest", "--days", "1", "--out", str(out_path)],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["to_block"] == naive_to
+    # The whole naive window was already covered, so the request must
+    # walk back to an earlier, equally-sized uncovered window instead of
+    # silently doing nothing.
+    assert captured["from_block"] == naive_from - blocks_in_range

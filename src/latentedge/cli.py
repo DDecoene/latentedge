@@ -18,6 +18,7 @@ from latentedge.ingest.chunked import (
     DEFAULT_RETRY_BACKOFF_SECONDS,
     ingest_range,
 )
+from latentedge.ingest.progress import extend_window_for_new_blocks, read_progress
 from latentedge.ingest.rpc_logs import RpcLogsError, describe_error, get_latest_block
 from latentedge.model import NetReturnRegressor, save
 from latentedge.model import train as train_model
@@ -94,9 +95,17 @@ def ingest(
                 head = get_latest_block(client, rpc_url)
             except (httpx.HTTPError, RpcLogsError) as exc:
                 raise click.ClickException(describe_error(rpc_url, exc)) from None
-        to_block = head - config.HEAD_BLOCK_SAFETY_BUFFER
+        naive_to = head - config.HEAD_BLOCK_SAFETY_BUFFER
         blocks_in_range = max(int(days * 86400 / config.AVG_BLOCK_SECONDS), 1)
-        from_block = to_block - blocks_in_range + 1
+        naive_from = naive_to - blocks_in_range + 1
+        # If the naive most-recent-N-days window is already (partly or
+        # fully) ingested, walk further back toward the pool's
+        # deployment block until a day's worth of genuinely new blocks
+        # is found — never re-request what's already on disk.
+        from_block = extend_window_for_new_blocks(
+            read_progress(out), naive_from, naive_to, blocks_in_range, config.POOL_CREATION_BLOCK,
+        )
+        to_block = naive_to
     assert to_block is not None  # guaranteed by the from_block/to_block XOR check above
 
     out.parent.mkdir(parents=True, exist_ok=True)
