@@ -4,7 +4,8 @@ from pathlib import Path
 import httpx
 import pytest
 
-from latentedge.ingest.chunked import ingest_range, read_progress
+from latentedge.ingest.chunked import ingest_range
+from latentedge.ingest.progress import read_progress
 from latentedge.schema import SwapRecord
 from latentedge.store import read_swaps
 from latentedge.tui.app import LatentEdgeApp
@@ -46,7 +47,7 @@ async def test_ingest_screen_reaches_complete_state(tmp_path: Path):
 
     assert screen.is_complete
     assert screen.total_written == 3
-    assert read_progress(out_path) == 29
+    assert read_progress(out_path) == [(0, 29)]
     assert len(read_swaps(out_path)) == 3
 
 

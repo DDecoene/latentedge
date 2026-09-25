@@ -12,8 +12,9 @@ from textual.binding import Binding
 from textual.screen import Screen
 from textual.widgets import Static
 
-from latentedge.ingest.chunked import FetchFn, read_progress
+from latentedge.ingest.chunked import FetchFn
 from latentedge.ingest.chunked import ingest_range as default_ingest_range
+from latentedge.ingest.progress import read_progress, uncovered_gaps
 from latentedge.ingest.rpc_logs import describe_error, fetch_swaps
 from latentedge.tui.train_screen import DEFAULT_MODEL_OUT_PATH, TrainAssembleFn, TrainScreen
 from latentedge.tui.widgets import LogPanel, ProgressPanel, StatsPanel
@@ -82,15 +83,16 @@ class IngestScreen(Screen[None]):
     def on_mount(self) -> None:
         total = max(self.to_block - self.from_block + 1, 0)
 
-        # A resumed run's already-fetched blocks count toward completed so
-        # the bar doesn't restart at 0% — mirrors ingest_range's own
-        # resume-from-watermark logic in ingest.chunked.
-        resume_from = read_progress(self.out_path)
-        start_block = self.from_block
-        if resume_from is not None and resume_from + 1 > start_block:
-            start_block = min(resume_from + 1, self.to_block + 1)
-        completed = max(start_block - self.from_block, 0)
-        unit_label = f"resuming from block {start_block}" if completed > 0 else "starting..."
+        # Already-ingested blocks within the requested range count
+        # toward completed so the bar doesn't restart at 0% on a
+        # resumed run — mirrors ingest_range's own gap-fill dedup logic
+        # in ingest.chunked.
+        intervals = read_progress(self.out_path)
+        uncovered = sum(
+            end - start + 1 for start, end in uncovered_gaps(intervals, self.from_block, self.to_block)
+        )
+        completed = max(total - uncovered, 0)
+        unit_label = f"resuming ({completed} blocks already ingested)" if completed > 0 else "starting..."
 
         self.query_one("#ingest-progress", ProgressPanel).update_progress(
             completed=completed, total=total, unit_label=unit_label,
