@@ -9,9 +9,13 @@ also prohibitively slow as the file grows, so writes are batched. Progress
 is only ever recorded for data that has actually been flushed to disk —
 a crash between flushes means re-fetching (cheap, deduped) some already-
 fetched chunks on resume, never silently skipping unwritten ones.
+
+Progress is tracked as a set of disjoint block intervals (see
+latentedge.ingest.progress), not a single forward watermark — a request
+only ever fetches the sub-ranges of [from_block, to_block] not already
+covered by a prior run, regardless of how those prior runs were shaped.
 """
 
-import json
 import threading
 import time
 from collections.abc import Callable
@@ -20,6 +24,7 @@ from pathlib import Path
 
 import httpx
 
+from latentedge.ingest.progress import Interval, add_interval, read_progress, uncovered_gaps, write_progress
 from latentedge.ingest.rpc_logs import RateLimitError, fetch_swaps
 from latentedge.schema import SwapRecord
 from latentedge.store import write_swaps
@@ -42,24 +47,6 @@ DEFAULT_MAX_WORKERS = 4
 DEFAULT_FLUSH_EVERY_N_CHUNKS = 50
 
 FetchFn = Callable[[str, int, int, httpx.Client, str], list[SwapRecord]]
-
-
-def _progress_path(out_path: Path) -> Path:
-    return Path(str(out_path) + ".progress.json")
-
-
-def read_progress(out_path: Path) -> int | None:
-    """The last fully-flushed block number, or None if no prior run."""
-    path = _progress_path(out_path)
-    if not path.exists():
-        return None
-    data = json.loads(path.read_text())
-    last_completed_block: int = data["last_completed_block"]
-    return last_completed_block
-
-
-def write_progress(out_path: Path, last_completed_block: int) -> None:
-    _progress_path(out_path).write_text(json.dumps({"last_completed_block": last_completed_block}))
 
 
 def _fetch_chunk_with_retries(
@@ -107,46 +94,57 @@ def ingest_range(
     fetch_fn: FetchFn = fetch_swaps,
 ) -> int:
     """Ingest [from_block, to_block] concurrently, in chunks, flushing to
-    disk (and advancing the resumable progress watermark) every
-    flush_every_n_chunks chunks — never per-chunk, which would mean
-    rewriting the whole output file hundreds of thousands of times over
-    a real year-long pull. Returns the total number of swap records
-    written in this call. Resumes automatically from a prior run's
-    progress file if the requested range overlaps it.
+    disk (and recording newly-covered intervals in the resumable
+    progress file) every flush_every_n_chunks chunks — never per-chunk,
+    which would mean rewriting the whole output file hundreds of
+    thousands of times over a real year-long pull. Returns the total
+    number of swap records written in this call. Any sub-range of
+    [from_block, to_block] already present in a prior run's progress is
+    skipped, never re-fetched.
     """
-    resume_from = read_progress(out_path)
-    start_block = from_block
-    if resume_from is not None and resume_from + 1 > start_block:
-        start_block = resume_from + 1
-
-    chunk_starts = list(range(start_block, to_block + 1, chunk_size))
-    if not chunk_starts:
+    progress_intervals = read_progress(out_path)
+    gaps = uncovered_gaps(progress_intervals, from_block, to_block)
+    if not gaps:
         return 0
 
+    # Chunk each gap independently and concatenate in order — a chunk
+    # never straddles a gap boundary, so an already-covered stretch is
+    # never touched even at its edges.
+    chunk_order: list[int] = []
+    chunk_ceiling: dict[int, int] = {}
+    for gap_start, gap_end in gaps:
+        for chunk_start in range(gap_start, gap_end + 1, chunk_size):
+            chunk_order.append(chunk_start)
+            chunk_ceiling[chunk_start] = gap_end
+
     lock = threading.Lock()
-    # chunk_start -> (chunk_end, records), for chunks that finished but
-    # haven't yet been folded into the contiguous, flush-eligible run.
     completed: dict[int, tuple[int, list[SwapRecord]]] = {}
-    next_watermark_start = start_block
+    expected_index = 0
 
     pending_records: list[SwapRecord] = []
-    pending_last_block: int | None = None
+    # Contiguous runs completed since the last flush — normally one, but
+    # can be several if a flush batch spans more than one previously-
+    # covered gap.
+    pending_intervals: list[Interval] = []
     chunks_since_flush = 0
     total_written = 0
 
     def flush() -> None:
-        nonlocal pending_records, pending_last_block, chunks_since_flush, total_written
-        if pending_last_block is None:
+        nonlocal pending_records, pending_intervals, chunks_since_flush, total_written, progress_intervals
+        if not pending_intervals:
             return
         if pending_records:
             write_swaps(pending_records, out_path)
             total_written += len(pending_records)
-        write_progress(out_path, pending_last_block)
+        for start, end in pending_intervals:
+            progress_intervals = add_interval(progress_intervals, start, end)
+        write_progress(out_path, progress_intervals)
         pending_records = []
+        pending_intervals = []
         chunks_since_flush = 0
 
     def process_chunk(chunk_start: int) -> tuple[int, int, list[SwapRecord]]:
-        chunk_end = min(chunk_start + chunk_size - 1, to_block)
+        chunk_end = min(chunk_start + chunk_size - 1, chunk_ceiling[chunk_start])
         records = _fetch_chunk_with_retries(
             fetch_fn, pool_address, chunk_start, chunk_end, client, rpc_url,
             max_retries, retry_backoff_seconds, on_retry,
@@ -154,7 +152,7 @@ def ingest_range(
         return chunk_start, chunk_end, records
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(process_chunk, cs): cs for cs in chunk_starts}
+        futures = {executor.submit(process_chunk, cs): cs for cs in chunk_order}
         try:
             for future in as_completed(futures):
                 chunk_start, chunk_end, records = future.result()
@@ -162,21 +160,28 @@ def ingest_range(
                 with lock:
                     completed[chunk_start] = (chunk_end, records)
 
-                    # Fold in whatever consecutive run is now available,
-                    # starting from the current watermark — chunks can
-                    # finish out of order, but the watermark (and what we
-                    # flush/report) only ever advances through a
-                    # contiguous, gap-free prefix.
-                    while next_watermark_start in completed:
-                        c_end, recs = completed.pop(next_watermark_start)
+                    # Fold in whatever prefix of the ordered chunk plan
+                    # is now available. Chunks can finish out of order,
+                    # but this only ever advances through chunk_order in
+                    # sequence — crossing from one gap's last chunk to
+                    # the next gap's first chunk is just the next index,
+                    # not an arithmetic +chunk_size step.
+                    while expected_index < len(chunk_order) and chunk_order[expected_index] in completed:
+                        cs = chunk_order[expected_index]
+                        c_end, recs = completed.pop(cs)
                         pending_records.extend(recs)
-                        pending_last_block = c_end
-                        chunks_since_flush += 1
+
+                        if pending_intervals and pending_intervals[-1][1] + 1 == cs:
+                            last_start, _ = pending_intervals[-1]
+                            pending_intervals[-1] = (last_start, c_end)
+                        else:
+                            pending_intervals.append((cs, c_end))
 
                         if on_progress is not None:
-                            on_progress(next_watermark_start, c_end, len(recs))
+                            on_progress(cs, c_end, len(recs))
 
-                        next_watermark_start = c_end + 1
+                        expected_index += 1
+                        chunks_since_flush += 1
 
                         if chunks_since_flush >= flush_every_n_chunks:
                             flush()
@@ -184,11 +189,9 @@ def ingest_range(
             # A chunk that exhausted its retries raises out of
             # future.result() above; cancel whatever hasn't started yet
             # rather than let the pool keep firing more requests. Flush
-            # here too (not only on the success path below) — an
+            # here too (not only on the success path above) — an
             # exception propagating past this block must never discard
-            # chunks that already succeeded since the last flush; a
-            # rate-limited chunk failing after hundreds of real,
-            # already-fetched chunks would otherwise lose all of them.
+            # chunks that already succeeded since the last flush.
             for f in futures:
                 f.cancel()
             with lock:
