@@ -75,8 +75,14 @@ def _get_latest_block_with_retries(
 
 
 @cli.command()
-@click.option("--from-block", type=int, default=None, help="Start of the block range. Omit together with --to-block to derive the range from --days instead.")
-@click.option("--to-block", type=int, default=None, help="End of the block range. Omit together with --from-block to derive the range from --days instead.")
+@click.option(
+    "--from-block", type=int, default=None, envvar="LATENTEDGE_FROM_BLOCK",
+    help="Start of the block range. Omit together with --to-block to derive the range from --days instead. Falls back to the LATENTEDGE_FROM_BLOCK env var (or a .env file).",
+)
+@click.option(
+    "--to-block", type=int, default=None, envvar="LATENTEDGE_TO_BLOCK",
+    help="End of the block range. Omit together with --from-block to derive the range from --days instead. Falls back to the LATENTEDGE_TO_BLOCK env var (or a .env file).",
+)
 @click.option(
     "--days",
     type=float,
@@ -91,12 +97,30 @@ def _get_latest_block_with_retries(
     envvar="LATENTEDGE_RPC_URL",
     help="An archive-capable RPC endpoint for ranges reaching back further than a few hours (e.g. an Alchemy/Infura URL) — free public endpoints gate deep history behind a paid token. Falls back to the LATENTEDGE_RPC_URL env var (or a .env file) if omitted, so a provider key never needs to appear as a bare CLI argument.",
 )
-@click.option("--out", type=click.Path(path_type=Path), default=Path("data/swaps.parquet"))
-@click.option("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE, help="Blocks per eth_getLogs call — keep at or under your provider's per-call limit (10 on Alchemy's free tier).")
-@click.option("--max-workers", type=int, default=DEFAULT_MAX_WORKERS, help="Concurrent chunk requests — at a small chunk size, a large range needs this to finish in a reasonable time.")
-@click.option("--flush-every-n-chunks", type=int, default=DEFAULT_FLUSH_EVERY_N_CHUNKS, help="Batches writes to the output file — writing after every chunk would mean rewriting the whole file hundreds of thousands of times over a large range.")
-@click.option("--max-retries", type=int, default=DEFAULT_MAX_RETRIES)
-@click.option("--retry-backoff-seconds", type=float, default=DEFAULT_RETRY_BACKOFF_SECONDS)
+@click.option(
+    "--out", type=click.Path(path_type=Path), default=Path("data/swaps.parquet"), envvar="LATENTEDGE_INGEST_OUT",
+    help="Where to write/append swap records. Falls back to the LATENTEDGE_INGEST_OUT env var (or a .env file).",
+)
+@click.option(
+    "--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE, envvar="LATENTEDGE_CHUNK_SIZE",
+    help="Blocks per eth_getLogs call — keep at or under your provider's per-call limit (10 on Alchemy's free tier). Falls back to the LATENTEDGE_CHUNK_SIZE env var (or a .env file).",
+)
+@click.option(
+    "--max-workers", type=int, default=DEFAULT_MAX_WORKERS, envvar="LATENTEDGE_MAX_WORKERS",
+    help="Ceiling on concurrent chunk requests — the auto-throttle backs off below this under rate limiting. Falls back to the LATENTEDGE_MAX_WORKERS env var (or a .env file).",
+)
+@click.option(
+    "--flush-every-n-chunks", type=int, default=DEFAULT_FLUSH_EVERY_N_CHUNKS, envvar="LATENTEDGE_FLUSH_EVERY_N_CHUNKS",
+    help="Batches writes to the output file — writing after every chunk would mean rewriting the whole file hundreds of thousands of times over a large range. Falls back to the LATENTEDGE_FLUSH_EVERY_N_CHUNKS env var (or a .env file).",
+)
+@click.option(
+    "--max-retries", type=int, default=DEFAULT_MAX_RETRIES, envvar="LATENTEDGE_MAX_RETRIES",
+    help="Falls back to the LATENTEDGE_MAX_RETRIES env var (or a .env file).",
+)
+@click.option(
+    "--retry-backoff-seconds", type=float, default=DEFAULT_RETRY_BACKOFF_SECONDS, envvar="LATENTEDGE_RETRY_BACKOFF_SECONDS",
+    help="Falls back to the LATENTEDGE_RETRY_BACKOFF_SECONDS env var (or a .env file).",
+)
 def ingest(
     from_block: int | None,
     to_block: int | None,
@@ -199,9 +223,18 @@ def _assemble_train_data(swaps_path: Path) -> tuple[np.ndarray, np.ndarray, int,
 
 
 @cli.command()
-@click.option("--swaps", type=click.Path(path_type=Path), default=Path("data/swaps.parquet"))
-@click.option("--out", type=click.Path(path_type=Path), default=Path("data/model.safetensors"))
-@click.option("--epochs", type=int, default=100)
+@click.option(
+    "--swaps", type=click.Path(path_type=Path), default=Path("data/swaps.parquet"), envvar="LATENTEDGE_TRAIN_SWAPS",
+    help="Falls back to the LATENTEDGE_TRAIN_SWAPS env var (or a .env file).",
+)
+@click.option(
+    "--out", type=click.Path(path_type=Path), default=Path("data/model.safetensors"), envvar="LATENTEDGE_TRAIN_OUT",
+    help="Falls back to the LATENTEDGE_TRAIN_OUT env var (or a .env file).",
+)
+@click.option(
+    "--epochs", type=int, default=100, envvar="LATENTEDGE_TRAIN_EPOCHS",
+    help="Falls back to the LATENTEDGE_TRAIN_EPOCHS env var (or a .env file).",
+)
 def train(swaps: Path, out: Path, epochs: int) -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
 
@@ -225,8 +258,14 @@ def train(swaps: Path, out: Path, epochs: int) -> None:
 
 
 @cli.command()
-@click.option("--swaps", type=click.Path(path_type=Path), default=Path("data/swaps.parquet"))
-@click.option("--model", type=click.Path(path_type=Path), default=Path("data/model.safetensors"))
+@click.option(
+    "--swaps", type=click.Path(path_type=Path), default=Path("data/swaps.parquet"), envvar="LATENTEDGE_BACKTEST_SWAPS",
+    help="Falls back to the LATENTEDGE_BACKTEST_SWAPS env var (or a .env file).",
+)
+@click.option(
+    "--model", type=click.Path(path_type=Path), default=Path("data/model.safetensors"), envvar="LATENTEDGE_BACKTEST_MODEL",
+    help="Falls back to the LATENTEDGE_BACKTEST_MODEL env var (or a .env file).",
+)
 def backtest(swaps: Path, model: Path) -> None:
     # Intentional stub (see the implementation plan): assembling the real
     # entry/exit swap arrays run_backtest needs is its own piece of glue

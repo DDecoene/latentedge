@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import numpy as np
 import pytest
 from click.testing import CliRunner
 
@@ -44,6 +45,84 @@ def test_ingest_rpc_url_falls_back_to_env_var_when_flag_omitted(monkeypatch: pyt
     )
 
     assert captured["rpc_url"] == "https://example-from-env.invalid"
+
+
+def test_ingest_numeric_and_path_options_fall_back_to_env_vars(monkeypatch: pytest.MonkeyPatch):
+    # The user wants every ingest knob settable from .env, not just
+    # --rpc-url/--days — nobody should have to remember or retype CLI
+    # flags for a run they do the same way every time.
+    captured: dict[str, object] = {}
+
+    def fake_ingest_range(pool_address, from_block, to_block, out, client, rpc_url, **kwargs):
+        captured["out"] = out
+        captured["chunk_size"] = kwargs["chunk_size"]
+        captured["max_workers"] = kwargs["max_workers"]
+        captured["flush_every_n_chunks"] = kwargs["flush_every_n_chunks"]
+        captured["max_retries"] = kwargs["max_retries"]
+        captured["retry_backoff_seconds"] = kwargs["retry_backoff_seconds"]
+        captured["from_block"] = from_block
+        captured["to_block"] = to_block
+        return 0
+
+    monkeypatch.setattr("latentedge.cli.ingest_range", fake_ingest_range)
+
+    runner = CliRunner()
+    runner.invoke(
+        cli,
+        ["ingest"],
+        env={
+            "LATENTEDGE_FROM_BLOCK": "100",
+            "LATENTEDGE_TO_BLOCK": "200",
+            "LATENTEDGE_INGEST_OUT": "/tmp/env-swaps.parquet",
+            "LATENTEDGE_CHUNK_SIZE": "5",
+            "LATENTEDGE_MAX_WORKERS": "2",
+            "LATENTEDGE_FLUSH_EVERY_N_CHUNKS": "3",
+            "LATENTEDGE_MAX_RETRIES": "7",
+            "LATENTEDGE_RETRY_BACKOFF_SECONDS": "1.5",
+        },
+    )
+
+    assert captured["from_block"] == 100
+    assert captured["to_block"] == 200
+    assert str(captured["out"]) == "/tmp/env-swaps.parquet"
+    assert captured["chunk_size"] == 5
+    assert captured["max_workers"] == 2
+    assert captured["flush_every_n_chunks"] == 3
+    assert captured["max_retries"] == 7
+    assert captured["retry_backoff_seconds"] == 1.5
+
+
+def test_train_options_fall_back_to_env_vars(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    captured: dict[str, object] = {}
+
+    def fake_assemble(swaps_path):
+        captured["swaps_path"] = swaps_path
+        return np.zeros((1, 1), dtype="float32"), np.zeros(1, dtype="float32"), 1, {}
+
+    def fake_train(model, x, y, epochs, learning_rate):
+        captured["epochs"] = epochs
+        return [0.0]
+
+    monkeypatch.setattr("latentedge.cli._assemble_train_data", fake_assemble)
+    monkeypatch.setattr("latentedge.cli.train_model", fake_train)
+
+    out_path = tmp_path / "env-model.safetensors"
+    swaps_path = tmp_path / "env-swaps.parquet"
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["train"],
+        env={
+            "LATENTEDGE_TRAIN_SWAPS": str(swaps_path),
+            "LATENTEDGE_TRAIN_OUT": str(out_path),
+            "LATENTEDGE_TRAIN_EPOCHS": "3",
+        },
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["swaps_path"] == swaps_path
+    assert captured["epochs"] == 3
 
 
 def test_cli_loads_dotenv_file_from_current_directory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
