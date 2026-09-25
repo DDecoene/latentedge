@@ -265,6 +265,42 @@ async def test_ingest_screen_shows_per_worker_status(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_ingest_screen_renders_a_worker_waiting_for_a_free_concurrency_slot(tmp_path: Path):
+    # Regression test: a worker blocked on the concurrency gate must
+    # render distinctly from one actively fetching — otherwise the
+    # auto-throttle has no visible effect in the UI at all. Drives the
+    # screen's own handler directly rather than racing real threads,
+    # since forcing a real gate-block deterministically through
+    # ingest_range's timing would be flaky.
+    out_path = tmp_path / "swaps.parquet"
+    screen = IngestScreen(
+        pool_address="0xpool", from_block=0, to_block=9, out_path=out_path,
+        client_factory=lambda: httpx.Client(), rpc_url="http://fake",
+        chunk_size=10, max_workers=1, flush_every_n_chunks=1,
+        max_retries=1, retry_backoff_seconds=0.001, fetch_fn=_fake_fetch,
+        train_assemble_fn=lambda p: (None, None, 0, {}),
+    )
+    app = LatentEdgeApp(start_screen=screen)
+
+    async with app.run_test() as pilot:
+        for _ in range(50):
+            await pilot.pause(0.01)
+            if screen.is_complete:
+                break
+        screen._handle_worker_status(0, 0, 9, "waiting")
+        await pilot.pause()
+        threads_text = str(app.screen.query_one("#ingest-threads-body").content)
+        fetching_text = threads_text
+        screen._handle_worker_status(0, 0, 9, "fetching")
+        await pilot.pause()
+        fetching_text = str(app.screen.query_one("#ingest-threads-body").content)
+
+    assert "waiting for a free slot" in threads_text
+    assert "waiting for a free slot" not in fetching_text
+    assert "fetching" in fetching_text
+
+
+@pytest.mark.asyncio
 async def test_ingest_screen_shows_concurrency_limit_after_a_throttle_down(tmp_path: Path):
     attempts = {"count": 0}
 

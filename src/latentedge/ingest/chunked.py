@@ -65,10 +65,18 @@ def _fetch_chunk_with_retries(
     limiter: AdaptiveConcurrencyLimiter,
     on_retry: OnRetryFn | None = None,
     on_concurrency_change: Callable[[int], None] | None = None,
+    on_status: Callable[[str], None] | None = None,
 ) -> list[SwapRecord]:
     last_error: Exception | None = None
     for attempt in range(max_retries):
+        # Blocking on the gate is the one moment the throttle is actually
+        # visible — report it distinctly from "fetching" rather than
+        # announcing "fetching" before the wait even starts.
+        if on_status is not None:
+            on_status("waiting")
         limiter.acquire()
+        if on_status is not None:
+            on_status("fetching")
         try:
             result = fetch_fn(pool_address, from_block, to_block, client, rpc_url)
         except Exception as exc:  # RpcLogsError et al — real transient failures
@@ -179,8 +187,6 @@ def ingest_range(
         chunk_end = min(chunk_start + chunk_size - 1, chunk_ceiling[chunk_start])
 
         slot = worker_slot() if on_worker_status is not None else -1
-        if on_worker_status is not None:
-            on_worker_status(slot, chunk_start, chunk_end, "fetching")
 
         def report_retry(cs: int, ce: int, attempt: int, retries: int, sleep_seconds: float, error_message: str) -> None:
             if on_retry is not None:
@@ -188,10 +194,15 @@ def ingest_range(
             if on_worker_status is not None:
                 on_worker_status(slot, cs, ce, f"retry {attempt}/{retries}, waiting {sleep_seconds:.1f}s")
 
+        def report_status(status: str) -> None:
+            if on_worker_status is not None:
+                on_worker_status(slot, chunk_start, chunk_end, status)
+
         retry_hook = report_retry if (on_retry is not None or on_worker_status is not None) else None
+        status_hook = report_status if on_worker_status is not None else None
         records = _fetch_chunk_with_retries(
             fetch_fn, pool_address, chunk_start, chunk_end, client, rpc_url,
-            max_retries, retry_backoff_seconds, limiter, retry_hook, on_concurrency_change,
+            max_retries, retry_backoff_seconds, limiter, retry_hook, on_concurrency_change, status_hook,
         )
 
         if on_worker_status is not None:

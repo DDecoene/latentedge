@@ -541,8 +541,51 @@ def test_ingest_range_reports_worker_status_during_retries(tmp_path: Path):
 
     retry_statuses = [s[3] for s in statuses if s[3].startswith("retry")]
     assert retry_statuses == ["retry 1/5, waiting 0.0s", "retry 2/5, waiting 0.0s"]
-    assert statuses[0] == (0, 0, 99, "fetching")
+    # Each attempt reports "waiting" (for a free concurrency slot) before
+    # "fetching" (once it actually has one) — with only one worker and no
+    # rate limiting, the slot is always immediately free.
+    assert statuses[0] == (0, 0, 99, "waiting")
+    assert statuses[1] == (0, 0, 99, "fetching")
     assert statuses[-1] == (0, 0, 99, "idle")
+
+
+def test_fetch_chunk_with_retries_reports_waiting_while_blocked_on_the_concurrency_gate(tmp_path: Path):
+    # Regression test: a throttled-down worker was reported as "fetching"
+    # the whole time it sat blocked on the concurrency gate, because the
+    # status was announced before limiter.acquire() — the one moment the
+    # throttle is actually visible was invisible in the UI.
+    from latentedge.ingest.chunked import _fetch_chunk_with_retries
+    from latentedge.ingest.concurrency import AdaptiveConcurrencyLimiter
+
+    limiter = AdaptiveConcurrencyLimiter(ceiling=1)
+    limiter.acquire()  # hold the only permit so the call under test must wait for it
+
+    statuses: list[str] = []
+    status_before_release: list[str] = []
+
+    def on_status(status: str) -> None:
+        statuses.append(status)
+
+    def fetch_fn(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str) -> list[SwapRecord]:
+        return [_record(from_block, 0)]
+
+    def release_after_delay() -> None:
+        time.sleep(0.05)
+        status_before_release.extend(statuses)
+        limiter.release("success")
+
+    releaser = threading.Thread(target=release_after_delay)
+    releaser.start()
+    try:
+        _fetch_chunk_with_retries(
+            fetch_fn, "0xpool", 0, 9, None, "http://fake",  # type: ignore[arg-type]
+            max_retries=1, backoff_seconds=0.001, limiter=limiter, on_status=on_status,
+        )
+    finally:
+        releaser.join(timeout=1.0)
+
+    assert status_before_release == ["waiting"]  # blocked on the gate, not "fetching"
+    assert statuses == ["waiting", "fetching"]
 
 
 def test_ingest_range_throttles_down_worker_concurrency_after_a_rate_limit(tmp_path: Path):

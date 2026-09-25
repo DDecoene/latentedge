@@ -212,6 +212,10 @@ class IngestScreen(Screen[None]):
             detail = "[dim]○ idle[/dim]"
         elif status == "fetching":
             detail = f"[green]● blocks {chunk_start}-{chunk_end} — fetching[/green]"
+        elif status == "waiting":
+            # Blocked on the concurrency gate, not the network — the
+            # visible sign the auto-throttle is actually doing something.
+            detail = f"[cyan]◐ blocks {chunk_start}-{chunk_end} — waiting for a free slot[/cyan]"
         else:
             detail = f"[yellow]● blocks {chunk_start}-{chunk_end} — {status}[/yellow]"
         self.query_one("#ingest-threads", ThreadPanel).update_worker(slot, detail)
