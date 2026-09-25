@@ -234,7 +234,8 @@ def test_ingest_shows_plain_language_error_when_days_resolution_cannot_reach_rpc
     # Regression test: a real connection failure while resolving --days
     # into a block range used to dump a raw Python traceback (see the
     # bug report this fixes). It must instead exit cleanly with a
-    # message a person can act on.
+    # message a person can act on, after exhausting retries (not on the
+    # very first failure — see the retry regression test below).
     import httpx as httpx_module
 
     def unreachable(client, rpc_url):
@@ -245,12 +246,47 @@ def test_ingest_shows_plain_language_error_when_days_resolution_cannot_reach_rpc
     runner = CliRunner()
     result = runner.invoke(
         cli,
-        ["ingest", "--days", "1", "--out", str(tmp_path / "swaps.parquet")],
+        [
+            "ingest", "--days", "1", "--out", str(tmp_path / "swaps.parquet"),
+            "--max-retries", "2", "--retry-backoff-seconds", "0.001",
+        ],
     )
 
     assert result.exit_code != 0
     assert "Traceback" not in result.output
     assert "internet connection" in result.output
+
+
+def test_ingest_retries_chain_head_lookup_before_giving_up(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    # Regression test: resolving --days into a block range used to make
+    # exactly one un-retried get_latest_block call — a single transient
+    # network hiccup at startup killed the whole run immediately, even
+    # though every other RPC call in the pipeline retries generously.
+    import httpx as httpx_module
+
+    attempts = {"count": 0}
+
+    def flaky_then_succeeds(client, rpc_url):
+        attempts["count"] += 1
+        if attempts["count"] < 3:
+            raise httpx_module.ConnectError("simulated transient failure")
+        return 20_000_000
+
+    monkeypatch.setattr("latentedge.cli.get_latest_block", flaky_then_succeeds)
+    monkeypatch.setattr("latentedge.cli.ingest_range", lambda *args, **kwargs: 0)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "ingest", "--days", "1", "--out", str(tmp_path / "swaps.parquet"),
+            "--max-retries", "5", "--retry-backoff-seconds", "0.001",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert attempts["count"] == 3
+    assert "retry" in result.output.lower()
 
 
 def test_ingest_shows_plain_language_error_when_plain_mode_ingest_fails_to_connect(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):

@@ -1,4 +1,5 @@
 import sys
+import time
 from pathlib import Path
 
 import click
@@ -16,10 +17,11 @@ from latentedge.ingest.chunked import (
     DEFAULT_MAX_RETRIES,
     DEFAULT_MAX_WORKERS,
     DEFAULT_RETRY_BACKOFF_SECONDS,
+    RATE_LIMIT_BACKOFF_MULTIPLIER,
     ingest_range,
 )
 from latentedge.ingest.progress import extend_window_for_new_blocks, read_progress
-from latentedge.ingest.rpc_logs import RpcLogsError, describe_error, get_latest_block
+from latentedge.ingest.rpc_logs import RateLimitError, RpcLogsError, describe_error, get_latest_block
 from latentedge.model import NetReturnRegressor, save
 from latentedge.model import train as train_model
 from latentedge.split import chronological_split
@@ -43,6 +45,33 @@ def cli() -> None:
 
 
 DEFAULT_RPC_URL = "https://ethereum.publicnode.com"
+
+
+def _get_latest_block_with_retries(
+    client: httpx.Client, rpc_url: str, max_retries: int, backoff_seconds: float,
+) -> int:
+    """Same retry-with-backoff behavior as every chunk fetch in
+    ingest_range — a single transient network hiccup at startup must not
+    kill the whole run before it even begins.
+    """
+    last_error: Exception | None = None
+    for attempt in range(max_retries):
+        try:
+            return get_latest_block(client, rpc_url)
+        except (httpx.HTTPError, RpcLogsError) as exc:
+            last_error = exc
+            if attempt < max_retries - 1:
+                sleep_seconds = backoff_seconds * (2**attempt)
+                if isinstance(exc, RateLimitError):
+                    sleep_seconds *= RATE_LIMIT_BACKOFF_MULTIPLIER
+                click.echo(
+                    f"  chain head lookup failed ({describe_error(rpc_url, exc)}) — "
+                    f"retry {attempt + 1}/{max_retries}, waiting {sleep_seconds:.1f}s",
+                    err=True,
+                )
+                time.sleep(sleep_seconds)
+    assert last_error is not None
+    raise last_error
 
 
 @cli.command()
@@ -92,7 +121,7 @@ def ingest(
     if from_block is None:
         with httpx.Client(timeout=30.0) as client:
             try:
-                head = get_latest_block(client, rpc_url)
+                head = _get_latest_block_with_retries(client, rpc_url, max_retries, retry_backoff_seconds)
             except (httpx.HTTPError, RpcLogsError) as exc:
                 raise click.ClickException(describe_error(rpc_url, exc)) from None
         naive_to = head - config.HEAD_BLOCK_SAFETY_BUFFER
