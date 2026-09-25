@@ -6,6 +6,7 @@ import pytest
 
 from latentedge.ingest.chunked import ingest_range
 from latentedge.ingest.progress import read_progress, write_progress
+from latentedge.ingest.rpc_logs import RpcLogsError
 from latentedge.schema import SwapRecord
 from latentedge.store import read_swaps
 from latentedge.tui.app import LatentEdgeApp
@@ -147,6 +148,82 @@ async def test_ingest_screen_progress_accounts_for_a_covered_gap_crossed_mid_run
     finally:
         release_second_chunk.set()
 
+    assert screen.is_complete
+
+
+@pytest.mark.asyncio
+async def test_ingest_screen_shows_retry_detail_in_log_and_stalled_stat(tmp_path: Path):
+    attempts = {"count": 0}
+
+    def flaky_fetch(pool_address, from_block, to_block, client, rpc_url):
+        attempts["count"] += 1
+        if attempts["count"] < 2:
+            raise RpcLogsError("simulated rate limit")
+        return [_record(from_block)]
+
+    out_path = tmp_path / "swaps.parquet"
+    screen = IngestScreen(
+        pool_address="0xpool", from_block=0, to_block=9, out_path=out_path,
+        client_factory=lambda: httpx.Client(), rpc_url="http://fake",
+        chunk_size=10, max_workers=1, flush_every_n_chunks=1,
+        max_retries=3, retry_backoff_seconds=0.001, fetch_fn=flaky_fetch,
+        train_assemble_fn=lambda p: (None, None, 0, {}),
+    )
+    app = LatentEdgeApp(start_screen=screen)
+
+    async with app.run_test() as pilot:
+        for _ in range(50):
+            await pilot.pause(0.01)
+            if screen.is_complete:
+                break
+        log_text = "\n".join(
+            str(line) for line in app.screen.query_one("#ingest-log-body").lines
+        )
+        stats_text = str(app.screen.query_one("#ingest-stats-body").content)
+
+    assert screen.is_complete
+    assert "retry 1/3" in log_text
+    assert "simulated rate limit" in log_text
+    assert "Stalled" in stats_text
+
+
+@pytest.mark.asyncio
+async def test_ingest_screen_shows_per_worker_status(tmp_path: Path):
+    release_chunks = threading.Event()
+
+    def gated_fetch(pool_address, from_block, to_block, client, rpc_url):
+        release_chunks.wait()
+        return [_record(from_block)]
+
+    out_path = tmp_path / "swaps.parquet"
+    screen = IngestScreen(
+        pool_address="0xpool", from_block=0, to_block=19, out_path=out_path,
+        client_factory=lambda: httpx.Client(), rpc_url="http://fake",
+        chunk_size=10, max_workers=2, flush_every_n_chunks=1,
+        max_retries=1, retry_backoff_seconds=0.001, fetch_fn=gated_fetch,
+        train_assemble_fn=lambda p: (None, None, 0, {}),
+    )
+    app = LatentEdgeApp(start_screen=screen)
+
+    try:
+        async with app.run_test() as pilot:
+            threads_text = ""
+            for _ in range(50):
+                await pilot.pause(0.01)
+                threads_text = str(app.screen.query_one("#ingest-threads-body").content)
+                if "Worker 0" in threads_text and "Worker 1" in threads_text:
+                    break
+            release_chunks.set()
+            for _ in range(50):
+                await pilot.pause(0.01)
+                if screen.is_complete:
+                    break
+    finally:
+        release_chunks.set()
+
+    assert "Worker 0" in threads_text
+    assert "Worker 1" in threads_text
+    assert "fetching" in threads_text
     assert screen.is_complete
 
 

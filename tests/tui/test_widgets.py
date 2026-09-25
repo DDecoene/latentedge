@@ -3,7 +3,7 @@ from textual.app import App, ComposeResult
 
 from textual.widgets import RichLog
 
-from latentedge.tui.widgets import LogPanel, ProgressPanel, StatsPanel, format_eta
+from latentedge.tui.widgets import LogPanel, ProgressPanel, StatsPanel, ThreadPanel, format_eta
 
 
 class _ProgressPanelHarness(App[None]):
@@ -81,6 +81,39 @@ async def test_stats_panel_renders_label_value_rows():
 class _LogPanelHarness(App[None]):
     def compose(self) -> ComposeResult:
         yield LogPanel(id="log")
+
+
+class _ThreadPanelHarness(App[None]):
+    def compose(self) -> ComposeResult:
+        yield ThreadPanel(id="threads")
+
+
+@pytest.mark.asyncio
+async def test_thread_panel_renders_one_line_per_worker_in_slot_order():
+    app = _ThreadPanelHarness()
+    async with app.run_test() as pilot:
+        panel = app.query_one(ThreadPanel)
+        panel.update_worker(1, "blocks 110-119 — fetching")
+        panel.update_worker(0, "blocks 100-109 — retry 2/5, waiting 18.3s")
+        await pilot.pause()
+        text = str(app.query_one("#threads-body").content)
+
+    lines = text.splitlines()
+    assert lines[0] == "Worker 0: blocks 100-109 — retry 2/5, waiting 18.3s"
+    assert lines[1] == "Worker 1: blocks 110-119 — fetching"
+
+
+@pytest.mark.asyncio
+async def test_thread_panel_updates_existing_worker_line_in_place():
+    app = _ThreadPanelHarness()
+    async with app.run_test() as pilot:
+        panel = app.query_one(ThreadPanel)
+        panel.update_worker(0, "blocks 100-109 — fetching")
+        panel.update_worker(0, "idle")
+        await pilot.pause()
+        text = str(app.query_one("#threads-body").content)
+
+    assert text == "Worker 0: idle"
 
 
 @pytest.mark.asyncio

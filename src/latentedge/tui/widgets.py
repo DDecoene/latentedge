@@ -60,6 +60,22 @@ class StatsPanel(Widget):
         self.query_one(f"#{self.id}-body", Static).update(text)
 
 
+class ThreadPanel(Widget):
+    """One line per worker thread: its current block range and status."""
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)  # type: ignore[arg-type]
+        self._lines: dict[int, str] = {}
+
+    def compose(self) -> ComposeResult:
+        yield Static("", id=f"{self.id}-body")
+
+    def update_worker(self, slot: int, text: str) -> None:
+        self._lines[slot] = f"Worker {slot}: {text}"
+        body = "\n".join(self._lines[slot] for slot in sorted(self._lines))
+        self.query_one(f"#{self.id}-body", Static).update(body)
+
+
 class LogPanel(Widget):
     """A bounded scrolling feed of recent discrete events."""
 
