@@ -5,6 +5,7 @@ import pytest
 from click.testing import CliRunner
 
 from latentedge.cli import DEFAULT_RPC_URL, cli
+from latentedge.training_data import AssembledTrainingData, SplitArrays
 
 
 def test_cli_exposes_expected_subcommands():
@@ -97,7 +98,8 @@ def test_train_options_fall_back_to_env_vars(monkeypatch: pytest.MonkeyPatch, tm
 
     def fake_assemble(swaps_path):
         captured["swaps_path"] = swaps_path
-        return np.zeros((1, 1), dtype="float32"), np.zeros(1, dtype="float32"), 1, {}
+        empty = SplitArrays(x=np.zeros((1, 1), dtype="float32"), y=np.zeros(1, dtype="float32"))
+        return AssembledTrainingData(train=empty, validate=empty, test=empty, input_dim=1, stats={})
 
     def fake_train(model, x, y, epochs, learning_rate):
         captured["epochs"] = epochs

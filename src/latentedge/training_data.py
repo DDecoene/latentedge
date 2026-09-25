@@ -8,12 +8,28 @@ by hand, since doing that separately and filtering before computing
 features is exactly the bug this module exists to prevent.
 """
 
+from typing import NamedTuple
+
+import numpy as np
 import pandas as pd
 
 from latentedge.features import compute_features, shift_features_for_labeling
 from latentedge.labeling import label_bars
 
 FEATURE_COLUMNS = ["return_5", "return_15", "return_30", "volatility", "volume_usdc", "bars_since_swap"]
+
+
+class SplitArrays(NamedTuple):
+    x: np.ndarray
+    y: np.ndarray
+
+
+class AssembledTrainingData(NamedTuple):
+    train: SplitArrays
+    validate: SplitArrays
+    test: SplitArrays
+    input_dim: int
+    stats: dict[str, tuple[float, float]]
 
 
 def assemble_training_data(

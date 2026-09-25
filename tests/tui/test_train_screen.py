@@ -1,18 +1,24 @@
+import json
 import threading
 from pathlib import Path
 
 import numpy as np
 import pytest
 
+from latentedge.training_data import AssembledTrainingData, SplitArrays
 from latentedge.tui.app import LatentEdgeApp
 from latentedge.tui.train_screen import TrainScreen
 
 
-def _fake_assemble(swaps_path: Path) -> tuple[np.ndarray, np.ndarray, int, dict[str, tuple[float, float]]]:
-    features = np.random.RandomState(0).randn(10, 3).astype("float32")
-    labels = np.random.RandomState(1).randn(10).astype("float32")
+def _fake_assemble(swaps_path: Path) -> AssembledTrainingData:
+    def split(seed: int, n: int) -> SplitArrays:
+        rng = np.random.RandomState(seed)
+        return SplitArrays(x=rng.randn(n, 3).astype("float32"), y=rng.randn(n).astype("float32"))
+
     stats = {"f0": (0.0, 1.0), "f1": (0.0, 1.0), "f2": (0.0, 1.0)}
-    return features, labels, 3, stats
+    return AssembledTrainingData(
+        train=split(0, 10), validate=split(2, 4), test=split(3, 4), input_dim=3, stats=stats,
+    )
 
 
 def _fake_train(model, features, labels, epochs, learning_rate, on_epoch=None):
@@ -44,7 +50,16 @@ async def test_train_screen_reaches_complete_state(tmp_path: Path):
 
     assert screen.is_complete
     assert screen.final_loss == pytest.approx(0.2)
+    assert screen.validate_correlation is not None
     assert (tmp_path / "model.safetensors").exists()
+
+    metrics_path = tmp_path / "model.safetensors.metrics.json"
+    assert metrics_path.exists()
+    metrics = json.loads(metrics_path.read_text())
+    assert metrics["epochs"] == 5
+    assert metrics["final_loss"] == pytest.approx(0.2)
+    assert set(metrics["splits"]) == {"train", "validate", "test"}
+    assert "correlation" in metrics["splits"]["validate"]
 
 
 @pytest.mark.asyncio
@@ -55,6 +70,7 @@ async def test_train_screen_saves_stats_only_after_the_model_is_saved(tmp_path: 
     # standardize inputs with the wrong parameters at inference time.
     model_path = tmp_path / "model.safetensors"
     stats_path = tmp_path / "model.safetensors.stats.json"
+    metrics_path = tmp_path / "model.safetensors.metrics.json"
 
     def failing_train(model, features, labels, epochs, learning_rate, on_epoch=None):
         raise RuntimeError("bad shapes")
@@ -77,6 +93,7 @@ async def test_train_screen_saves_stats_only_after_the_model_is_saved(tmp_path: 
     assert screen.error is not None
     assert not model_path.exists()
     assert not stats_path.exists()
+    assert not metrics_path.exists()
 
 
 @pytest.mark.asyncio
@@ -144,7 +161,7 @@ async def test_train_screen_q_exits_after_completion(tmp_path: Path):
         await pilot.pause()
         still_running = app.is_running
 
-    assert "Exit" in action_bar_text
+    assert "exit" in action_bar_text.lower()
     assert not still_running
 
 
@@ -172,7 +189,7 @@ async def test_train_screen_q_exits_after_error(tmp_path: Path):
         await pilot.pause()
         still_running = app.is_running
 
-    assert "Exit" in action_bar_text
+    assert "exit" in action_bar_text.lower()
     assert not still_running
 
 

@@ -11,9 +11,12 @@ from dotenv import load_dotenv
 from latentedge import config
 from latentedge.bars import build_bars
 from latentedge.features import compute_feature_stats, save_feature_stats, standardize_features
+from latentedge.metrics import build_training_metrics, save_training_metrics
 from latentedge.ingest.chunked import (
     DEFAULT_CHUNK_SIZE,
+    DEFAULT_CONCURRENCY_COOLDOWN_SECONDS,
     DEFAULT_FLUSH_EVERY_N_CHUNKS,
+    DEFAULT_MAX_RATE_LIMIT_BACKOFF_SECONDS,
     DEFAULT_MAX_RETRIES,
     DEFAULT_MAX_WORKERS,
     DEFAULT_RETRY_BACKOFF_SECONDS,
@@ -26,7 +29,7 @@ from latentedge.model import NetReturnRegressor, save
 from latentedge.model import train as train_model
 from latentedge.split import chronological_split
 from latentedge.store import read_swaps
-from latentedge.training_data import FEATURE_COLUMNS, assemble_training_data
+from latentedge.training_data import FEATURE_COLUMNS, AssembledTrainingData, SplitArrays, assemble_training_data
 from latentedge.tui.app import LatentEdgeApp
 from latentedge.tui.ingest_screen import IngestScreen
 from latentedge.tui.train_screen import TrainScreen
@@ -121,6 +124,16 @@ def _get_latest_block_with_retries(
     "--retry-backoff-seconds", type=float, default=DEFAULT_RETRY_BACKOFF_SECONDS, envvar="LATENTEDGE_RETRY_BACKOFF_SECONDS",
     help="Falls back to the LATENTEDGE_RETRY_BACKOFF_SECONDS env var (or a .env file).",
 )
+@click.option(
+    "--concurrency-cooldown-seconds", type=float, default=DEFAULT_CONCURRENCY_COOLDOWN_SECONDS,
+    envvar="LATENTEDGE_CONCURRENCY_COOLDOWN_SECONDS",
+    help="After any rate limit, pauses every worker (not just the one that hit it) for this long before any new request goes out — stops the other workers from immediately re-triggering the same limit. Falls back to the LATENTEDGE_CONCURRENCY_COOLDOWN_SECONDS env var (or a .env file).",
+)
+@click.option(
+    "--max-rate-limit-backoff-seconds", type=float, default=DEFAULT_MAX_RATE_LIMIT_BACKOFF_SECONDS,
+    envvar="LATENTEDGE_MAX_RATE_LIMIT_BACKOFF_SECONDS",
+    help="A rate-limited chunk retries forever (it's expected, temporary provider behavior, not a bug) rather than giving up after --max-retries — this caps how long each wait between retries can grow to. Falls back to the LATENTEDGE_MAX_RATE_LIMIT_BACKOFF_SECONDS env var (or a .env file).",
+)
 def ingest(
     from_block: int | None,
     to_block: int | None,
@@ -132,6 +145,8 @@ def ingest(
     flush_every_n_chunks: int,
     max_retries: int,
     retry_backoff_seconds: float,
+    concurrency_cooldown_seconds: float,
+    max_rate_limit_backoff_seconds: float,
 ) -> None:
     # A large range (e.g. a year of history) needs chunking to respect
     # provider limits, concurrency to finish in a reasonable time, and
@@ -169,7 +184,9 @@ def ingest(
             out_path=out, client_factory=lambda: httpx.Client(timeout=30.0), rpc_url=rpc_url,
             chunk_size=chunk_size, max_workers=max_workers,
             flush_every_n_chunks=flush_every_n_chunks, max_retries=max_retries,
-            retry_backoff_seconds=retry_backoff_seconds, ingest_fn=ingest_range,
+            retry_backoff_seconds=retry_backoff_seconds,
+            concurrency_cooldown_seconds=concurrency_cooldown_seconds,
+            max_rate_limit_backoff_seconds=max_rate_limit_backoff_seconds, ingest_fn=ingest_range,
             train_assemble_fn=_assemble_train_data,
         )
         LatentEdgeApp(start_screen=screen).run()
@@ -187,6 +204,8 @@ def ingest(
                 config.POOL_ADDRESS, from_block, to_block, out, client, rpc_url,
                 chunk_size=chunk_size, max_retries=max_retries, retry_backoff_seconds=retry_backoff_seconds,
                 max_workers=max_workers, flush_every_n_chunks=flush_every_n_chunks,
+                concurrency_cooldown_seconds=concurrency_cooldown_seconds,
+                max_rate_limit_backoff_seconds=max_rate_limit_backoff_seconds,
                 on_progress=report,
             )
         except (httpx.HTTPError, RpcLogsError) as exc:
@@ -194,7 +213,7 @@ def ingest(
     click.echo(f"wrote {total} new swap records to {out}")
 
 
-def _assemble_train_data(swaps_path: Path) -> tuple[np.ndarray, np.ndarray, int, dict[str, tuple[float, float]]]:
+def _assemble_train_data(swaps_path: Path) -> AssembledTrainingData:
     swap_df = read_swaps(swaps_path)
     bar_df = build_bars(swap_df, config.BAR_INTERVAL_SECONDS)
 
@@ -207,7 +226,7 @@ def _assemble_train_data(swaps_path: Path) -> tuple[np.ndarray, np.ndarray, int,
     assembled = assemble_training_data(
         bar_df, swap_df, return_windows=[5, 15, 30], volatility_window=15, tp_sl_fraction=tp_sl_fraction
     )
-    train_split, _validate_split, _test_split = chronological_split(assembled, train_fraction=0.7, validate_fraction=0.15)
+    train_split, validate_split, test_split = chronological_split(assembled, train_fraction=0.7, validate_fraction=0.15)
 
     # Standardize using train-split statistics only — computing stats
     # from validate/test data would leak information about those splits
@@ -215,11 +234,20 @@ def _assemble_train_data(swaps_path: Path) -> tuple[np.ndarray, np.ndarray, int,
     # after the model itself is safely on disk, so SignalClient never
     # sees a stats file that doesn't match the model next to it.
     stats = compute_feature_stats(train_split, FEATURE_COLUMNS)
-    train_split = standardize_features(train_split, FEATURE_COLUMNS, stats)
 
-    x = train_split[FEATURE_COLUMNS].to_numpy(dtype="float32")
-    y = train_split["net_return"].to_numpy(dtype="float32")
-    return x, y, len(FEATURE_COLUMNS), stats
+    def to_arrays(split: pd.DataFrame) -> SplitArrays:
+        standardized = standardize_features(split, FEATURE_COLUMNS, stats)
+        x = standardized[FEATURE_COLUMNS].to_numpy(dtype="float32")
+        y = standardized["net_return"].to_numpy(dtype="float32")
+        return SplitArrays(x=x, y=y)
+
+    return AssembledTrainingData(
+        train=to_arrays(train_split),
+        validate=to_arrays(validate_split),
+        test=to_arrays(test_split),
+        input_dim=len(FEATURE_COLUMNS),
+        stats=stats,
+    )
 
 
 @cli.command()
@@ -249,12 +277,17 @@ def train(swaps: Path, out: Path, epochs: int) -> None:
             raise SystemExit(1)
         return
 
-    x, y, input_dim, stats = _assemble_train_data(swaps)
-    regressor = NetReturnRegressor(input_dim=input_dim)
-    losses = train_model(regressor, x, y, epochs=epochs, learning_rate=0.001)
+    assembled = _assemble_train_data(swaps)
+    regressor = NetReturnRegressor(input_dim=assembled.input_dim)
+    losses = train_model(regressor, assembled.train.x, assembled.train.y, epochs=epochs, learning_rate=0.001)
     save(regressor, out)
-    save_feature_stats(stats, Path(str(out) + ".stats.json"))
-    click.echo(f"trained {epochs} epochs, final loss {losses[-1]:.6f}, saved to {out}")
+    save_feature_stats(assembled.stats, Path(str(out) + ".stats.json"))
+    metrics = build_training_metrics(regressor, assembled, losses)
+    save_training_metrics(metrics, Path(str(out) + ".metrics.json"))
+    val_corr = metrics["splits"]["validate"]["correlation"]
+    click.echo(
+        f"trained {epochs} epochs, final loss {losses[-1]:.6f}, val corr {val_corr:.4f}, saved to {out}"
+    )
 
 
 @cli.command()
