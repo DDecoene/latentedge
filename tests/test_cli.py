@@ -145,7 +145,11 @@ def test_train_launches_dashboard_when_stdout_is_a_tty(monkeypatch: pytest.Monke
 
 
 def test_ingest_without_block_range_derives_it_from_days_and_chain_head(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
-    monkeypatch.setattr("latentedge.cli.get_latest_block", lambda client, rpc_url: 1_000_000)
+    # A head well above config.POOL_CREATION_BLOCK (12_376_729) so the
+    # naive window stays realistic — a head this low would sit entirely
+    # before the pool existed and trigger the floor clamp instead of
+    # this test's plain day-arithmetic path.
+    monkeypatch.setattr("latentedge.cli.get_latest_block", lambda client, rpc_url: 20_000_000)
     captured: dict[str, int] = {}
 
     def fake_ingest_range(pool_address, from_block, to_block, out, client, rpc_url, **kwargs):
@@ -163,12 +167,12 @@ def test_ingest_without_block_range_derives_it_from_days_and_chain_head(monkeypa
 
     assert result.exit_code == 0, result.output
     # 1 day of 12s blocks, minus the safety buffer behind the head.
-    assert captured["to_block"] == 1_000_000 - 5
-    assert captured["from_block"] == 1_000_000 - 5 - 7200 + 1
+    assert captured["to_block"] == 20_000_000 - 5
+    assert captured["from_block"] == 20_000_000 - 5 - 7200 + 1
 
 
 def test_ingest_days_falls_back_to_env_var_when_flag_omitted(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
-    monkeypatch.setattr("latentedge.cli.get_latest_block", lambda client, rpc_url: 1_000_000)
+    monkeypatch.setattr("latentedge.cli.get_latest_block", lambda client, rpc_url: 20_000_000)
     captured: dict[str, int] = {}
 
     def fake_ingest_range(pool_address, from_block, to_block, out, client, rpc_url, **kwargs):
@@ -186,8 +190,8 @@ def test_ingest_days_falls_back_to_env_var_when_flag_omitted(monkeypatch: pytest
     )
 
     assert result.exit_code == 0, result.output
-    assert captured["to_block"] == 1_000_000 - 5
-    assert captured["from_block"] == 1_000_000 - 5 - 14400 + 1
+    assert captured["to_block"] == 20_000_000 - 5
+    assert captured["from_block"] == 20_000_000 - 5 - 14400 + 1
 
 
 def test_ingest_explicit_block_range_takes_priority_over_days(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
@@ -304,3 +308,36 @@ def test_ingest_days_window_walks_back_past_already_ingested_blocks(monkeypatch:
     # walk back to an earlier, equally-sized uncovered window instead of
     # silently doing nothing.
     assert captured["from_block"] == naive_from - blocks_in_range
+
+
+def test_ingest_days_window_reports_zero_when_entire_pool_history_already_ingested(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    # The floor-reaching case: progress already covers everything back
+    # to the pool's deployment block, so there's nothing left anywhere
+    # in the pool's history to walk back to. This must be a normal "0
+    # new records" outcome, not an error.
+    from latentedge import config
+    from latentedge.ingest.progress import write_progress
+
+    monkeypatch.setattr("latentedge.cli.get_latest_block", lambda client, rpc_url: 13_000_000)
+
+    out_path = tmp_path / "swaps.parquet"
+    naive_to = 13_000_000 - 5
+    write_progress(out_path, [(config.POOL_CREATION_BLOCK, naive_to)])
+
+    captured: dict[str, int] = {}
+
+    def fake_ingest_range(pool_address, from_block, to_block, out, client, rpc_url, **kwargs):
+        captured["from_block"] = from_block
+        return 0
+
+    monkeypatch.setattr("latentedge.cli.ingest_range", fake_ingest_range)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["ingest", "--days", "1", "--out", str(out_path)],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["from_block"] == config.POOL_CREATION_BLOCK  # walked all the way to the floor, no further
+    assert "wrote 0 new swap records" in result.output

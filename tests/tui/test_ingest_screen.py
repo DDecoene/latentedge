@@ -5,7 +5,7 @@ import httpx
 import pytest
 
 from latentedge.ingest.chunked import ingest_range
-from latentedge.ingest.progress import read_progress
+from latentedge.ingest.progress import read_progress, write_progress
 from latentedge.schema import SwapRecord
 from latentedge.store import read_swaps
 from latentedge.tui.app import LatentEdgeApp
@@ -95,6 +95,59 @@ async def test_ingest_screen_progress_starts_from_resumed_block(tmp_path: Path):
 
     assert screen.is_complete
     assert screen.total_written == 2  # only blocks [10,29] were new
+
+
+@pytest.mark.asyncio
+async def test_ingest_screen_progress_accounts_for_a_covered_gap_crossed_mid_run(tmp_path: Path):
+    # Regression test: once progress can have gaps, a chunk's position
+    # (chunk_end) no longer maps directly to "blocks completed since
+    # from_block" — the bar must track blocks actually fetched (plus
+    # what was already covered), not the chunk's raw position.
+    out_path = tmp_path / "swaps.parquet"
+    write_progress(out_path, [(20, 29)])  # a gap sits in the middle of [0, 49]
+
+    release_second_chunk = threading.Event()
+    call_count = {"n": 0}
+
+    def gated_fetch(pool_address, from_block, to_block, client, rpc_url):
+        call_count["n"] += 1
+        if call_count["n"] > 1:
+            release_second_chunk.wait()
+        return [_record(from_block)]
+
+    screen = IngestScreen(
+        pool_address="0xpool", from_block=0, to_block=49, out_path=out_path,
+        client_factory=lambda: httpx.Client(), rpc_url="http://fake",
+        chunk_size=10, max_workers=1, flush_every_n_chunks=1,
+        max_retries=1, retry_backoff_seconds=0.001, fetch_fn=gated_fetch,
+        train_assemble_fn=lambda p: (None, None, 0, {}),
+    )
+    app = LatentEdgeApp(start_screen=screen)
+
+    try:
+        async with app.run_test() as pilot:
+            detail_text = ""
+            for _ in range(50):
+                await pilot.pause(0.01)
+                detail_text = str(app.screen.query_one("#ingest-progress-detail").content)
+                if "block 9" in detail_text:
+                    break
+
+            # Already-covered [20,29] (10 blocks) plus the just-fetched
+            # [0,9] (10 blocks) = 20 of 50 total = 40%. The old
+            # position-based formula would report chunk_end - from_block
+            # + 1 = 10 -> 20%, understating real progress.
+            assert "40%" in detail_text
+
+            release_second_chunk.set()
+            for _ in range(50):
+                await pilot.pause(0.01)
+                if screen.is_complete:
+                    break
+    finally:
+        release_second_chunk.set()
+
+    assert screen.is_complete
 
 
 @pytest.mark.asyncio

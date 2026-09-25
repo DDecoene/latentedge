@@ -72,6 +72,11 @@ class IngestScreen(Screen[None]):
         self.total_written: int | None = None
         self.error: str | None = None
         self.retry_count = 0
+        # Cumulative blocks accounted for (already-covered + fetched),
+        # tracked as a running count rather than derived from a chunk's
+        # position — gap-fill means chunk_end no longer maps directly to
+        # "blocks completed since from_block".
+        self._completed = 0
         self._rate_window: deque[tuple[float, int]] = deque(maxlen=RATE_WINDOW_SIZE)
 
     def compose(self) -> ComposeResult:
@@ -91,11 +96,11 @@ class IngestScreen(Screen[None]):
         uncovered = sum(
             end - start + 1 for start, end in uncovered_gaps(intervals, self.from_block, self.to_block)
         )
-        completed = max(total - uncovered, 0)
-        unit_label = f"resuming ({completed} blocks already ingested)" if completed > 0 else "starting..."
+        self._completed = max(total - uncovered, 0)
+        unit_label = f"resuming ({self._completed} blocks already ingested)" if self._completed > 0 else "starting..."
 
         self.query_one("#ingest-progress", ProgressPanel).update_progress(
-            completed=completed, total=total, unit_label=unit_label,
+            completed=self._completed, total=total, unit_label=unit_label,
             rate_per_sec=0.0, rate_unit="blocks/sec",
         )
         self.set_interval(STATS_REFRESH_INTERVAL_SECONDS, self._refresh_disk_stats)
@@ -126,7 +131,8 @@ class IngestScreen(Screen[None]):
 
     def _handle_progress(self, chunk_start: int, chunk_end: int, count: int) -> None:
         total = max(self.to_block - self.from_block + 1, 0)
-        completed = chunk_end - self.from_block + 1
+        self._completed += chunk_end - chunk_start + 1
+        completed = self._completed
         now = self.time_fn()
         self._rate_window.append((now, completed))
 

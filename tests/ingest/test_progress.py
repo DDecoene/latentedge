@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 from latentedge.ingest.progress import (
@@ -7,10 +8,33 @@ from latentedge.ingest.progress import (
     uncovered_gaps,
     write_progress,
 )
+from latentedge.schema import SwapRecord
+from latentedge.store import write_swaps
 
 
 def test_read_progress_returns_empty_list_when_no_file_exists(tmp_path: Path):
     assert read_progress(tmp_path / "swaps.parquet") == []
+
+
+def _record(block_number: int) -> SwapRecord:
+    return SwapRecord(
+        block_number=block_number, timestamp=block_number * 12,
+        tx_hash=f"0x{block_number:064x}", log_index=0,
+        sqrt_price_x96=1 << 96, tick=0, liquidity=10**18,
+        amount0=1000.0, amount1=-0.3, base_fee_wei=20_000_000_000,
+    )
+
+
+def test_read_progress_migrates_the_legacy_single_watermark_format(tmp_path: Path):
+    # Real progress files written before this change use
+    # {"last_completed_block": N} with no recorded start — a run that
+    # crashes on this instead of a clean migration would force deleting
+    # real progress data and re-fetching blocks already on disk.
+    out_path = tmp_path / "swaps.parquet"
+    write_swaps([_record(100), _record(150)], out_path)
+    (tmp_path / "swaps.parquet.progress.json").write_text(json.dumps({"last_completed_block": 150}))
+
+    assert read_progress(out_path) == [(100, 150)]
 
 
 def test_write_then_read_progress_round_trips(tmp_path: Path):
@@ -87,3 +111,12 @@ def test_extend_window_walks_past_a_covered_stretch_in_the_extension_zone():
 def test_extend_window_clamps_at_floor_block_when_not_enough_new_blocks_exist():
     result = extend_window_for_new_blocks([], naive_from=100, naive_to=199, desired_new_blocks=1000, floor_block=50)
     assert result == 50
+
+
+def test_extend_window_never_returns_below_floor_block_when_naive_from_is_already_below_it():
+    # naive_from can sit below floor_block on its own (e.g. an
+    # oversized --days value) — the contract is "never below
+    # floor_block", not "never below floor_block only when we had to
+    # extend to get there".
+    result = extend_window_for_new_blocks([], naive_from=50, naive_to=199, desired_new_blocks=100, floor_block=100)
+    assert result == 100

@@ -153,6 +153,43 @@ def test_ingest_range_fetches_around_two_disjoint_pre_existing_intervals(tmp_pat
     assert read_progress(out_path) == [(0, 49)]
 
 
+def test_ingest_range_records_each_disjoint_new_stretch_as_its_own_interval_before_merging(tmp_path: Path):
+    # The final progress file [(0,49)] alone doesn't prove the three new
+    # stretches were tracked separately — a buggy implementation that
+    # collapsed them into one span before merging would produce the same
+    # final answer here. Spy on add_interval to prove pending_intervals
+    # really held three separate (start, end) pairs, not one.
+    import latentedge.ingest.chunked as chunked_module
+    from latentedge.ingest.progress import add_interval as real_add_interval
+
+    calls: list[tuple[int, int]] = []
+
+    def spy_add_interval(intervals: list[tuple[int, int]], new_from: int, new_to: int) -> list[tuple[int, int]]:
+        calls.append((new_from, new_to))
+        return real_add_interval(intervals, new_from, new_to)
+
+    original = chunked_module.add_interval
+    chunked_module.add_interval = spy_add_interval
+    try:
+        def fake_fetch(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str) -> list[SwapRecord]:
+            return [_record(from_block, 0)]
+
+        out_path = tmp_path / "swaps.parquet"
+        write_progress(out_path, [(10, 19), (30, 39)])
+
+        with httpx.Client() as client:
+            ingest_range(
+                pool_address="0xpool", from_block=0, to_block=49, out_path=out_path,
+                client=client, rpc_url="http://fake", chunk_size=10, max_workers=1,
+                flush_every_n_chunks=50,  # all three new stretches land in one flush
+                fetch_fn=fake_fetch,
+            )
+    finally:
+        chunked_module.add_interval = original
+
+    assert calls == [(0, 9), (20, 29), (40, 49)]
+
+
 def test_ingest_range_flushes_correctly_when_failure_happens_after_crossing_a_gap_boundary(tmp_path: Path):
     # A pre-existing covered interval sits between two uncovered
     # stretches. The first stretch's chunk succeeds (crossing into the

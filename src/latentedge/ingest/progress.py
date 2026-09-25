@@ -20,7 +20,19 @@ def read_progress(out_path: Path) -> list[Interval]:
     if not path.exists():
         return []
     data = json.loads(path.read_text())
-    return [(pair[0], pair[1]) for pair in data["ingested"]]
+    if "ingested" in data:
+        return [(pair[0], pair[1]) for pair in data["ingested"]]
+
+    # Legacy single-watermark format (pre-interval progress tracking)
+    # records no start block — derive it from the output file's actual
+    # minimum block rather than assuming coverage back to genesis, which
+    # would make earlier, never-fetched ranges look falsely
+    # already-ingested and silently skip real missing history.
+    from latentedge.store import read_swaps
+
+    last_completed_block: int = data["last_completed_block"]
+    earliest_block = int(read_swaps(out_path)["block_number"].min())
+    return [(earliest_block, last_completed_block)]
 
 
 def write_progress(out_path: Path, intervals: list[Interval]) -> None:
@@ -78,6 +90,7 @@ def extend_window_for_new_blocks(
     floor_block if even the full [floor_block, naive_to] range doesn't
     have that many.
     """
+    naive_from = max(naive_from, floor_block)
     new_in_naive = sum(end - start + 1 for start, end in uncovered_gaps(intervals, naive_from, naive_to))
     remaining_needed = desired_new_blocks - new_in_naive
     if remaining_needed <= 0:
