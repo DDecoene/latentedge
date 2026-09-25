@@ -14,6 +14,51 @@ recognize even when no human has written down the rule — something that
 fits to real-world structure rather than an explicit heuristic. This project
 tries to find one.
 
+## Getting started
+
+Requires Python 3.12+, [`uv`](https://docs.astral.sh/uv/), and an Apple
+Silicon Mac (the model uses MLX, which is Apple Silicon–only).
+
+```bash
+uv sync
+cp .env.example .env
+```
+
+Edit `.env` and set `LATENTEDGE_RPC_URL` to an archive-capable RPC endpoint
+(e.g. an Alchemy or Infura mainnet URL — free public endpoints don't serve
+history older than a few hours). `LATENTEDGE_INGEST_DAYS` controls how much
+history a plain `ingest` call pulls; it's set low by default so a first run
+is quick.
+
+Run the test suite and type checker:
+
+```bash
+uv run pytest
+uv run mypy --strict src/
+```
+
+Try a small real ingest (pulls a few hours of real WETH/USDC swap history
+from your configured RPC endpoint into `data/swaps.parquet`, showing a live
+progress dashboard):
+
+```bash
+uv run latentedge ingest --days 1
+```
+
+Ingest is resumable and safe to re-run — it tracks which blocks it already
+has and only ever fetches new ones, so running it again (or with a larger
+`--days`) never re-downloads existing data. `--from-block`/`--to-block` are
+available for a specific range instead of a most-recent-N-days window.
+
+Then train a model on whatever's been ingested so far:
+
+```bash
+uv run latentedge train --swaps data/swaps.parquet
+```
+
+`latentedge backtest` exists as a CLI entry but is not implemented yet — it
+exits non-zero rather than silently pretending to run a backtest.
+
 ## Decided so far
 
 - **Execution venue: Uniswap.** An AMM, not an order book — price comes from
