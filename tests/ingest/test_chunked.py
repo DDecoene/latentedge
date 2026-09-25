@@ -416,7 +416,7 @@ def test_ingest_range_backs_off_longer_for_rate_limit_errors(tmp_path: Path, mon
 def test_ingest_range_calls_on_retry_for_each_failed_attempt(tmp_path: Path):
     attempts = {"count": 0}
     lock = threading.Lock()
-    retry_calls = {"count": 0}
+    retry_calls: list[tuple[int, int, int, int, float, str]] = []
     retry_lock = threading.Lock()
 
     def flaky_fetch(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str) -> list[SwapRecord]:
@@ -427,9 +427,9 @@ def test_ingest_range_calls_on_retry_for_each_failed_attempt(tmp_path: Path):
             raise RpcLogsError("transient failure")
         return [_record(from_block, 0)]
 
-    def on_retry() -> None:
+    def on_retry(chunk_start: int, chunk_end: int, attempt: int, max_retries: int, sleep_seconds: float, error_message: str) -> None:
         with retry_lock:
-            retry_calls["count"] += 1
+            retry_calls.append((chunk_start, chunk_end, attempt, max_retries, sleep_seconds, error_message))
 
     out_path = tmp_path / "swaps.parquet"
     with httpx.Client() as client:
@@ -440,8 +440,109 @@ def test_ingest_range_calls_on_retry_for_each_failed_attempt(tmp_path: Path):
             on_retry=on_retry,
         )
 
-    # 3 attempts total means 2 failed-then-retried attempts.
-    assert retry_calls["count"] == 2
+    # 3 attempts total means 2 failed-then-retried attempts, with
+    # increasing attempt numbers and the chunk's real block range and
+    # error text carried through.
+    assert [c[:4] for c in retry_calls] == [(0, 99, 1, 5), (0, 99, 2, 5)]
+    assert all(c[4] > 0 for c in retry_calls)
+    assert all("transient failure" in c[5] for c in retry_calls)
+
+
+def test_ingest_range_reports_queue_status_when_a_chunk_buffers_behind_a_straggler(tmp_path: Path):
+    # Chunk [0,9] is slow (simulates a retrying straggler); chunk [10,19]
+    # finishes first and must buffer behind it rather than being folded
+    # into progress immediately. on_queue_status reports that buildup.
+    release_first_chunk = threading.Event()
+
+    def gated_fetch(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str) -> list[SwapRecord]:
+        if from_block == 0:
+            release_first_chunk.wait()
+        return [_record(from_block, 0)]
+
+    statuses: list[tuple[int, int | None]] = []
+    status_lock = threading.Lock()
+    saw_second_chunk_done = threading.Event()
+
+    def on_queue_status(buffered_count: int, blocking_chunk_start: int | None) -> None:
+        with status_lock:
+            statuses.append((buffered_count, blocking_chunk_start))
+        if buffered_count >= 1:
+            saw_second_chunk_done.set()
+            release_first_chunk.set()
+
+    out_path = tmp_path / "swaps.parquet"
+    with httpx.Client() as client:
+        ingest_range(
+            pool_address="0xpool", from_block=0, to_block=19, out_path=out_path,
+            client=client, rpc_url="http://fake", chunk_size=10, max_workers=2,
+            fetch_fn=gated_fetch, on_queue_status=on_queue_status,
+        )
+
+    assert saw_second_chunk_done.is_set()
+    assert (1, 0) in statuses  # one chunk buffered, blocked on chunk starting at block 0
+
+
+def test_ingest_range_reports_worker_status_while_fetching_and_when_idle(tmp_path: Path):
+    release_chunks = threading.Event()
+
+    def gated_fetch(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str) -> list[SwapRecord]:
+        release_chunks.wait()
+        return [_record(from_block, 0)]
+
+    statuses: list[tuple[int, int, int, str]] = []
+    status_lock = threading.Lock()
+    saw_two_fetching = threading.Event()
+
+    def on_worker_status(slot: int, chunk_start: int, chunk_end: int, status: str) -> None:
+        with status_lock:
+            statuses.append((slot, chunk_start, chunk_end, status))
+            fetching_slots = {s for s, _, _, st in statuses if st == "fetching"}
+            if len(fetching_slots) >= 2:
+                saw_two_fetching.set()
+                release_chunks.set()
+
+    out_path = tmp_path / "swaps.parquet"
+    with httpx.Client() as client:
+        ingest_range(
+            pool_address="0xpool", from_block=0, to_block=19, out_path=out_path,
+            client=client, rpc_url="http://fake", chunk_size=10, max_workers=2,
+            fetch_fn=gated_fetch, on_worker_status=on_worker_status,
+        )
+
+    assert saw_two_fetching.is_set()
+    fetching_slots = sorted({s for s, _, _, st in statuses if st == "fetching"})
+    assert fetching_slots == [0, 1]
+    idle_statuses = [s for s in statuses if s[3] == "idle"]
+    assert len(idle_statuses) == 2
+
+
+def test_ingest_range_reports_worker_status_during_retries(tmp_path: Path):
+    attempts = {"count": 0}
+
+    def flaky_fetch(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str) -> list[SwapRecord]:
+        attempts["count"] += 1
+        if attempts["count"] < 3:
+            raise RpcLogsError("transient failure")
+        return [_record(from_block, 0)]
+
+    statuses: list[tuple[int, int, int, str]] = []
+
+    def on_worker_status(slot: int, chunk_start: int, chunk_end: int, status: str) -> None:
+        statuses.append((slot, chunk_start, chunk_end, status))
+
+    out_path = tmp_path / "swaps.parquet"
+    with httpx.Client() as client:
+        ingest_range(
+            pool_address="0xpool", from_block=0, to_block=99, out_path=out_path,
+            client=client, rpc_url="http://fake", chunk_size=100, max_workers=1,
+            fetch_fn=flaky_fetch, max_retries=5, retry_backoff_seconds=0.001,
+            on_worker_status=on_worker_status,
+        )
+
+    retry_statuses = [s[3] for s in statuses if s[3].startswith("retry")]
+    assert retry_statuses == ["retry 1/5, waiting 0.0s", "retry 2/5, waiting 0.0s"]
+    assert statuses[0] == (0, 0, 99, "fetching")
+    assert statuses[-1] == (0, 0, 99, "idle")
 
 
 def test_ingest_range_flushes_completed_chunks_before_raising_on_a_later_failure(tmp_path: Path):

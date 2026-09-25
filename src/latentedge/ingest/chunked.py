@@ -49,6 +49,9 @@ DEFAULT_FLUSH_EVERY_N_CHUNKS = 50
 FetchFn = Callable[[str, int, int, httpx.Client, str], list[SwapRecord]]
 
 
+OnRetryFn = Callable[[int, int, int, int, float, str], None]
+
+
 def _fetch_chunk_with_retries(
     fetch_fn: FetchFn,
     pool_address: str,
@@ -58,7 +61,7 @@ def _fetch_chunk_with_retries(
     rpc_url: str,
     max_retries: int,
     backoff_seconds: float,
-    on_retry: Callable[[], None] | None = None,
+    on_retry: OnRetryFn | None = None,
 ) -> list[SwapRecord]:
     last_error: Exception | None = None
     for attempt in range(max_retries):
@@ -67,11 +70,11 @@ def _fetch_chunk_with_retries(
         except Exception as exc:  # RpcLogsError et al — real transient failures
             last_error = exc
             if attempt < max_retries - 1:
-                if on_retry is not None:
-                    on_retry()
                 sleep_seconds = backoff_seconds * (2**attempt)
                 if isinstance(exc, RateLimitError):
                     sleep_seconds *= RATE_LIMIT_BACKOFF_MULTIPLIER
+                if on_retry is not None:
+                    on_retry(from_block, to_block, attempt + 1, max_retries, sleep_seconds, str(exc))
                 time.sleep(sleep_seconds)
     assert last_error is not None
     raise last_error
@@ -90,7 +93,9 @@ def ingest_range(
     max_workers: int = DEFAULT_MAX_WORKERS,
     flush_every_n_chunks: int = DEFAULT_FLUSH_EVERY_N_CHUNKS,
     on_progress: Callable[[int, int, int], None] | None = None,
-    on_retry: Callable[[], None] | None = None,
+    on_retry: OnRetryFn | None = None,
+    on_queue_status: Callable[[int, int | None], None] | None = None,
+    on_worker_status: Callable[[int, int, int, str], None] | None = None,
     fetch_fn: FetchFn = fetch_swaps,
 ) -> int:
     """Ingest [from_block, to_block] concurrently, in chunks, flushing to
@@ -143,12 +148,37 @@ def ingest_range(
         pending_intervals = []
         chunks_since_flush = 0
 
+    worker_slots: dict[int, int] = {}
+    slots_lock = threading.Lock()
+
+    def worker_slot() -> int:
+        ident = threading.get_ident()
+        with slots_lock:
+            if ident not in worker_slots:
+                worker_slots[ident] = len(worker_slots)
+            return worker_slots[ident]
+
     def process_chunk(chunk_start: int) -> tuple[int, int, list[SwapRecord]]:
         chunk_end = min(chunk_start + chunk_size - 1, chunk_ceiling[chunk_start])
+
+        slot = worker_slot() if on_worker_status is not None else -1
+        if on_worker_status is not None:
+            on_worker_status(slot, chunk_start, chunk_end, "fetching")
+
+        def report_retry(cs: int, ce: int, attempt: int, retries: int, sleep_seconds: float, error_message: str) -> None:
+            if on_retry is not None:
+                on_retry(cs, ce, attempt, retries, sleep_seconds, error_message)
+            if on_worker_status is not None:
+                on_worker_status(slot, cs, ce, f"retry {attempt}/{retries}, waiting {sleep_seconds:.1f}s")
+
+        retry_hook = report_retry if (on_retry is not None or on_worker_status is not None) else None
         records = _fetch_chunk_with_retries(
             fetch_fn, pool_address, chunk_start, chunk_end, client, rpc_url,
-            max_retries, retry_backoff_seconds, on_retry,
+            max_retries, retry_backoff_seconds, retry_hook,
         )
+
+        if on_worker_status is not None:
+            on_worker_status(slot, chunk_start, chunk_end, "idle")
         return chunk_start, chunk_end, records
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -185,6 +215,12 @@ def ingest_range(
 
                         if chunks_since_flush >= flush_every_n_chunks:
                             flush()
+
+                    if on_queue_status is not None:
+                        blocking_chunk_start = (
+                            chunk_order[expected_index] if expected_index < len(chunk_order) else None
+                        )
+                        on_queue_status(len(completed), blocking_chunk_start)
         finally:
             # A chunk that exhausted its retries raises out of
             # future.result() above; cancel whatever hasn't started yet
