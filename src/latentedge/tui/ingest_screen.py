@@ -9,6 +9,7 @@ from pathlib import Path
 import httpx
 from textual.app import ComposeResult
 from textual.binding import Binding
+from textual.containers import Horizontal, Vertical
 from textual.screen import Screen
 from textual.widgets import Static
 
@@ -32,6 +33,11 @@ class IngestScreen(Screen[None]):
         Binding("t", "train_now", "Train now", show=False),
         Binding("q", "exit_now", "Exit", show=False),
     ]
+    CSS = """
+    #ingest-top-row { height: auto; }
+    #ingest-left-col { width: 1fr; height: auto; }
+    #ingest-threads { width: 1fr; }
+    """
 
     def __init__(
         self,
@@ -87,9 +93,11 @@ class IngestScreen(Screen[None]):
         self._blocking_chunk_start: int | None = None
 
     def compose(self) -> ComposeResult:
-        yield ProgressPanel(id="ingest-progress")
-        yield StatsPanel(id="ingest-stats")
-        yield ThreadPanel(id="ingest-threads")
+        with Horizontal(id="ingest-top-row"):
+            with Vertical(id="ingest-left-col"):
+                yield ProgressPanel(id="ingest-progress")
+                yield StatsPanel(id="ingest-stats")
+            yield ThreadPanel(id="ingest-threads")
         yield LogPanel(id="ingest-log")
         yield Static("", id="ingest-action-bar")
 
@@ -191,23 +199,29 @@ class IngestScreen(Screen[None]):
         self._refresh_disk_stats()
 
     def _handle_worker_status(self, slot: int, chunk_start: int, chunk_end: int, status: str) -> None:
-        detail = "idle" if status == "idle" else f"blocks {chunk_start}-{chunk_end} — {status}"
+        if status == "idle":
+            detail = "[dim]○ idle[/dim]"
+        elif status == "fetching":
+            detail = f"[green]● blocks {chunk_start}-{chunk_end} — fetching[/green]"
+        else:
+            detail = f"[yellow]● blocks {chunk_start}-{chunk_end} — {status}[/yellow]"
         self.query_one("#ingest-threads", ThreadPanel).update_worker(slot, detail)
 
     def _refresh_disk_stats(self) -> None:
         file_size = self.out_path.stat().st_size if self.out_path.exists() else 0
         free_bytes = shutil.disk_usage(self.out_path.parent).free if self.out_path.parent.exists() else 0
         stalled_seconds = self.time_fn() - self._last_progress_time
-        stalled = f"{stalled_seconds:.0f}s" if stalled_seconds >= STALL_THRESHOLD_SECONDS else "no"
+        stalled = f"[red]{stalled_seconds:.0f}s[/red]" if stalled_seconds >= STALL_THRESHOLD_SECONDS else "[dim]no[/dim]"
         buffered = (
-            f"{self._buffered_count} (waiting on block {self._blocking_chunk_start})"
+            f"[yellow]{self._buffered_count} (waiting on block {self._blocking_chunk_start})[/yellow]"
             if self._buffered_count > 0
             else "0"
         )
+        retries = f"[yellow]{self.retry_count}[/yellow]" if self.retry_count > 0 else "0"
         self.query_one("#ingest-stats", StatsPanel).update_stats([
             ("File size", f"{file_size / 1_048_576:.1f} MB"),
             ("Free disk", f"{free_bytes / 1_073_741_824:.1f} GB"),
-            ("Retries", str(self.retry_count)),
+            ("Retries", retries),
             ("Stalled", stalled),
             ("Buffered", buffered),
         ])

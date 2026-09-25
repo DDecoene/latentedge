@@ -30,9 +30,17 @@ class ProgressPanel(Widget):
     # summary panels are a fixed handful of lines; only LogPanel (below)
     # should actually expand to fill the remaining space.
     DEFAULT_CSS = """
-    ProgressPanel { height: auto; }
+    ProgressPanel {
+        height: auto;
+        border: round $primary;
+        border-title-color: $text;
+        padding: 0 1;
+    }
     ProgressPanel Vertical { height: auto; }
     """
+
+    def on_mount(self) -> None:
+        self.border_title = "Progress"
 
     def compose(self) -> ComposeResult:
         with Vertical():
@@ -63,7 +71,17 @@ class ProgressPanel(Widget):
 class StatsPanel(Widget):
     """A small label/value table for point-in-time stats (file size, retries, ...)."""
 
-    DEFAULT_CSS = "StatsPanel { height: auto; }"
+    DEFAULT_CSS = """
+    StatsPanel {
+        height: auto;
+        border: round $primary;
+        border-title-color: $text;
+        padding: 0 1;
+    }
+    """
+
+    def on_mount(self) -> None:
+        self.border_title = "Stats"
 
     def compose(self) -> ComposeResult:
         yield Static("", id=f"{self.id}-body")
@@ -76,11 +94,21 @@ class StatsPanel(Widget):
 class ThreadPanel(Widget):
     """One line per worker thread: its current block range and status."""
 
-    DEFAULT_CSS = "ThreadPanel { height: auto; }"
+    DEFAULT_CSS = """
+    ThreadPanel {
+        height: auto;
+        border: round $primary;
+        border-title-color: $text;
+        padding: 0 1;
+    }
+    """
 
     def __init__(self, *args: object, **kwargs: object) -> None:
         super().__init__(*args, **kwargs)  # type: ignore[arg-type]
         self._lines: dict[int, str] = {}
+
+    def on_mount(self) -> None:
+        self.border_title = "Workers"
 
     def compose(self) -> ComposeResult:
         yield Static("", id=f"{self.id}-body")
@@ -96,7 +124,17 @@ class LogPanel(Widget):
 
     # The one panel that should actually expand to fill whatever space
     # the fixed-height summary panels above it leave behind.
-    DEFAULT_CSS = "LogPanel { height: 1fr; }"
+    DEFAULT_CSS = """
+    LogPanel {
+        height: 1fr;
+        border: round $primary;
+        border-title-color: $text;
+        padding: 0 1;
+    }
+    """
+
+    def on_mount(self) -> None:
+        self.border_title = "Log"
 
     def compose(self) -> ComposeResult:
         yield RichLog(max_lines=MAX_LOG_LINES, id=f"{self.id}-body")
