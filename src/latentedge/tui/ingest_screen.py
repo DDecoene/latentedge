@@ -14,7 +14,7 @@ from textual.widgets import Static
 
 from latentedge.ingest.chunked import FetchFn, read_progress
 from latentedge.ingest.chunked import ingest_range as default_ingest_range
-from latentedge.ingest.rpc_logs import fetch_swaps
+from latentedge.ingest.rpc_logs import describe_error, fetch_swaps
 from latentedge.tui.train_screen import DEFAULT_MODEL_OUT_PATH, TrainAssembleFn, TrainScreen
 from latentedge.tui.widgets import LogPanel, ProgressPanel, StatsPanel
 
@@ -118,7 +118,7 @@ class IngestScreen(Screen[None]):
                     on_progress=on_progress, on_retry=on_retry, fetch_fn=self.fetch_fn,
                 )
         except Exception as exc:
-            self.app.call_from_thread(self._handle_error, str(exc))
+            self.app.call_from_thread(self._handle_error, describe_error(self.rpc_url, exc))
             return
         self.app.call_from_thread(self._handle_complete, total)
 

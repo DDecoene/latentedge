@@ -2,7 +2,7 @@ import httpx
 import pytest
 
 from latentedge import config
-from latentedge.ingest.rpc_logs import RateLimitError, fetch_swaps, get_latest_block
+from latentedge.ingest.rpc_logs import RateLimitError, RpcLogsError, describe_error, fetch_swaps, get_latest_block
 from latentedge.ingest.rpc_logs import _batch_fetch_blocks, _rpc_call
 
 RPC_URL = "https://ethereum.publicnode.com"
@@ -119,3 +119,35 @@ def test_batch_fetch_blocks_raises_rate_limit_error_on_embedded_429_code():
     with _mock_client(handler) as client:
         with pytest.raises(RateLimitError):
             _batch_fetch_blocks([1], client, RPC_URL)
+
+
+def test_describe_error_explains_connection_failure_in_plain_language():
+    exc = httpx.ConnectError("[Errno 8] nodename nor servname provided, or not known")
+    message = describe_error(RPC_URL, exc)
+
+    assert "internet connection" in message
+    assert RPC_URL in message
+    # No raw errno/traceback jargon leaking into the user-facing message.
+    assert "Errno" not in message
+
+
+def test_describe_error_explains_timeout_in_plain_language():
+    exc = httpx.TimeoutException("timed out")
+    message = describe_error(RPC_URL, exc)
+
+    assert "slow" in message or "timed out" in message.lower()
+    assert RPC_URL in message
+
+
+def test_describe_error_explains_rate_limit_in_plain_language():
+    exc = RateLimitError("RPC rate limited (HTTP 429): ...")
+    message = describe_error(RPC_URL, exc)
+
+    assert "rate" in message.lower()
+
+
+def test_describe_error_passes_through_other_rpc_errors_as_is():
+    exc = RpcLogsError("RPC error: {'code': -32602, 'message': 'block range extends beyond current head block'}")
+    message = describe_error(RPC_URL, exc)
+
+    assert "block range extends beyond current head block" in message

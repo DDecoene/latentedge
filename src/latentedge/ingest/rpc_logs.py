@@ -44,6 +44,23 @@ def get_latest_block(client: httpx.Client, rpc_url: str) -> int:
     return int(result, 16)
 
 
+def describe_error(rpc_url: str, exc: Exception) -> str:
+    """Turn a network/RPC exception into a message a person can act on,
+    instead of a raw traceback full of errno numbers and stack frames.
+    """
+    if isinstance(exc, httpx.ConnectError):
+        return f"Could not reach {rpc_url} — check your internet connection and the RPC URL."
+    if isinstance(exc, httpx.TimeoutException):
+        return f"Timed out talking to {rpc_url} — the endpoint may be slow or unreachable right now."
+    if isinstance(exc, RateLimitError):
+        return f"{rpc_url} is rate-limiting requests — retrying with a longer backoff; if this keeps happening, try a lower --max-workers or a paid RPC tier."
+    if isinstance(exc, RpcLogsError):
+        return str(exc)
+    if isinstance(exc, httpx.HTTPError):
+        return f"Network error talking to {rpc_url}: {exc}"
+    return str(exc)
+
+
 BLOCK_BATCH_SIZE = 100
 
 

@@ -224,3 +224,45 @@ def test_ingest_rejects_only_one_of_from_block_to_block(tmp_path: Path):
 
     assert result.exit_code != 0
     assert "--from-block and --to-block" in result.output
+
+
+def test_ingest_shows_plain_language_error_when_days_resolution_cannot_reach_rpc(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    # Regression test: a real connection failure while resolving --days
+    # into a block range used to dump a raw Python traceback (see the
+    # bug report this fixes). It must instead exit cleanly with a
+    # message a person can act on.
+    import httpx as httpx_module
+
+    def unreachable(client, rpc_url):
+        raise httpx_module.ConnectError("[Errno 8] nodename nor servname provided, or not known")
+
+    monkeypatch.setattr("latentedge.cli.get_latest_block", unreachable)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["ingest", "--days", "1", "--out", str(tmp_path / "swaps.parquet")],
+    )
+
+    assert result.exit_code != 0
+    assert "Traceback" not in result.output
+    assert "internet connection" in result.output
+
+
+def test_ingest_shows_plain_language_error_when_plain_mode_ingest_fails_to_connect(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    import httpx as httpx_module
+
+    def unreachable(pool_address, from_block, to_block, out, client, rpc_url, **kwargs):
+        raise httpx_module.ConnectError("[Errno 8] nodename nor servname provided, or not known")
+
+    monkeypatch.setattr("latentedge.cli.ingest_range", unreachable)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["ingest", "--from-block", "1", "--to-block", "2", "--out", str(tmp_path / "swaps.parquet")],
+    )
+
+    assert result.exit_code != 0
+    assert "Traceback" not in result.output
+    assert "internet connection" in result.output

@@ -18,7 +18,7 @@ from latentedge.ingest.chunked import (
     DEFAULT_RETRY_BACKOFF_SECONDS,
     ingest_range,
 )
-from latentedge.ingest.rpc_logs import get_latest_block
+from latentedge.ingest.rpc_logs import RpcLogsError, describe_error, get_latest_block
 from latentedge.model import NetReturnRegressor, save
 from latentedge.model import train as train_model
 from latentedge.split import chronological_split
@@ -90,7 +90,10 @@ def ingest(
 
     if from_block is None:
         with httpx.Client(timeout=30.0) as client:
-            head = get_latest_block(client, rpc_url)
+            try:
+                head = get_latest_block(client, rpc_url)
+            except (httpx.HTTPError, RpcLogsError) as exc:
+                raise click.ClickException(describe_error(rpc_url, exc)) from None
         to_block = head - config.HEAD_BLOCK_SAFETY_BUFFER
         blocks_in_range = max(int(days * 86400 / config.AVG_BLOCK_SECONDS), 1)
         from_block = to_block - blocks_in_range + 1
@@ -117,12 +120,15 @@ def ingest(
         click.echo(f"  blocks {chunk_start}-{chunk_end}: {count} swaps")
 
     with httpx.Client(timeout=30.0) as client:
-        total = ingest_range(
-            config.POOL_ADDRESS, from_block, to_block, out, client, rpc_url,
-            chunk_size=chunk_size, max_retries=max_retries, retry_backoff_seconds=retry_backoff_seconds,
-            max_workers=max_workers, flush_every_n_chunks=flush_every_n_chunks,
-            on_progress=report,
-        )
+        try:
+            total = ingest_range(
+                config.POOL_ADDRESS, from_block, to_block, out, client, rpc_url,
+                chunk_size=chunk_size, max_retries=max_retries, retry_backoff_seconds=retry_backoff_seconds,
+                max_workers=max_workers, flush_every_n_chunks=flush_every_n_chunks,
+                on_progress=report,
+            )
+        except (httpx.HTTPError, RpcLogsError) as exc:
+            raise click.ClickException(describe_error(rpc_url, exc)) from None
     click.echo(f"wrote {total} new swap records to {out}")
 
 

@@ -197,6 +197,35 @@ async def test_ingest_screen_logs_error_on_exhausted_retries_without_crashing(tm
 
 
 @pytest.mark.asyncio
+async def test_ingest_screen_shows_a_plain_language_message_for_a_connection_failure(tmp_path: Path):
+    # Regression test: a raw httpx exception (errno numbers, internal
+    # jargon) must not reach the screen verbatim — it should read like
+    # something a person can act on.
+    def connection_refused(pool_address, from_block, to_block, client, rpc_url):
+        raise httpx.ConnectError("[Errno 8] nodename nor servname provided, or not known")
+
+    out_path = tmp_path / "swaps.parquet"
+    screen = IngestScreen(
+        pool_address="0xpool", from_block=0, to_block=9, out_path=out_path,
+        client_factory=lambda: httpx.Client(), rpc_url="http://fake-rpc.invalid",
+        chunk_size=10, max_workers=1, flush_every_n_chunks=1,
+        max_retries=1, retry_backoff_seconds=0.001, fetch_fn=connection_refused,
+        train_assemble_fn=lambda p: (None, None, 0, {}),
+    )
+    app = LatentEdgeApp(start_screen=screen)
+
+    async with app.run_test() as pilot:
+        for _ in range(50):
+            await pilot.pause(0.01)
+            if screen.error is not None:
+                break
+
+    assert screen.error is not None
+    assert "internet connection" in screen.error
+    assert "Errno" not in screen.error
+
+
+@pytest.mark.asyncio
 async def test_ingest_screen_shows_completion_prompt(tmp_path: Path):
     out_path = tmp_path / "swaps.parquet"
     screen = IngestScreen(
