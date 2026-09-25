@@ -51,6 +51,48 @@ async def test_ingest_screen_reaches_complete_state(tmp_path: Path):
     assert read_progress(out_path) == [(0, 29)]
     assert len(read_swaps(out_path)) == 3
 
+    # Everything shown in the on-screen log panel must also land on disk
+    # — the panel only keeps its last MAX_LOG_LINES, but the file is
+    # where retry/timing history survives after the run ends.
+    log_text = screen.log_path.read_text()
+    assert "starting:" in log_text
+    assert "blocks 0-9: 1 swaps" in log_text
+    assert "complete: wrote 3 swaps" in log_text
+
+
+@pytest.mark.asyncio
+async def test_ingest_screen_writes_retries_and_concurrency_changes_to_the_log_file(tmp_path: Path):
+    attempts = {"count": 0}
+
+    def one_rate_limit_then_fine(pool_address, from_block, to_block, client, rpc_url):
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise RateLimitError("simulated rate limit")
+        return [_record(from_block)]
+
+    out_path = tmp_path / "swaps.parquet"
+    screen = IngestScreen(
+        pool_address="0xpool", from_block=0, to_block=39, out_path=out_path,
+        client_factory=lambda: httpx.Client(), rpc_url="http://fake",
+        chunk_size=10, max_workers=4, flush_every_n_chunks=1,
+        max_retries=3, retry_backoff_seconds=0.001, concurrency_cooldown_seconds=0,
+        fetch_fn=one_rate_limit_then_fine,
+        train_assemble_fn=lambda p: (None, None, 0, {}),
+    )
+    app = LatentEdgeApp(start_screen=screen)
+
+    async with app.run_test() as pilot:
+        for _ in range(50):
+            await pilot.pause(0.01)
+            if screen.is_complete:
+                break
+
+    assert screen.is_complete
+    log_text = screen.log_path.read_text()
+    assert "rate limited, retry 1" in log_text
+    assert "simulated rate limit" in log_text
+    assert "throttled down to 2/4" in log_text
+
 
 @pytest.mark.asyncio
 async def test_ingest_screen_progress_starts_from_resumed_block(tmp_path: Path):
@@ -315,7 +357,8 @@ async def test_ingest_screen_shows_concurrency_limit_after_a_throttle_down(tmp_p
         pool_address="0xpool", from_block=0, to_block=39, out_path=out_path,
         client_factory=lambda: httpx.Client(), rpc_url="http://fake",
         chunk_size=10, max_workers=4, flush_every_n_chunks=1,
-        max_retries=3, retry_backoff_seconds=0.001, fetch_fn=one_rate_limit_then_fine,
+        max_retries=3, retry_backoff_seconds=0.001, concurrency_cooldown_seconds=0,
+        fetch_fn=one_rate_limit_then_fine,
         train_assemble_fn=lambda p: (None, None, 0, {}),
     )
     app = LatentEdgeApp(start_screen=screen)
@@ -427,7 +470,7 @@ async def test_ingest_screen_logs_error_on_exhausted_retries_without_crashing(tm
 
     assert screen.error is not None
     assert "permanent failure" in screen.error
-    assert "Exit" in action_bar_text
+    assert "exit" in action_bar_text.lower()
     assert not isinstance(screen_after_t, TrainScreen)
     assert not still_running
 
@@ -481,8 +524,8 @@ async def test_ingest_screen_shows_completion_prompt(tmp_path: Path):
         action_bar = app.screen.query_one("#ingest-action-bar")
         text = str(action_bar.content)
 
-    assert "Train now" in text
-    assert "Exit" in text
+    assert "train now" in text.lower()
+    assert "exit" in text.lower()
     assert str(out_path) in text or "1" in text  # swap count or path present
 
 

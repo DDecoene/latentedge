@@ -24,33 +24,59 @@ from pathlib import Path
 
 import httpx
 
+from latentedge.ingest import concurrency as _concurrency
 from latentedge.ingest.concurrency import AdaptiveConcurrencyLimiter, ReleaseOutcome
-from latentedge.ingest.progress import Interval, add_interval, read_progress, uncovered_gaps, write_progress
+from latentedge.ingest.progress import (
+    Interval,
+    add_interval,
+    read_concurrency_limit,
+    read_progress,
+    uncovered_gaps,
+    write_concurrency_limit,
+    write_progress,
+)
 from latentedge.ingest.rpc_logs import RateLimitError, fetch_swaps
 from latentedge.schema import SwapRecord
 from latentedge.store import write_swaps
 
-DEFAULT_CHUNK_SIZE = 10  # Alchemy's free-tier eth_getLogs cap; verified against the real service
+# Kept equal to rpc_logs.ETH_GETLOGS_RANGE_CAP (the provider's per-call
+# eth_getLogs limit) on purpose. fetch_swaps CAN accept a larger chunk and
+# sub-chunk eth_getLogs internally to batch block-timestamp lookups across
+# more blocks per round-trip — tried that here, but it made real 429s
+# *worse*: the concurrency limiter only gates once per chunk, so a larger
+# chunk means one "permitted" worker fires many eth_getLogs calls back-to-
+# back with no pacing between them, bursting far more requests per permit
+# than the limiter's concurrency count suggests. Needs per-request pacing
+# inside fetch_swaps (not just per-chunk gating) to be safe — not built
+# yet, so keep this at the provider cap until that exists.
+DEFAULT_CHUNK_SIZE = 10
 DEFAULT_MAX_RETRIES = 5
 DEFAULT_RETRY_BACKOFF_SECONDS = 2.0
 # A rate limit retried on the same short schedule as a generic transient
 # error just re-triggers the same limit (observed for real against
 # Alchemy's free tier) — back off substantially longer for it.
 RATE_LIMIT_BACKOFF_MULTIPLIER = 5.0
-# Lower than earlier default (8): fewer concurrent workers means fewer
-# simultaneous requests competing for the same per-second compute-unit
-# budget, observed for real to matter more than backoff tuning alone.
-DEFAULT_MAX_WORKERS = 4
-# Lower than earlier default (200): a chunk that ultimately can't
-# recover from a rate limit no longer loses unflushed progress (see
-# ingest_range's finally-block flush), but flushing more often still
-# bounds how much work a mid-run interruption could repeat on resume.
+DEFAULT_MAX_WORKERS = 8
+# A chunk that ultimately can't recover from a rate limit no longer loses
+# unflushed progress (see ingest_range's finally-block flush), but
+# flushing more often still bounds how much work a mid-run interruption
+# could repeat on resume.
 DEFAULT_FLUSH_EVERY_N_CHUNKS = 50
+DEFAULT_CONCURRENCY_COOLDOWN_SECONDS = _concurrency.DEFAULT_COOLDOWN_SECONDS
+# A rate limit is an expected, temporary condition on a free-tier provider
+# — not evidence of a real bug — so it must never be the reason an
+# unattended, hours-long ingest run gives up partway through. Rate-limited
+# chunks retry indefinitely (unlike max_retries below, which still bounds
+# genuine errors so a real bug fails fast instead of looping forever), with
+# backoff capped at this ceiling rather than growing unboundedly.
+DEFAULT_MAX_RATE_LIMIT_BACKOFF_SECONDS = 120.0
 
 FetchFn = Callable[[str, int, int, httpx.Client, str], list[SwapRecord]]
 
 
-OnRetryFn = Callable[[int, int, int, int, float, str], None]
+# max_retries (5th positional) is None for a rate-limited retry — there is
+# no ceiling to report since it never gives up.
+OnRetryFn = Callable[[int, int, int, int | None, float, str], None]
 
 
 def _fetch_chunk_with_retries(
@@ -66,9 +92,17 @@ def _fetch_chunk_with_retries(
     on_retry: OnRetryFn | None = None,
     on_concurrency_change: Callable[[int], None] | None = None,
     on_status: Callable[[str], None] | None = None,
+    max_rate_limit_backoff_seconds: float = DEFAULT_MAX_RATE_LIMIT_BACKOFF_SECONDS,
 ) -> list[SwapRecord]:
-    last_error: Exception | None = None
-    for attempt in range(max_retries):
+    # Two independent counters: a rate limit is expected, temporary
+    # provider behavior and retries forever (capped backoff, uncapped
+    # attempts) so an unattended run never quits over it; a genuine
+    # error (bad params, a real RPC bug) still gives up after
+    # max_retries, so an actually-broken run fails fast instead of
+    # retrying something that can never succeed.
+    failure_attempt = 0
+    rate_limit_attempt = 0
+    while True:
         # Blocking on the gate is the one moment the throttle is actually
         # visible — report it distinctly from "fetching" rather than
         # announcing "fetching" before the wait even starts.
@@ -80,26 +114,37 @@ def _fetch_chunk_with_retries(
         try:
             result = fetch_fn(pool_address, from_block, to_block, client, rpc_url)
         except Exception as exc:  # RpcLogsError et al — real transient failures
-            outcome: ReleaseOutcome = "rate_limited" if isinstance(exc, RateLimitError) else "failed"
-            new_limit, changed = limiter.release(outcome)
+            is_rate_limited = isinstance(exc, RateLimitError)
+            new_limit, changed = limiter.release("rate_limited" if is_rate_limited else "failed")
             if changed and on_concurrency_change is not None:
                 on_concurrency_change(new_limit)
 
-            last_error = exc
-            if attempt < max_retries - 1:
-                sleep_seconds = backoff_seconds * (2**attempt)
-                if isinstance(exc, RateLimitError):
-                    sleep_seconds *= RATE_LIMIT_BACKOFF_MULTIPLIER
+            if is_rate_limited:
+                rate_limit_attempt += 1
+                # Exponent capped so the count doesn't grow into a huge
+                # integer over a run lasting hours — the min() below
+                # already does the real capping of how long it sleeps.
+                sleep_seconds = min(
+                    backoff_seconds * (2 ** min(rate_limit_attempt - 1, 20)) * RATE_LIMIT_BACKOFF_MULTIPLIER,
+                    max_rate_limit_backoff_seconds,
+                )
                 if on_retry is not None:
-                    on_retry(from_block, to_block, attempt + 1, max_retries, sleep_seconds, str(exc))
+                    on_retry(from_block, to_block, rate_limit_attempt, None, sleep_seconds, str(exc))
                 time.sleep(sleep_seconds)
+                continue
+
+            failure_attempt += 1
+            if failure_attempt >= max_retries:
+                raise
+            sleep_seconds = backoff_seconds * (2 ** (failure_attempt - 1))
+            if on_retry is not None:
+                on_retry(from_block, to_block, failure_attempt, max_retries, sleep_seconds, str(exc))
+            time.sleep(sleep_seconds)
         else:
             new_limit, changed = limiter.release("success")
             if changed and on_concurrency_change is not None:
                 on_concurrency_change(new_limit)
             return result
-    assert last_error is not None
-    raise last_error
 
 
 def ingest_range(
@@ -114,6 +159,8 @@ def ingest_range(
     retry_backoff_seconds: float = DEFAULT_RETRY_BACKOFF_SECONDS,
     max_workers: int = DEFAULT_MAX_WORKERS,
     flush_every_n_chunks: int = DEFAULT_FLUSH_EVERY_N_CHUNKS,
+    concurrency_cooldown_seconds: float = DEFAULT_CONCURRENCY_COOLDOWN_SECONDS,
+    max_rate_limit_backoff_seconds: float = DEFAULT_MAX_RATE_LIMIT_BACKOFF_SECONDS,
     on_progress: Callable[[int, int, int], None] | None = None,
     on_retry: OnRetryFn | None = None,
     on_queue_status: Callable[[int, int | None], None] | None = None,
@@ -171,7 +218,21 @@ def ingest_range(
         pending_intervals = []
         chunks_since_flush = 0
 
-    limiter = AdaptiveConcurrencyLimiter(ceiling=max_workers)
+    persisted_limit = read_concurrency_limit(out_path)
+    # A floor, not a fixed resume point: recovering from a throttle-down
+    # needs successes_before_increase consecutive successes, which a
+    # genuinely flaky provider may rarely string together — resuming at
+    # the exact worst level a prior run ever reached would otherwise
+    # ratchet every future run down to that floor permanently, with no
+    # chance to re-test whether conditions (or the provider's load) have
+    # improved since. Never resume below half the ceiling regardless of
+    # how low a prior run bottomed out.
+    start_limit = max(persisted_limit, -(-max_workers // 2)) if persisted_limit is not None else None
+    limiter = AdaptiveConcurrencyLimiter(
+        ceiling=max_workers,
+        cooldown_seconds=concurrency_cooldown_seconds,
+        start_limit=start_limit,
+    )
 
     worker_slots: dict[int, int] = {}
     slots_lock = threading.Lock()
@@ -188,11 +249,12 @@ def ingest_range(
 
         slot = worker_slot() if on_worker_status is not None else -1
 
-        def report_retry(cs: int, ce: int, attempt: int, retries: int, sleep_seconds: float, error_message: str) -> None:
+        def report_retry(cs: int, ce: int, attempt: int, retries: int | None, sleep_seconds: float, error_message: str) -> None:
             if on_retry is not None:
                 on_retry(cs, ce, attempt, retries, sleep_seconds, error_message)
             if on_worker_status is not None:
-                on_worker_status(slot, cs, ce, f"retry {attempt}/{retries}, waiting {sleep_seconds:.1f}s")
+                label = f"retry {attempt}/{retries}" if retries is not None else f"rate limited, retry {attempt}"
+                on_worker_status(slot, cs, ce, f"{label}, waiting {sleep_seconds:.1f}s")
 
         def report_status(status: str) -> None:
             if on_worker_status is not None:
@@ -203,6 +265,7 @@ def ingest_range(
         records = _fetch_chunk_with_retries(
             fetch_fn, pool_address, chunk_start, chunk_end, client, rpc_url,
             max_retries, retry_backoff_seconds, limiter, retry_hook, on_concurrency_change, status_hook,
+            max_rate_limit_backoff_seconds,
         )
 
         if on_worker_status is not None:
@@ -260,5 +323,10 @@ def ingest_range(
                 f.cancel()
             with lock:
                 flush()
+            # Persisted regardless of whether this run finished cleanly
+            # or was cut short — whatever level the limiter actually
+            # settled at is the useful starting point for a resume,
+            # not just the happy-path ending level.
+            write_concurrency_limit(out_path, limiter.limit)
 
     return total_written

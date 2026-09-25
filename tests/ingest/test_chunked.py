@@ -6,7 +6,7 @@ import httpx
 import pytest
 
 from latentedge.ingest.chunked import ingest_range
-from latentedge.ingest.progress import read_progress, write_progress
+from latentedge.ingest.progress import read_concurrency_limit, read_progress, write_progress
 from latentedge.ingest.rpc_logs import RateLimitError, RpcLogsError
 from latentedge.schema import SwapRecord
 from latentedge.store import read_swaps
@@ -405,12 +405,91 @@ def test_ingest_range_backs_off_longer_for_rate_limit_errors(tmp_path: Path, mon
             pool_address="0xpool", from_block=0, to_block=99, out_path=out_path,
             client=client, rpc_url="http://fake", chunk_size=100, max_workers=1,
             fetch_fn=rate_limited_fetch, max_retries=5, retry_backoff_seconds=1.0,
+            concurrency_cooldown_seconds=0,
         )
 
     # Two retries happened (attempts 1 and 2 failed); both backoffs must
     # be well beyond the plain (non-rate-limited) schedule of 1s, 2s.
     assert len(sleeps) == 2
     assert all(s >= 5.0 for s in sleeps)
+
+
+def test_ingest_range_never_gives_up_on_a_rate_limited_chunk_even_past_max_retries(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    # A rate limit is expected, temporary provider behavior, not a bug —
+    # an unattended, hours-long run must never quit over it, however many
+    # times it recurs on one chunk. max_retries=2 would exhaust a
+    # generic error in 2 attempts; this chunk fails 5 times and still
+    # must succeed rather than raise.
+    monkeypatch.setattr("latentedge.ingest.chunked.time.sleep", lambda seconds: None)
+    attempts = {"count": 0}
+
+    def rate_limited_many_times(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str) -> list[SwapRecord]:
+        attempts["count"] += 1
+        if attempts["count"] < 6:
+            raise RateLimitError("simulated rate limit")
+        return [_record(from_block, 0)]
+
+    out_path = tmp_path / "swaps.parquet"
+    with httpx.Client() as client:
+        total = ingest_range(
+            pool_address="0xpool", from_block=0, to_block=99, out_path=out_path,
+            client=client, rpc_url="http://fake", chunk_size=100, max_workers=1,
+            fetch_fn=rate_limited_many_times, max_retries=2, retry_backoff_seconds=0.001,
+            concurrency_cooldown_seconds=0,
+        )
+
+    assert total == 1
+    assert attempts["count"] == 6
+
+
+def test_ingest_range_caps_rate_limit_backoff_instead_of_growing_unbounded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    sleeps: list[float] = []
+    monkeypatch.setattr("latentedge.ingest.chunked.time.sleep", lambda seconds: sleeps.append(seconds))
+    attempts = {"count": 0}
+
+    def rate_limited_many_times(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str) -> list[SwapRecord]:
+        attempts["count"] += 1
+        if attempts["count"] < 8:
+            raise RateLimitError("simulated rate limit")
+        return [_record(from_block, 0)]
+
+    out_path = tmp_path / "swaps.parquet"
+    with httpx.Client() as client:
+        ingest_range(
+            pool_address="0xpool", from_block=0, to_block=99, out_path=out_path,
+            client=client, rpc_url="http://fake", chunk_size=100, max_workers=1,
+            fetch_fn=rate_limited_many_times, max_retries=2, retry_backoff_seconds=2.0,
+            concurrency_cooldown_seconds=0,
+        )
+
+    # Uncapped exponential growth (2 * 2^6 * 5 = 640s) would blow way past
+    # any reasonable ceiling by the 7th rate-limited attempt.
+    assert all(s <= 120.0 for s in sleeps)
+    assert max(sleeps) == 120.0
+
+
+def test_ingest_range_reports_no_retry_ceiling_for_a_rate_limited_retry(tmp_path: Path):
+    attempts = {"count": 0}
+
+    def rate_limited_then_fine(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str) -> list[SwapRecord]:
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise RateLimitError("simulated rate limit")
+        return [_record(from_block, 0)]
+
+    retry_calls: list[tuple[int, int, int, int | None, float, str]] = []
+
+    out_path = tmp_path / "swaps.parquet"
+    with httpx.Client() as client:
+        ingest_range(
+            pool_address="0xpool", from_block=0, to_block=99, out_path=out_path,
+            client=client, rpc_url="http://fake", chunk_size=100, max_workers=1,
+            fetch_fn=rate_limited_then_fine, max_retries=2, retry_backoff_seconds=0.001,
+            concurrency_cooldown_seconds=0, on_retry=lambda *args: retry_calls.append(args),
+        )
+
+    assert len(retry_calls) == 1
+    assert retry_calls[0][3] is None  # no ceiling reported for a rate limit
 
 
 def test_ingest_range_calls_on_retry_for_each_failed_attempt(tmp_path: Path):
@@ -613,11 +692,89 @@ def test_ingest_range_throttles_down_worker_concurrency_after_a_rate_limit(tmp_p
             pool_address="0xpool", from_block=0, to_block=99, out_path=out_path,
             client=client, rpc_url="http://fake", chunk_size=10, max_workers=4,
             fetch_fn=one_rate_limit_then_fine, max_retries=3, retry_backoff_seconds=0.001,
+            concurrency_cooldown_seconds=0,
             on_concurrency_change=on_concurrency_change,
         )
 
     assert total == 10
     assert 2 in concurrency_changes  # halved from the ceiling of 4 after the one rate limit
+
+
+def test_ingest_range_persists_the_settled_concurrency_limit_for_the_next_run(tmp_path: Path):
+    attempts = {"count": 0}
+    lock = threading.Lock()
+
+    def one_rate_limit_then_fine(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str) -> list[SwapRecord]:
+        with lock:
+            attempts["count"] += 1
+            first = attempts["count"] == 1
+        if first:
+            raise RateLimitError("simulated rate limit")
+        return [_record(from_block, 0)]
+
+    out_path = tmp_path / "swaps.parquet"
+    with httpx.Client() as client:
+        ingest_range(
+            pool_address="0xpool", from_block=0, to_block=99, out_path=out_path,
+            client=client, rpc_url="http://fake", chunk_size=10, max_workers=4,
+            fetch_fn=one_rate_limit_then_fine, max_retries=3, retry_backoff_seconds=0.001,
+            concurrency_cooldown_seconds=0,
+        )
+
+    # The run above halved from a ceiling of 4 down to 2 and never grew
+    # back (successes_before_increase defaults to 20, far more than the
+    # handful of chunks here) — a resumed run must start from that 2,
+    # not silently reset to the ceiling and re-earn the same throttle.
+    assert read_concurrency_limit(out_path) == 2
+
+    seen_limits: list[int] = []
+
+    def record_limit_seen_on_acquire(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str) -> list[SwapRecord]:
+        return [_record(from_block, 0)]
+
+    def on_concurrency_change(new_limit: int) -> None:
+        seen_limits.append(new_limit)
+
+    with httpx.Client() as client:
+        ingest_range(
+            pool_address="0xpool", from_block=100, to_block=109, out_path=out_path,
+            client=client, rpc_url="http://fake", chunk_size=10, max_workers=4,
+            fetch_fn=record_limit_seen_on_acquire, concurrency_cooldown_seconds=0,
+            on_concurrency_change=on_concurrency_change,
+        )
+
+    # Nothing rate-limited this time, so the limit should only ever have
+    # been read as 2 (the persisted value), never reported back up to
+    # the ceiling of 4 from a single chunk's worth of successes.
+    assert 4 not in seen_limits
+    assert read_concurrency_limit(out_path) == 2
+
+
+def test_ingest_range_never_resumes_below_half_the_ceiling_even_if_a_prior_run_bottomed_out(tmp_path: Path):
+    # A prior run that bottomed all the way out to 1 (the AIMD floor)
+    # must not permanently pin every future run to 1 — recovering from 1
+    # needs successes_before_increase consecutive successes, which a
+    # flaky provider may never string together, so a bare persisted
+    # floor would ratchet throughput down forever with no way back up.
+    from latentedge.ingest.progress import write_concurrency_limit
+
+    out_path = tmp_path / "swaps.parquet"
+    write_concurrency_limit(out_path, 1)
+
+    def fake_fetch(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str) -> list[SwapRecord]:
+        return [_record(from_block, 0)]
+
+    with httpx.Client() as client:
+        ingest_range(
+            pool_address="0xpool", from_block=0, to_block=9, out_path=out_path,
+            client=client, rpc_url="http://fake", chunk_size=10, max_workers=4,
+            fetch_fn=fake_fetch, concurrency_cooldown_seconds=0,
+        )
+
+    # Nothing rate-limited or grew the limit in this single-chunk run, so
+    # whatever it ends on is exactly what it started from — must be half
+    # the ceiling (2), not the persisted floor of 1.
+    assert read_concurrency_limit(out_path) == 2
 
 
 def test_ingest_range_flushes_completed_chunks_before_raising_on_a_later_failure(tmp_path: Path):

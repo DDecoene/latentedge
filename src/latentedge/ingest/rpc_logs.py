@@ -13,6 +13,13 @@ from latentedge.schema import SwapRecord
 # keccak256("Swap(address,address,int256,int256,uint160,uint128,int24)")
 SWAP_TOPIC = "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67"
 
+# Alchemy's free-tier eth_getLogs cap; verified against the real service.
+# This bounds only the getLogs sub-calls fetch_swaps makes internally —
+# callers pass whatever from_block/to_block span they want and fetch_swaps
+# sub-chunks it, so the (much larger) block-timestamp batch below isn't
+# forced down to this same tiny granularity.
+ETH_GETLOGS_RANGE_CAP = 10
+
 
 class RpcLogsError(Exception):
     pass
@@ -124,20 +131,39 @@ def _decode_swap_data(data_hex: str) -> tuple[float, float, int, int, int]:
     return float(amount0), float(amount1), sqrt_price_x96, liquidity, tick
 
 
-def fetch_swaps(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str) -> list[SwapRecord]:
-    logs = _rpc_call(
-        client,
-        rpc_url,
-        "eth_getLogs",
-        [
-            {
-                "address": pool_address,
-                "topics": [SWAP_TOPIC],
-                "fromBlock": hex(from_block),
-                "toBlock": hex(to_block),
-            }
-        ],
-    )
+def fetch_swaps(
+    pool_address: str,
+    from_block: int,
+    to_block: int,
+    client: httpx.Client,
+    rpc_url: str,
+    eth_getlogs_range_cap: int = ETH_GETLOGS_RANGE_CAP,
+) -> list[SwapRecord]:
+    # eth_getLogs itself must stay within the provider's tiny per-call
+    # range cap, but that cap has nothing to do with how many blocks'
+    # worth of timestamps get batched into one eth_getBlockByNumber
+    # round-trip below — sub-chunking only the getLogs half here, over
+    # whatever (larger) span the caller asked for, means a caller
+    # requesting e.g. 100 blocks makes 10 getLogs calls but still only
+    # 1 block-timestamp batch call instead of 10.
+    logs: list[dict[str, Any]] = []
+    for sub_from in range(from_block, to_block + 1, eth_getlogs_range_cap):
+        sub_to = min(sub_from + eth_getlogs_range_cap - 1, to_block)
+        logs.extend(
+            _rpc_call(
+                client,
+                rpc_url,
+                "eth_getLogs",
+                [
+                    {
+                        "address": pool_address,
+                        "topics": [SWAP_TOPIC],
+                        "fromBlock": hex(sub_from),
+                        "toBlock": hex(sub_to),
+                    }
+                ],
+            )
+        )
 
     # Both the timestamp and base fee come from the same block fetch —
     # eth_getBlockByNumber's response already carries baseFeePerGas, so

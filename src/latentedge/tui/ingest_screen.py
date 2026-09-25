@@ -4,6 +4,7 @@ import shutil
 import time
 from collections import deque
 from collections.abc import Callable
+from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
@@ -13,7 +14,7 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import Screen
 from textual.widgets import Static
 
-from latentedge.ingest.chunked import FetchFn
+from latentedge.ingest.chunked import DEFAULT_CONCURRENCY_COOLDOWN_SECONDS, DEFAULT_MAX_RATE_LIMIT_BACKOFF_SECONDS, FetchFn
 from latentedge.ingest.chunked import ingest_range as default_ingest_range
 from latentedge.ingest.progress import read_progress, uncovered_gaps
 from latentedge.ingest.rpc_logs import describe_error, fetch_swaps
@@ -53,6 +54,8 @@ class IngestScreen(Screen[None]):
         max_retries: int,
         retry_backoff_seconds: float,
         train_assemble_fn: TrainAssembleFn,
+        concurrency_cooldown_seconds: float = DEFAULT_CONCURRENCY_COOLDOWN_SECONDS,
+        max_rate_limit_backoff_seconds: float = DEFAULT_MAX_RATE_LIMIT_BACKOFF_SECONDS,
         model_out_path: Path = DEFAULT_MODEL_OUT_PATH,
         train_epochs: int = 100,
         ingest_fn: Callable[..., int] = default_ingest_range,
@@ -64,6 +67,11 @@ class IngestScreen(Screen[None]):
         self.from_block = from_block
         self.to_block = to_block
         self.out_path = out_path
+        # Everything that scrolls off the top of the on-screen log panel
+        # is still available here afterward — the panel itself only ever
+        # keeps its last MAX_LOG_LINES, but a long run's retry/timing
+        # history is exactly what's needed to diagnose why it felt slow.
+        self.log_path = Path(str(out_path) + ".ingest.log")
         self.client_factory = client_factory
         self.rpc_url = rpc_url
         self.chunk_size = chunk_size
@@ -71,6 +79,8 @@ class IngestScreen(Screen[None]):
         self.flush_every_n_chunks = flush_every_n_chunks
         self.max_retries = max_retries
         self.retry_backoff_seconds = retry_backoff_seconds
+        self.concurrency_cooldown_seconds = concurrency_cooldown_seconds
+        self.max_rate_limit_backoff_seconds = max_rate_limit_backoff_seconds
         self.train_assemble_fn = train_assemble_fn
         self.model_out_path = model_out_path
         self.train_epochs = train_epochs
@@ -92,6 +102,16 @@ class IngestScreen(Screen[None]):
         self._buffered_count = 0
         self._blocking_chunk_start: int | None = None
         self._concurrency_limit = max_workers
+
+    def _log(self, message: str) -> None:
+        self.query_one("#ingest-log", LogPanel).log_line(message)
+        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+        # Opened, written, and closed per line rather than held open —
+        # a run killed mid-flight (the same event the concurrency
+        # limiter's own persistence is trying to survive) must never
+        # cost the retry/timing history that explains what happened.
+        with self.log_path.open("a") as f:
+            f.write(f"{timestamp} {message}\n")
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="ingest-top-row"):
@@ -121,6 +141,11 @@ class IngestScreen(Screen[None]):
             rate_per_sec=0.0, rate_unit="blocks/sec",
         )
         self.set_interval(STATS_REFRESH_INTERVAL_SECONDS, self._refresh_disk_stats)
+        self._log(
+            f"starting: blocks {self.from_block}-{self.to_block}, chunk_size={self.chunk_size}, "
+            f"max_workers={self.max_workers}, concurrency_cooldown_seconds={self.concurrency_cooldown_seconds} "
+            f"— full log at {self.log_path}"
+        )
         self.run_worker(self._run_ingest, thread=True, exclusive=True)
 
     def _run_ingest(self) -> None:
@@ -128,7 +153,7 @@ class IngestScreen(Screen[None]):
             self.app.call_from_thread(self._handle_progress, chunk_start, chunk_end, count)
 
         def on_retry(
-            chunk_start: int, chunk_end: int, attempt: int, max_retries: int,
+            chunk_start: int, chunk_end: int, attempt: int, max_retries: int | None,
             sleep_seconds: float, error_message: str,
         ) -> None:
             self.app.call_from_thread(
@@ -154,6 +179,8 @@ class IngestScreen(Screen[None]):
                     retry_backoff_seconds=self.retry_backoff_seconds,
                     max_workers=self.max_workers,
                     flush_every_n_chunks=self.flush_every_n_chunks,
+                    concurrency_cooldown_seconds=self.concurrency_cooldown_seconds,
+                    max_rate_limit_backoff_seconds=self.max_rate_limit_backoff_seconds,
                     on_progress=on_progress, on_retry=on_retry,
                     on_queue_status=on_queue_status, on_worker_status=on_worker_status,
                     on_concurrency_change=on_concurrency_change,
@@ -183,19 +210,15 @@ class IngestScreen(Screen[None]):
             completed=completed, total=total, unit_label=f"block {chunk_end}",
             rate_per_sec=rate, rate_unit="blocks/sec",
         )
-        self.query_one("#ingest-log", LogPanel).log_line(
-            f"blocks {chunk_start}-{chunk_end}: {count} swaps"
-        )
+        self._log(f"blocks {chunk_start}-{chunk_end}: {count} swaps")
 
     def _handle_retry(
-        self, chunk_start: int, chunk_end: int, attempt: int, max_retries: int,
+        self, chunk_start: int, chunk_end: int, attempt: int, max_retries: int | None,
         sleep_seconds: float, error_message: str,
     ) -> None:
         self.retry_count += 1
-        self.query_one("#ingest-log", LogPanel).log_line(
-            f"blocks {chunk_start}-{chunk_end}: retry {attempt}/{max_retries} "
-            f"({error_message}) — waiting {sleep_seconds:.1f}s"
-        )
+        label = f"retry {attempt}/{max_retries}" if max_retries is not None else f"rate limited, retry {attempt} (retrying until it clears)"
+        self._log(f"blocks {chunk_start}-{chunk_end}: {label} ({error_message}) — waiting {sleep_seconds:.1f}s")
         self._refresh_disk_stats()
 
     def _handle_queue_status(self, buffered_count: int, blocking_chunk_start: int | None) -> None:
@@ -204,7 +227,9 @@ class IngestScreen(Screen[None]):
         self._refresh_disk_stats()
 
     def _handle_concurrency_change(self, new_limit: int) -> None:
+        direction = "throttled down to" if new_limit < self._concurrency_limit else "raised to"
         self._concurrency_limit = new_limit
+        self._log(f"concurrency {direction} {new_limit}/{self.max_workers}")
         self._refresh_disk_stats()
 
     def _handle_worker_status(self, slot: int, chunk_start: int, chunk_end: int, status: str) -> None:
@@ -248,6 +273,7 @@ class IngestScreen(Screen[None]):
     def _handle_complete(self, total: int) -> None:
         self.is_complete = True
         self.total_written = total
+        self._log(f"complete: wrote {total} swaps, {self.retry_count} retries total")
         self._refresh_disk_stats()
         range_total = max(self.to_block - self.from_block + 1, 0)
         self.query_one("#ingest-progress", ProgressPanel).update_progress(
@@ -256,13 +282,13 @@ class IngestScreen(Screen[None]):
         )
         self.query_one("#ingest-action-bar", Static).update(
             f"Ingestion complete — wrote {total} swaps to {self.out_path}. "
-            "[T] Train now   [Q] Exit"
+            "Press [b]T[/b] to train now, or [b]Q[/b] to exit."
         )
 
     def _handle_error(self, message: str) -> None:
         self.error = message
-        self.query_one("#ingest-log", LogPanel).log_line(f"ERROR: {message}")
-        self.query_one("#ingest-action-bar", Static).update(f"Ingestion failed: {message}. [Q] Exit")
+        self._log(f"ERROR: {message}")
+        self.query_one("#ingest-action-bar", Static).update(f"Ingestion failed: {message}. Press [b]Q[/b] to exit.")
 
     def action_train_now(self) -> None:
         if not self.is_complete:

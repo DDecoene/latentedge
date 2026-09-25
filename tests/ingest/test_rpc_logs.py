@@ -86,6 +86,59 @@ def _mock_client(handler) -> httpx.Client:
     return httpx.Client(transport=httpx.MockTransport(handler))
 
 
+def test_fetch_swaps_sub_chunks_eth_getlogs_but_batches_blocks_in_one_call():
+    # from_block=0..29 with a cap of 10 must issue 3 eth_getLogs calls
+    # (one per 10-block sub-range) but only 1 eth_getBlockByNumber batch
+    # call for every unique block across the whole span, not 3 — this is
+    # the whole point of decoupling the getLogs cap from the block-batch
+    # granularity.
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        import json as _json
+
+        body = _json.loads(request.content)
+        if isinstance(body, list):
+            calls.append("eth_getBlockByNumber_batch")
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "jsonrpc": "2.0",
+                        "id": entry["id"],
+                        "result": {"timestamp": hex(entry["id"] * 12), "baseFeePerGas": "0x1"},
+                    }
+                    for entry in body
+                ],
+            )
+
+        calls.append(body["method"])
+        from_block = int(body["params"][0]["fromBlock"], 16)
+        return httpx.Response(
+            200,
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": [
+                    {
+                        "address": "0xpool",
+                        "blockNumber": hex(from_block),
+                        "transactionHash": "0x" + "1" * 64,
+                        "logIndex": "0x0",
+                        "data": "0x" + "0" * 64 * 5,
+                    }
+                ],
+            },
+        )
+
+    with _mock_client(handler) as client:
+        records = fetch_swaps("0xpool", from_block=0, to_block=29, client=client, rpc_url=RPC_URL)
+
+    assert calls.count("eth_getLogs") == 3
+    assert calls.count("eth_getBlockByNumber_batch") == 1
+    assert len(records) == 3
+
+
 def test_rpc_call_raises_rate_limit_error_on_http_429():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(429, text="rate limited")

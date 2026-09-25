@@ -4,8 +4,10 @@ from pathlib import Path
 from latentedge.ingest.progress import (
     add_interval,
     extend_window_for_new_blocks,
+    read_concurrency_limit,
     read_progress,
     uncovered_gaps,
+    write_concurrency_limit,
     write_progress,
 )
 from latentedge.schema import SwapRecord
@@ -41,6 +43,16 @@ def test_write_then_read_progress_round_trips(tmp_path: Path):
     out_path = tmp_path / "swaps.parquet"
     write_progress(out_path, [(0, 99), (200, 299)])
     assert read_progress(out_path) == [(0, 99), (200, 299)]
+
+
+def test_read_concurrency_limit_returns_none_when_no_file_exists(tmp_path: Path):
+    assert read_concurrency_limit(tmp_path / "swaps.parquet") is None
+
+
+def test_write_then_read_concurrency_limit_round_trips(tmp_path: Path):
+    out_path = tmp_path / "swaps.parquet"
+    write_concurrency_limit(out_path, 3)
+    assert read_concurrency_limit(out_path) == 3
 
 
 def test_add_interval_merges_overlapping_ranges():
