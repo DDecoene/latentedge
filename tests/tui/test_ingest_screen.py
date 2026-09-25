@@ -152,6 +152,43 @@ async def test_ingest_screen_progress_accounts_for_a_covered_gap_crossed_mid_run
 
 
 @pytest.mark.asyncio
+async def test_ingest_screen_all_panels_are_visible_within_the_viewport(tmp_path: Path):
+    # Regression test: panels with no explicit height default to filling
+    # the whole screen, so each one stacks at a *virtual* position that
+    # pushes everything before the last panel off-screen (negative y) and
+    # the action bar off the bottom — only one panel's content is ever
+    # actually visible even though compose() yields all of them.
+    out_path = tmp_path / "swaps.parquet"
+    screen = IngestScreen(
+        pool_address="0xpool", from_block=0, to_block=9, out_path=out_path,
+        client_factory=lambda: httpx.Client(), rpc_url="http://fake",
+        chunk_size=10, max_workers=1, flush_every_n_chunks=1,
+        max_retries=1, retry_backoff_seconds=0.001, fetch_fn=_fake_fetch,
+        train_assemble_fn=lambda p: (None, None, 0, {}),
+    )
+    app = LatentEdgeApp(start_screen=screen)
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause()
+        regions = {
+            widget_id: app.screen.query_one(f"#{widget_id}").region
+            for widget_id in (
+                "ingest-progress", "ingest-stats", "ingest-threads",
+                "ingest-log", "ingest-action-bar",
+            )
+        }
+
+    for widget_id, region in regions.items():
+        assert region.y >= 0, f"{widget_id} is pushed above the viewport (y={region.y})"
+        assert region.y + region.height <= 40, f"{widget_id} extends past the viewport"
+
+    # The summary panels are compact (a handful of lines), not full-screen.
+    assert regions["ingest-progress"].height <= 5
+    assert regions["ingest-stats"].height <= 8
+    assert regions["ingest-threads"].height <= 5
+
+
+@pytest.mark.asyncio
 async def test_ingest_screen_shows_retry_detail_in_log_and_stalled_stat(tmp_path: Path):
     attempts = {"count": 0}
 

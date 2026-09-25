@@ -23,6 +23,17 @@ def format_eta(seconds_remaining: float | None) -> str:
 class ProgressPanel(Widget):
     """A progress bar plus a detail line: percent, current unit, rate, ETA."""
 
+    # A plain Widget with no height rule defaults to filling whatever
+    # space is available rather than sizing to its content — stacked in
+    # a vertical screen, every such panel would independently claim the
+    # full screen height, pushing everything after it off-screen. These
+    # summary panels are a fixed handful of lines; only LogPanel (below)
+    # should actually expand to fill the remaining space.
+    DEFAULT_CSS = """
+    ProgressPanel { height: auto; }
+    ProgressPanel Vertical { height: auto; }
+    """
+
     def compose(self) -> ComposeResult:
         with Vertical():
             yield ProgressBar(total=100, show_eta=False, id=f"{self.id}-bar")
@@ -52,6 +63,8 @@ class ProgressPanel(Widget):
 class StatsPanel(Widget):
     """A small label/value table for point-in-time stats (file size, retries, ...)."""
 
+    DEFAULT_CSS = "StatsPanel { height: auto; }"
+
     def compose(self) -> ComposeResult:
         yield Static("", id=f"{self.id}-body")
 
@@ -62,6 +75,8 @@ class StatsPanel(Widget):
 
 class ThreadPanel(Widget):
     """One line per worker thread: its current block range and status."""
+
+    DEFAULT_CSS = "ThreadPanel { height: auto; }"
 
     def __init__(self, *args: object, **kwargs: object) -> None:
         super().__init__(*args, **kwargs)  # type: ignore[arg-type]
@@ -78,6 +93,10 @@ class ThreadPanel(Widget):
 
 class LogPanel(Widget):
     """A bounded scrolling feed of recent discrete events."""
+
+    # The one panel that should actually expand to fill whatever space
+    # the fixed-height summary panels above it leave behind.
+    DEFAULT_CSS = "LogPanel { height: 1fr; }"
 
     def compose(self) -> ComposeResult:
         yield RichLog(max_lines=MAX_LOG_LINES, id=f"{self.id}-body")
