@@ -6,7 +6,7 @@ import pytest
 
 from latentedge.ingest.chunked import ingest_range
 from latentedge.ingest.progress import read_progress, write_progress
-from latentedge.ingest.rpc_logs import RpcLogsError
+from latentedge.ingest.rpc_logs import RateLimitError, RpcLogsError
 from latentedge.schema import SwapRecord
 from latentedge.store import read_swaps
 from latentedge.tui.app import LatentEdgeApp
@@ -262,6 +262,38 @@ async def test_ingest_screen_shows_per_worker_status(tmp_path: Path):
     assert "Worker 1" in threads_text
     assert "fetching" in threads_text
     assert screen.is_complete
+
+
+@pytest.mark.asyncio
+async def test_ingest_screen_shows_concurrency_limit_after_a_throttle_down(tmp_path: Path):
+    attempts = {"count": 0}
+
+    def one_rate_limit_then_fine(pool_address, from_block, to_block, client, rpc_url):
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise RateLimitError("simulated rate limit")
+        return [_record(from_block)]
+
+    out_path = tmp_path / "swaps.parquet"
+    screen = IngestScreen(
+        pool_address="0xpool", from_block=0, to_block=39, out_path=out_path,
+        client_factory=lambda: httpx.Client(), rpc_url="http://fake",
+        chunk_size=10, max_workers=4, flush_every_n_chunks=1,
+        max_retries=3, retry_backoff_seconds=0.001, fetch_fn=one_rate_limit_then_fine,
+        train_assemble_fn=lambda p: (None, None, 0, {}),
+    )
+    app = LatentEdgeApp(start_screen=screen)
+
+    async with app.run_test() as pilot:
+        for _ in range(50):
+            await pilot.pause(0.01)
+            if screen.is_complete:
+                break
+        stats_text = str(app.screen.query_one("#ingest-stats-body").content)
+
+    assert screen.is_complete
+    assert "Concurrency" in stats_text
+    assert "2/4" in stats_text
 
 
 @pytest.mark.asyncio

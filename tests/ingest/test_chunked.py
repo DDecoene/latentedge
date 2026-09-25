@@ -545,6 +545,38 @@ def test_ingest_range_reports_worker_status_during_retries(tmp_path: Path):
     assert statuses[-1] == (0, 0, 99, "idle")
 
 
+def test_ingest_range_throttles_down_worker_concurrency_after_a_rate_limit(tmp_path: Path):
+    attempts = {"count": 0}
+    lock = threading.Lock()
+
+    def one_rate_limit_then_fine(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str) -> list[SwapRecord]:
+        with lock:
+            attempts["count"] += 1
+            first = attempts["count"] == 1
+        if first:
+            raise RateLimitError("simulated rate limit")
+        return [_record(from_block, 0)]
+
+    concurrency_changes: list[int] = []
+    changes_lock = threading.Lock()
+
+    def on_concurrency_change(new_limit: int) -> None:
+        with changes_lock:
+            concurrency_changes.append(new_limit)
+
+    out_path = tmp_path / "swaps.parquet"
+    with httpx.Client() as client:
+        total = ingest_range(
+            pool_address="0xpool", from_block=0, to_block=99, out_path=out_path,
+            client=client, rpc_url="http://fake", chunk_size=10, max_workers=4,
+            fetch_fn=one_rate_limit_then_fine, max_retries=3, retry_backoff_seconds=0.001,
+            on_concurrency_change=on_concurrency_change,
+        )
+
+    assert total == 10
+    assert 2 in concurrency_changes  # halved from the ceiling of 4 after the one rate limit
+
+
 def test_ingest_range_flushes_completed_chunks_before_raising_on_a_later_failure(tmp_path: Path):
     # Regression test: a single chunk exhausting its retries must not
     # discard every chunk that already succeeded since the last flush —

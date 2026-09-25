@@ -91,6 +91,7 @@ class IngestScreen(Screen[None]):
         self._last_progress_time = self.time_fn()
         self._buffered_count = 0
         self._blocking_chunk_start: int | None = None
+        self._concurrency_limit = max_workers
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="ingest-top-row"):
@@ -141,6 +142,9 @@ class IngestScreen(Screen[None]):
         def on_worker_status(slot: int, chunk_start: int, chunk_end: int, status: str) -> None:
             self.app.call_from_thread(self._handle_worker_status, slot, chunk_start, chunk_end, status)
 
+        def on_concurrency_change(new_limit: int) -> None:
+            self.app.call_from_thread(self._handle_concurrency_change, new_limit)
+
         try:
             with self.client_factory() as client:
                 total = self.ingest_fn(
@@ -152,6 +156,7 @@ class IngestScreen(Screen[None]):
                     flush_every_n_chunks=self.flush_every_n_chunks,
                     on_progress=on_progress, on_retry=on_retry,
                     on_queue_status=on_queue_status, on_worker_status=on_worker_status,
+                    on_concurrency_change=on_concurrency_change,
                     fetch_fn=self.fetch_fn,
                 )
         except Exception as exc:
@@ -198,6 +203,10 @@ class IngestScreen(Screen[None]):
         self._blocking_chunk_start = blocking_chunk_start
         self._refresh_disk_stats()
 
+    def _handle_concurrency_change(self, new_limit: int) -> None:
+        self._concurrency_limit = new_limit
+        self._refresh_disk_stats()
+
     def _handle_worker_status(self, slot: int, chunk_start: int, chunk_end: int, status: str) -> None:
         if status == "idle":
             detail = "[dim]○ idle[/dim]"
@@ -218,12 +227,18 @@ class IngestScreen(Screen[None]):
             else "0"
         )
         retries = f"[yellow]{self.retry_count}[/yellow]" if self.retry_count > 0 else "0"
+        concurrency = (
+            f"[yellow]{self._concurrency_limit}/{self.max_workers}[/yellow]"
+            if self._concurrency_limit < self.max_workers
+            else f"{self._concurrency_limit}/{self.max_workers}"
+        )
         self.query_one("#ingest-stats", StatsPanel).update_stats([
             ("File size", f"{file_size / 1_048_576:.1f} MB"),
             ("Free disk", f"{free_bytes / 1_073_741_824:.1f} GB"),
             ("Retries", retries),
             ("Stalled", stalled),
             ("Buffered", buffered),
+            ("Concurrency", concurrency),
         ])
 
     def _handle_complete(self, total: int) -> None:

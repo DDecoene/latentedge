@@ -24,6 +24,7 @@ from pathlib import Path
 
 import httpx
 
+from latentedge.ingest.concurrency import AdaptiveConcurrencyLimiter, ReleaseOutcome
 from latentedge.ingest.progress import Interval, add_interval, read_progress, uncovered_gaps, write_progress
 from latentedge.ingest.rpc_logs import RateLimitError, fetch_swaps
 from latentedge.schema import SwapRecord
@@ -61,13 +62,21 @@ def _fetch_chunk_with_retries(
     rpc_url: str,
     max_retries: int,
     backoff_seconds: float,
+    limiter: AdaptiveConcurrencyLimiter,
     on_retry: OnRetryFn | None = None,
+    on_concurrency_change: Callable[[int], None] | None = None,
 ) -> list[SwapRecord]:
     last_error: Exception | None = None
     for attempt in range(max_retries):
+        limiter.acquire()
         try:
-            return fetch_fn(pool_address, from_block, to_block, client, rpc_url)
+            result = fetch_fn(pool_address, from_block, to_block, client, rpc_url)
         except Exception as exc:  # RpcLogsError et al — real transient failures
+            outcome: ReleaseOutcome = "rate_limited" if isinstance(exc, RateLimitError) else "failed"
+            new_limit, changed = limiter.release(outcome)
+            if changed and on_concurrency_change is not None:
+                on_concurrency_change(new_limit)
+
             last_error = exc
             if attempt < max_retries - 1:
                 sleep_seconds = backoff_seconds * (2**attempt)
@@ -76,6 +85,11 @@ def _fetch_chunk_with_retries(
                 if on_retry is not None:
                     on_retry(from_block, to_block, attempt + 1, max_retries, sleep_seconds, str(exc))
                 time.sleep(sleep_seconds)
+        else:
+            new_limit, changed = limiter.release("success")
+            if changed and on_concurrency_change is not None:
+                on_concurrency_change(new_limit)
+            return result
     assert last_error is not None
     raise last_error
 
@@ -96,6 +110,7 @@ def ingest_range(
     on_retry: OnRetryFn | None = None,
     on_queue_status: Callable[[int, int | None], None] | None = None,
     on_worker_status: Callable[[int, int, int, str], None] | None = None,
+    on_concurrency_change: Callable[[int], None] | None = None,
     fetch_fn: FetchFn = fetch_swaps,
 ) -> int:
     """Ingest [from_block, to_block] concurrently, in chunks, flushing to
@@ -148,6 +163,8 @@ def ingest_range(
         pending_intervals = []
         chunks_since_flush = 0
 
+    limiter = AdaptiveConcurrencyLimiter(ceiling=max_workers)
+
     worker_slots: dict[int, int] = {}
     slots_lock = threading.Lock()
 
@@ -174,7 +191,7 @@ def ingest_range(
         retry_hook = report_retry if (on_retry is not None or on_worker_status is not None) else None
         records = _fetch_chunk_with_retries(
             fetch_fn, pool_address, chunk_start, chunk_end, client, rpc_url,
-            max_retries, retry_backoff_seconds, retry_hook,
+            max_retries, retry_backoff_seconds, limiter, retry_hook, on_concurrency_change,
         )
 
         if on_worker_status is not None:
