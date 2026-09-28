@@ -1,3 +1,5 @@
+import threading
+
 import httpx
 import pytest
 
@@ -204,3 +206,111 @@ def test_describe_error_passes_through_other_rpc_errors_as_is():
     message = describe_error(RPC_URL, exc)
 
     assert "block range extends beyond current head block" in message
+
+
+class _RecordingRateLimiter:
+    def __init__(self) -> None:
+        self.acquired = 0
+        self.released: list[str] = []
+
+    def acquire(self, cancel_event=None) -> None:
+        self.acquired += 1
+
+    def release(self, outcome: str) -> None:
+        self.released.append(outcome)
+
+
+def test_rpc_call_acquires_and_releases_success_through_the_rate_limiter():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": "0x1"})
+
+    rate_limiter = _RecordingRateLimiter()
+    with _mock_client(handler) as client:
+        _rpc_call(client, RPC_URL, "eth_blockNumber", [], rate_limiter=rate_limiter)
+
+    assert rate_limiter.acquired == 1
+    assert rate_limiter.released == ["success"]
+
+
+def test_rpc_call_releases_rate_limited_on_http_429():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, text="rate limited")
+
+    rate_limiter = _RecordingRateLimiter()
+    with _mock_client(handler) as client:
+        with pytest.raises(RateLimitError):
+            _rpc_call(client, RPC_URL, "eth_blockNumber", [], rate_limiter=rate_limiter)
+
+    assert rate_limiter.released == ["rate_limited"]
+
+
+def test_rpc_call_propagates_cancelled_from_the_rate_limiter():
+    from latentedge.ingest.rate_limiter import Cancelled, RateLimiter
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("must not fire an HTTP request once cancelled")
+
+    rate_limiter = RateLimiter(ceiling=1.0)
+    cancel_event = threading.Event()
+    cancel_event.set()
+
+    with _mock_client(handler) as client:
+        with pytest.raises(Cancelled):
+            _rpc_call(client, RPC_URL, "eth_blockNumber", [], rate_limiter=rate_limiter, cancel_event=cancel_event)
+
+
+def test_batch_fetch_blocks_reports_exactly_one_rate_limited_outcome_for_an_embedded_429():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=[{"jsonrpc": "2.0", "id": 1, "error": {"code": 429, "message": "compute units exceeded"}}],
+        )
+
+    rate_limiter = _RecordingRateLimiter()
+    with _mock_client(handler) as client:
+        with pytest.raises(RateLimitError):
+            _batch_fetch_blocks([1], client, RPC_URL, rate_limiter=rate_limiter)
+
+    assert rate_limiter.released == ["rate_limited"]
+
+
+def test_fetch_swaps_gates_every_sub_call_through_the_rate_limiter():
+    # Reuses the 3-getLogs-calls + 1-batched-block-call shape proven by
+    # test_fetch_swaps_sub_chunks_eth_getlogs_but_batches_blocks_in_one_call.
+    def handler(request: httpx.Request) -> httpx.Response:
+        import json as _json
+
+        body = _json.loads(request.content)
+        if isinstance(body, list):
+            return httpx.Response(
+                200,
+                json=[
+                    {"jsonrpc": "2.0", "id": entry["id"], "result": {"timestamp": hex(entry["id"] * 12), "baseFeePerGas": "0x1"}}
+                    for entry in body
+                ],
+            )
+        from_block = int(body["params"][0]["fromBlock"], 16)
+        return httpx.Response(
+            200,
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": [
+                    {
+                        "address": "0xpool",
+                        "blockNumber": hex(from_block),
+                        "transactionHash": "0x" + "1" * 64,
+                        "logIndex": "0x0",
+                        "data": "0x" + "0" * 64 * 5,
+                    }
+                ],
+            },
+        )
+
+    rate_limiter = _RecordingRateLimiter()
+    with _mock_client(handler) as client:
+        fetch_swaps("0xpool", from_block=0, to_block=29, client=client, rpc_url=RPC_URL, rate_limiter=rate_limiter)
+
+    # 3 eth_getLogs sub-range calls + 1 batched eth_getBlockByNumber call.
+    assert rate_limiter.acquired == 4
+    assert rate_limiter.released == ["success", "success", "success", "success"]

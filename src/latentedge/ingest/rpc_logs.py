@@ -4,11 +4,15 @@ Swap(address indexed sender, address indexed recipient, int256 amount0,
      int256 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick)
 """
 
-from typing import Any
+import threading
+from typing import TYPE_CHECKING, Any
 
 import httpx
 
 from latentedge.schema import SwapRecord
+
+if TYPE_CHECKING:
+    from latentedge.ingest.rate_limiter import RateLimiter
 
 # keccak256("Swap(address,address,int256,int256,uint160,uint128,int24)")
 SWAP_TOPIC = "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67"
@@ -34,20 +38,42 @@ class RateLimitError(RpcLogsError):
     """
 
 
-def _rpc_call(client: httpx.Client, rpc_url: str, method: str, params: list[Any]) -> Any:
+def _rpc_call(
+    client: httpx.Client,
+    rpc_url: str,
+    method: str,
+    params: list[Any],
+    rate_limiter: "RateLimiter | None" = None,
+    cancel_event: threading.Event | None = None,
+) -> Any:
+    if rate_limiter is not None:
+        rate_limiter.acquire(cancel_event)
     response = client.post(rpc_url, json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
     if response.status_code == 429:
+        if rate_limiter is not None:
+            rate_limiter.release("rate_limited")
         raise RateLimitError(f"RPC rate limited (HTTP 429): {response.text}")
     if response.status_code != 200:
+        if rate_limiter is not None:
+            rate_limiter.release("failed")
         raise RpcLogsError(f"RPC returned HTTP {response.status_code}: {response.text}")
     payload = response.json()
     if "error" in payload:
+        if rate_limiter is not None:
+            rate_limiter.release("failed")
         raise RpcLogsError(f"RPC error: {payload['error']}")
+    if rate_limiter is not None:
+        rate_limiter.release("success")
     return payload["result"]
 
 
-def get_latest_block(client: httpx.Client, rpc_url: str) -> int:
-    result: str = _rpc_call(client, rpc_url, "eth_blockNumber", [])
+def get_latest_block(
+    client: httpx.Client,
+    rpc_url: str,
+    rate_limiter: "RateLimiter | None" = None,
+    cancel_event: threading.Event | None = None,
+) -> int:
+    result: str = _rpc_call(client, rpc_url, "eth_blockNumber", [], rate_limiter=rate_limiter, cancel_event=cancel_event)
     return int(result, 16)
 
 
@@ -71,7 +97,13 @@ def describe_error(rpc_url: str, exc: Exception) -> str:
 BLOCK_BATCH_SIZE = 100
 
 
-def _batch_fetch_blocks(block_numbers: list[int], client: httpx.Client, rpc_url: str) -> dict[int, tuple[int, int]]:
+def _batch_fetch_blocks(
+    block_numbers: list[int],
+    client: httpx.Client,
+    rpc_url: str,
+    rate_limiter: "RateLimiter | None" = None,
+    cancel_event: threading.Event | None = None,
+) -> dict[int, tuple[int, int]]:
     """Fetch (timestamp, base_fee_wei) for each block number in as few
     HTTP round-trips as possible — a JSON-RPC batch request per
     BLOCK_BATCH_SIZE blocks, rather than one call per block. A year of
@@ -87,10 +119,16 @@ def _batch_fetch_blocks(block_numbers: list[int], client: httpx.Client, rpc_url:
             {"jsonrpc": "2.0", "id": block_number, "method": "eth_getBlockByNumber", "params": [hex(block_number), False]}
             for block_number in batch
         ]
+        if rate_limiter is not None:
+            rate_limiter.acquire(cancel_event)
         response = client.post(rpc_url, json=payload)
         if response.status_code == 429:
+            if rate_limiter is not None:
+                rate_limiter.release("rate_limited")
             raise RateLimitError(f"RPC rate limited (HTTP 429): {response.text}")
         if response.status_code != 200:
+            if rate_limiter is not None:
+                rate_limiter.release("failed")
             raise RpcLogsError(f"RPC returned HTTP {response.status_code}: {response.text}")
 
         responses = response.json()
@@ -99,16 +137,25 @@ def _batch_fetch_blocks(block_numbers: list[int], client: httpx.Client, rpc_url:
         for block_number in batch:
             entry = by_id.get(block_number)
             if entry is None:
+                if rate_limiter is not None:
+                    rate_limiter.release("failed")
                 raise RpcLogsError(f"batch response missing block {block_number}")
             if "error" in entry:
                 if entry["error"].get("code") == 429:
+                    if rate_limiter is not None:
+                        rate_limiter.release("rate_limited")
                     raise RateLimitError(f"RPC rate limited for block {block_number}: {entry['error']}")
+                if rate_limiter is not None:
+                    rate_limiter.release("failed")
                 raise RpcLogsError(f"RPC error for block {block_number}: {entry['error']}")
 
             block = entry["result"]
             timestamp = int(block["timestamp"], 16)
             base_fee_wei = int(block["baseFeePerGas"], 16) if "baseFeePerGas" in block else 0
             result[block_number] = (timestamp, base_fee_wei)
+
+        if rate_limiter is not None:
+            rate_limiter.release("success")
 
     return result
 
@@ -138,6 +185,8 @@ def fetch_swaps(
     client: httpx.Client,
     rpc_url: str,
     eth_getlogs_range_cap: int = ETH_GETLOGS_RANGE_CAP,
+    rate_limiter: "RateLimiter | None" = None,
+    cancel_event: threading.Event | None = None,
 ) -> list[SwapRecord]:
     # eth_getLogs itself must stay within the provider's tiny per-call
     # range cap, but that cap has nothing to do with how many blocks'
@@ -162,6 +211,8 @@ def fetch_swaps(
                         "toBlock": hex(sub_to),
                     }
                 ],
+                rate_limiter=rate_limiter,
+                cancel_event=cancel_event,
             )
         )
 
@@ -173,7 +224,7 @@ def fetch_swaps(
     # Batched rather than one call per block: a year of history for an
     # actively-traded pool can touch close to a million unique blocks.
     unique_block_numbers = [int(log["blockNumber"], 16) for log in logs]
-    block_cache = _batch_fetch_blocks(unique_block_numbers, client, rpc_url)
+    block_cache = _batch_fetch_blocks(unique_block_numbers, client, rpc_url, rate_limiter=rate_limiter, cancel_event=cancel_event)
 
     records: list[SwapRecord] = []
     for log in logs:
