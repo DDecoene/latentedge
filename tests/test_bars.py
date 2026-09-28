@@ -8,7 +8,7 @@ USDC_DECIMALS = 6
 USDC_SCALE = 10**USDC_DECIMALS
 
 
-def _swap(timestamp: int, human_price: float, human_amount0_usdc: float) -> dict:
+def _swap(timestamp: int, human_price: float, human_amount0_usdc: float, base_fee_gwei: float = 20.0) -> dict:
     # price_to_sqrt_price_x96 already decimal-adjusts internally, so the
     # human-terms WETH-per-USDC price (inverse of USDC-per-WETH) is
     # passed directly, with no additional scaling (see Task 2's ruling on
@@ -27,6 +27,7 @@ def _swap(timestamp: int, human_price: float, human_amount0_usdc: float) -> dict
         "sqrt_price_x96": price_to_sqrt_price_x96(raw_price, decimals0=6, decimals1=18),
         "amount0": raw_amount0,
         "amount1": -raw_amount0 / human_price,
+        "base_fee_wei": int(base_fee_gwei * 1_000_000_000),
     }
 
 
@@ -50,6 +51,15 @@ def test_bar_with_many_swaps_aggregates_volume():
     assert len(bars) == 1
     assert bars.iloc[0]["swap_count"] == 3
     assert bars.iloc[0]["volume_usdc"] == pytest.approx(350.0)
+
+
+def test_base_fee_gwei_carries_forward_through_gap_bars():
+    swaps = pd.DataFrame([_swap(0, 3000.0, 1000.0, base_fee_gwei=15.0), _swap(150, 3010.0, 500.0, base_fee_gwei=25.0)])
+    bars = build_bars(swaps, interval_seconds=60)
+
+    assert bars.iloc[0]["base_fee_gwei"] == pytest.approx(15.0)
+    assert bars.iloc[1]["base_fee_gwei"] == pytest.approx(15.0)  # gap bar carries the last known fee forward
+    assert bars.iloc[2]["base_fee_gwei"] == pytest.approx(25.0)
 
 
 def test_volume_usdc_is_decimal_adjusted_from_raw_amount0():

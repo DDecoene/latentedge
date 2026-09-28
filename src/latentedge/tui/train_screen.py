@@ -10,7 +10,7 @@ from textual.screen import Screen
 from textual.widgets import Static
 from textual_plotext import PlotextPlot
 
-from latentedge.features import save_feature_stats
+from latentedge.features import save_feature_stats, standardize_value
 from latentedge.metrics import build_training_metrics, save_training_metrics
 from latentedge.model import NetReturnRegressor, save
 from latentedge.model import train as default_train
@@ -73,8 +73,13 @@ class TrainScreen(Screen[None]):
         try:
             assembled = self.assemble_fn(self.swaps_path)
             model = NetReturnRegressor(input_dim=assembled.input_dim)
+            # net_return's raw scale is too flat a loss surface for Adam
+            # to make real progress in a practical epoch count — train on
+            # the standardized target, unstandardized back for reporting
+            # in build_training_metrics below.
+            y_train = standardize_value(assembled.train.y, assembled.stats["net_return"])
             losses = self.train_fn(
-                model, assembled.train.x, assembled.train.y, epochs=self.epochs,
+                model, assembled.train.x, y_train, epochs=self.epochs,
                 learning_rate=self.learning_rate, on_epoch=on_epoch,
             )
             self.out_path.parent.mkdir(parents=True, exist_ok=True)

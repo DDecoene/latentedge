@@ -99,7 +99,9 @@ def test_train_options_fall_back_to_env_vars(monkeypatch: pytest.MonkeyPatch, tm
     def fake_assemble(swaps_path):
         captured["swaps_path"] = swaps_path
         empty = SplitArrays(x=np.zeros((1, 1), dtype="float32"), y=np.zeros(1, dtype="float32"))
-        return AssembledTrainingData(train=empty, validate=empty, test=empty, input_dim=1, stats={})
+        return AssembledTrainingData(
+            train=empty, validate=empty, test=empty, input_dim=1, stats={"net_return": (0.0, 1.0)}
+        )
 
     def fake_train(model, x, y, epochs, learning_rate):
         captured["epochs"] = epochs
@@ -125,6 +127,65 @@ def test_train_options_fall_back_to_env_vars(monkeypatch: pytest.MonkeyPatch, tm
     assert result.exit_code == 0, result.output
     assert captured["swaps_path"] == swaps_path
     assert captured["epochs"] == 3
+
+
+def test_ingest_train_after_ingest_chains_training_in_non_tty_mode(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    # Lets an unattended, non-interactive ingest (e.g. a long overnight
+    # run) go straight into training without a human pressing [T].
+    captured: dict[str, object] = {}
+
+    def fake_ingest_range(pool_address, from_block, to_block, out, client, rpc_url, **kwargs):
+        return 3
+
+    def fake_assemble(swaps_path):
+        captured["swaps_path"] = swaps_path
+        empty = SplitArrays(x=np.zeros((1, 1), dtype="float32"), y=np.zeros(1, dtype="float32"))
+        return AssembledTrainingData(train=empty, validate=empty, test=empty, input_dim=1, stats={"net_return": (0.0, 1.0)})
+
+    def fake_train(model, x, y, epochs, learning_rate):
+        captured["epochs"] = epochs
+        return [0.0]
+
+    monkeypatch.setattr("latentedge.cli.ingest_range", fake_ingest_range)
+    monkeypatch.setattr("latentedge.cli._assemble_train_data", fake_assemble)
+    monkeypatch.setattr("latentedge.cli.train_model", fake_train)
+
+    out_path = tmp_path / "swaps.parquet"
+    train_out_path = tmp_path / "model.safetensors"
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["ingest", "--from-block", "1", "--to-block", "2", "--out", str(out_path)],
+        env={
+            "LATENTEDGE_TRAIN_AFTER_INGEST": "true",
+            "LATENTEDGE_TRAIN_OUT": str(train_out_path),
+            "LATENTEDGE_TRAIN_EPOCHS": "3",
+        },
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["swaps_path"] == out_path
+    assert captured["epochs"] == 3
+    assert "trained 3 epochs" in result.output
+
+
+def test_ingest_train_after_ingest_off_by_default_does_not_train(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    def fake_ingest_range(pool_address, from_block, to_block, out, client, rpc_url, **kwargs):
+        return 0
+
+    def fake_assemble(swaps_path):
+        raise AssertionError("training must not run when --train-after-ingest is off")
+
+    monkeypatch.setattr("latentedge.cli.ingest_range", fake_ingest_range)
+    monkeypatch.setattr("latentedge.cli._assemble_train_data", fake_assemble)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli, ["ingest", "--from-block", "1", "--to-block", "2", "--out", str(tmp_path / "swaps.parquet")]
+    )
+
+    assert result.exit_code == 0, result.output
 
 
 def test_cli_loads_dotenv_file_from_current_directory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

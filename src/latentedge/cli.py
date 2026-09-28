@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 
 from latentedge import config
 from latentedge.bars import build_bars
-from latentedge.features import compute_feature_stats, save_feature_stats, standardize_features
+from latentedge.features import compute_feature_stats, save_feature_stats, standardize_features, standardize_value
 from latentedge.metrics import build_training_metrics, save_training_metrics
 from latentedge.ingest.chunked import (
     DEFAULT_CHUNK_SIZE,
@@ -134,6 +134,18 @@ def _get_latest_block_with_retries(
     envvar="LATENTEDGE_MAX_RATE_LIMIT_BACKOFF_SECONDS",
     help="A rate-limited chunk retries forever (it's expected, temporary provider behavior, not a bug) rather than giving up after --max-retries — this caps how long each wait between retries can grow to. Falls back to the LATENTEDGE_MAX_RATE_LIMIT_BACKOFF_SECONDS env var (or a .env file).",
 )
+@click.option(
+    "--train-after-ingest/--no-train-after-ingest", default=False, envvar="LATENTEDGE_TRAIN_AFTER_INGEST",
+    help="Start training immediately once ingestion finishes, instead of pausing for a [T]/[Q] prompt (TTY) or just exiting (non-TTY). Off by default so ingestion still pauses for review first. Falls back to the LATENTEDGE_TRAIN_AFTER_INGEST env var (or a .env file).",
+)
+@click.option(
+    "--train-out", type=click.Path(path_type=Path), default=Path("data/model.safetensors"), envvar="LATENTEDGE_TRAIN_OUT",
+    help="Where a chained (--train-after-ingest, or the TTY dashboard's [T]) training run saves its model. Falls back to the LATENTEDGE_TRAIN_OUT env var (or a .env file).",
+)
+@click.option(
+    "--train-epochs", type=int, default=100, envvar="LATENTEDGE_TRAIN_EPOCHS",
+    help="Epoch count for a chained (--train-after-ingest, or the TTY dashboard's [T]) training run. Falls back to the LATENTEDGE_TRAIN_EPOCHS env var (or a .env file).",
+)
 def ingest(
     from_block: int | None,
     to_block: int | None,
@@ -147,6 +159,9 @@ def ingest(
     retry_backoff_seconds: float,
     concurrency_cooldown_seconds: float,
     max_rate_limit_backoff_seconds: float,
+    train_after_ingest: bool,
+    train_out: Path,
+    train_epochs: int,
 ) -> None:
     # A large range (e.g. a year of history) needs chunking to respect
     # provider limits, concurrency to finish in a reasonable time, and
@@ -188,6 +203,7 @@ def ingest(
             concurrency_cooldown_seconds=concurrency_cooldown_seconds,
             max_rate_limit_backoff_seconds=max_rate_limit_backoff_seconds, ingest_fn=ingest_range,
             train_assemble_fn=_assemble_train_data,
+            model_out_path=train_out, train_epochs=train_epochs, train_after_ingest=train_after_ingest,
         )
         LatentEdgeApp(start_screen=screen).run()
         if screen.error is not None:
@@ -212,6 +228,9 @@ def ingest(
             raise click.ClickException(describe_error(rpc_url, exc)) from None
     click.echo(f"wrote {total} new swap records to {out}")
 
+    if train_after_ingest:
+        _run_train_direct(out, train_out, train_epochs)
+
 
 def _assemble_train_data(swaps_path: Path) -> AssembledTrainingData:
     swap_df = read_swaps(swaps_path)
@@ -233,7 +252,13 @@ def _assemble_train_data(swaps_path: Path) -> AssembledTrainingData:
     # into training. The caller saves these stats alongside the model,
     # after the model itself is safely on disk, so SignalClient never
     # sees a stats file that doesn't match the model next to it.
-    stats = compute_feature_stats(train_split, FEATURE_COLUMNS)
+    #
+    # net_return's own (mean, std) rides along in the same stats dict —
+    # SplitArrays.y below stays on the raw net_return scale (only
+    # FEATURE_COLUMNS get standardized into x), so callers that want a
+    # standardized training target must apply these net_return stats
+    # themselves via features.standardize_value/unstandardize_value.
+    stats = compute_feature_stats(train_split, [*FEATURE_COLUMNS, "net_return"])
 
     def to_arrays(split: pd.DataFrame) -> SplitArrays:
         standardized = standardize_features(split, FEATURE_COLUMNS, stats)
@@ -247,6 +272,30 @@ def _assemble_train_data(swaps_path: Path) -> AssembledTrainingData:
         test=to_arrays(test_split),
         input_dim=len(FEATURE_COLUMNS),
         stats=stats,
+    )
+
+
+def _run_train_direct(swaps: Path, out: Path, epochs: int) -> None:
+    """Trains without the TUI — used both by `train` when stdout isn't a
+    tty and by `ingest --train-after-ingest` in that same non-tty case,
+    where there's no ingest TUI screen around to chain into TrainScreen.
+    """
+    out.parent.mkdir(parents=True, exist_ok=True)
+    assembled = _assemble_train_data(swaps)
+    regressor = NetReturnRegressor(input_dim=assembled.input_dim)
+    # net_return's raw scale (~1e-3) makes the MSE loss surface too flat
+    # for Adam to make real progress in a practical number of epochs —
+    # train on the standardized target and let build_training_metrics
+    # unstandardize predictions back for reporting.
+    y_train = standardize_value(assembled.train.y, assembled.stats["net_return"])
+    losses = train_model(regressor, assembled.train.x, y_train, epochs=epochs, learning_rate=0.001)
+    save(regressor, out)
+    save_feature_stats(assembled.stats, Path(str(out) + ".stats.json"))
+    metrics = build_training_metrics(regressor, assembled, losses)
+    save_training_metrics(metrics, Path(str(out) + ".metrics.json"))
+    val_corr = metrics["splits"]["validate"]["correlation"]
+    click.echo(
+        f"trained {epochs} epochs, final loss {losses[-1]:.6f}, val corr {val_corr:.4f}, saved to {out}"
     )
 
 
@@ -264,9 +313,8 @@ def _assemble_train_data(swaps_path: Path) -> AssembledTrainingData:
     help="Falls back to the LATENTEDGE_TRAIN_EPOCHS env var (or a .env file).",
 )
 def train(swaps: Path, out: Path, epochs: int) -> None:
-    out.parent.mkdir(parents=True, exist_ok=True)
-
     if sys.stdout.isatty():
+        out.parent.mkdir(parents=True, exist_ok=True)
         screen = TrainScreen(
             swaps_path=swaps, out_path=out, epochs=epochs,
             assemble_fn=_assemble_train_data,
@@ -277,17 +325,7 @@ def train(swaps: Path, out: Path, epochs: int) -> None:
             raise SystemExit(1)
         return
 
-    assembled = _assemble_train_data(swaps)
-    regressor = NetReturnRegressor(input_dim=assembled.input_dim)
-    losses = train_model(regressor, assembled.train.x, assembled.train.y, epochs=epochs, learning_rate=0.001)
-    save(regressor, out)
-    save_feature_stats(assembled.stats, Path(str(out) + ".stats.json"))
-    metrics = build_training_metrics(regressor, assembled, losses)
-    save_training_metrics(metrics, Path(str(out) + ".metrics.json"))
-    val_corr = metrics["splits"]["validate"]["correlation"]
-    click.echo(
-        f"trained {epochs} epochs, final loss {losses[-1]:.6f}, val corr {val_corr:.4f}, saved to {out}"
-    )
+    _run_train_direct(swaps, out, epochs)
 
 
 @cli.command()

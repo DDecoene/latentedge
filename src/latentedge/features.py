@@ -70,6 +70,21 @@ def standardize_features(df: pd.DataFrame, feature_columns: list[str], stats: di
     return result
 
 
+def standardize_value(values: np.ndarray, stats: tuple[float, float]) -> np.ndarray:
+    """Z-score a single array (e.g. a regression target) using a
+    precomputed (mean, std) pair — the array counterpart to
+    standardize_features for a column that isn't part of a DataFrame."""
+    mean, std = stats
+    return (values - mean) / std
+
+
+def unstandardize_value(values: np.ndarray, stats: tuple[float, float]) -> np.ndarray:
+    """Inverse of standardize_value — maps a model's standardized-scale
+    output back to the original units for reporting/consumption."""
+    mean, std = stats
+    return values * std + mean
+
+
 def save_feature_stats(stats: dict[str, tuple[float, float]], path: Path) -> None:
     path.write_text(json.dumps(stats))
 

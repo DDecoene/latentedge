@@ -15,7 +15,7 @@ def _fake_assemble(swaps_path: Path) -> AssembledTrainingData:
         rng = np.random.RandomState(seed)
         return SplitArrays(x=rng.randn(n, 3).astype("float32"), y=rng.randn(n).astype("float32"))
 
-    stats = {"f0": (0.0, 1.0), "f1": (0.0, 1.0), "f2": (0.0, 1.0)}
+    stats = {"f0": (0.0, 1.0), "f1": (0.0, 1.0), "f2": (0.0, 1.0), "net_return": (0.0, 1.0)}
     return AssembledTrainingData(
         train=split(0, 10), validate=split(2, 4), test=split(3, 4), input_dim=3, stats=stats,
     )

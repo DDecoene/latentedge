@@ -39,7 +39,8 @@ def test_build_training_metrics_reports_all_three_splits():
         return SplitArrays(x=rng.normal(size=(n, 3)).astype("float32"), y=rng.normal(size=(n,)).astype("float32"))
 
     assembled = AssembledTrainingData(
-        train=make_split(20), validate=make_split(8), test=make_split(8), input_dim=3, stats={},
+        train=make_split(20), validate=make_split(8), test=make_split(8), input_dim=3,
+        stats={"net_return": (0.0, 1.0)},
     )
     model = NetReturnRegressor(input_dim=3)
     losses = train(model, assembled.train.x, assembled.train.y, epochs=3, learning_rate=0.01)

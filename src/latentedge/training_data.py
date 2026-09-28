@@ -16,7 +16,7 @@ import pandas as pd
 from latentedge.features import compute_features, shift_features_for_labeling
 from latentedge.labeling import label_bars
 
-FEATURE_COLUMNS = ["return_5", "return_15", "return_30", "volatility", "volume_usdc", "bars_since_swap"]
+FEATURE_COLUMNS = ["return_5", "return_15", "return_30", "volatility", "volume_usdc", "bars_since_swap", "base_fee_gwei"]
 
 
 class SplitArrays(NamedTuple):
@@ -39,7 +39,9 @@ def assemble_training_data(
     volatility_window: int,
     tp_sl_fraction: float,
 ) -> pd.DataFrame:
-    feature_columns = [f"return_{n}" for n in return_windows] + ["volatility", "volume_usdc", "bars_since_swap"]
+    feature_columns = [f"return_{n}" for n in return_windows] + [
+        "volatility", "volume_usdc", "bars_since_swap", "base_fee_gwei",
+    ]
 
     # Compute features and labels on the same full, contiguous bar
     # series (not a post-exclusion-filtered one) so rolling windows never

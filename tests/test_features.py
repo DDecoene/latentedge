@@ -10,8 +10,10 @@ from latentedge.features import (
     load_feature_stats,
     save_feature_stats,
     shift_features_for_labeling,
-    stats_to_arrays,
     standardize_features,
+    standardize_value,
+    stats_to_arrays,
+    unstandardize_value,
 )
 
 
@@ -119,6 +121,24 @@ def test_stats_to_arrays_preserves_feature_column_order():
     means, stds = stats_to_arrays(stats, feature_columns=["c", "a", "b"])
     assert list(means) == [5.0, 1.0, 3.0]
     assert list(stds) == [6.0, 2.0, 4.0]
+
+
+def test_standardize_value_produces_zero_mean_unit_std():
+    values = np.array([10.0, 20.0, 30.0, 40.0, 50.0])
+    stats = (float(values.mean()), float(values.std()))
+    standardized = standardize_value(values, stats)
+
+    assert standardized.mean() == pytest.approx(0.0, abs=1e-9)
+    assert standardized.std() == pytest.approx(1.0, rel=1e-6)
+
+
+def test_unstandardize_value_inverts_standardize_value():
+    values = np.array([0.001, -0.002, 0.0015, -0.0005, 0.003])
+    stats = (float(values.mean()), float(values.std()))
+
+    round_tripped = unstandardize_value(standardize_value(values, stats), stats)
+
+    assert np.allclose(round_tripped, values)
 
 
 def test_standardize_array_matches_standardize_features():
