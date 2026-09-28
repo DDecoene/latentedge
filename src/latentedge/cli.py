@@ -1,3 +1,4 @@
+import os
 import sys
 import time
 from pathlib import Path
@@ -18,6 +19,7 @@ from latentedge.ingest.chunked import (
     DEFAULT_FLUSH_EVERY_N_CHUNKS,
     DEFAULT_MAX_RATE_LIMIT_BACKOFF_SECONDS,
     DEFAULT_MAX_RETRIES,
+    DEFAULT_MAX_RPS,
     DEFAULT_MAX_WORKERS,
     DEFAULT_RETRY_BACKOFF_SECONDS,
     RATE_LIMIT_BACKOFF_MULTIPLIER,
@@ -110,7 +112,7 @@ def _get_latest_block_with_retries(
 )
 @click.option(
     "--max-workers", type=int, default=DEFAULT_MAX_WORKERS, envvar="LATENTEDGE_MAX_WORKERS",
-    help="Ceiling on concurrent chunk requests — the auto-throttle backs off below this under rate limiting. Falls back to the LATENTEDGE_MAX_WORKERS env var (or a .env file).",
+    help="Thread pool size (simultaneous connections) — the actual request pace against the provider is a separate ceiling, set via the LATENTEDGE_INGEST_MAX_RPS env var. Falls back to the LATENTEDGE_MAX_WORKERS env var (or a .env file).",
 )
 @click.option(
     "--flush-every-n-chunks", type=int, default=DEFAULT_FLUSH_EVERY_N_CHUNKS, envvar="LATENTEDGE_FLUSH_EVERY_N_CHUNKS",
@@ -172,6 +174,8 @@ def ingest(
     if (from_block is None) != (to_block is None):
         raise click.UsageError("--from-block and --to-block must be given together, or both omitted to use --days instead.")
 
+    max_rps = float(os.environ.get("LATENTEDGE_INGEST_MAX_RPS", DEFAULT_MAX_RPS))
+
     if from_block is None:
         with httpx.Client(timeout=30.0) as client:
             try:
@@ -213,7 +217,7 @@ def ingest(
         screen = IngestScreen(
             pool_address=config.POOL_ADDRESS, from_block=first_from, to_block=first_to,
             out_path=out, client_factory=lambda: httpx.Client(timeout=30.0), rpc_url=rpc_url,
-            chunk_size=chunk_size, max_workers=max_workers,
+            chunk_size=chunk_size, max_workers=max_workers, max_rps=max_rps,
             flush_every_n_chunks=flush_every_n_chunks, max_retries=max_retries,
             retry_backoff_seconds=retry_backoff_seconds,
             concurrency_cooldown_seconds=concurrency_cooldown_seconds,
@@ -246,7 +250,7 @@ def ingest(
                 ingest_range(
                     config.POOL_ADDRESS, gap_start, gap_end, out, client, rpc_url,
                     chunk_size=chunk_size, max_retries=max_retries, retry_backoff_seconds=retry_backoff_seconds,
-                    max_workers=max_workers, flush_every_n_chunks=flush_every_n_chunks,
+                    max_workers=max_workers, max_rps=max_rps, flush_every_n_chunks=flush_every_n_chunks,
                     concurrency_cooldown_seconds=concurrency_cooldown_seconds,
                     max_rate_limit_backoff_seconds=max_rate_limit_backoff_seconds,
                     on_progress=report,
@@ -256,7 +260,7 @@ def ingest(
             total = ingest_range(
                 config.POOL_ADDRESS, from_block, to_block, out, client, rpc_url,
                 chunk_size=chunk_size, max_retries=max_retries, retry_backoff_seconds=retry_backoff_seconds,
-                max_workers=max_workers, flush_every_n_chunks=flush_every_n_chunks,
+                max_workers=max_workers, max_rps=max_rps, flush_every_n_chunks=flush_every_n_chunks,
                 concurrency_cooldown_seconds=concurrency_cooldown_seconds,
                 max_rate_limit_backoff_seconds=max_rate_limit_backoff_seconds,
                 on_progress=report,

@@ -578,3 +578,42 @@ def test_ingest_days_window_reports_zero_when_entire_pool_history_already_ingest
     assert result.exit_code == 0, result.output
     assert captured["from_block"] == config.POOL_CREATION_BLOCK  # walked all the way to the floor, no further
     assert "wrote 0 new swap records" in result.output
+
+
+def test_ingest_max_rps_falls_back_to_env_var_with_no_cli_flag(monkeypatch: pytest.MonkeyPatch):
+    # LATENTEDGE_INGEST_MAX_RPS is deliberately env-var-only — no --max-rps
+    # flag — matching this repo's preference for env vars over new flags
+    # for run options that aren't part of every invocation's everyday use.
+    captured: dict[str, object] = {}
+
+    def fake_ingest_range(pool_address, from_block, to_block, out, client, rpc_url, **kwargs):
+        captured["max_rps"] = kwargs["max_rps"]
+        return 0
+
+    monkeypatch.setattr("latentedge.cli.ingest_range", fake_ingest_range)
+
+    runner = CliRunner()
+    runner.invoke(
+        cli,
+        ["ingest", "--from-block", "1", "--to-block", "2"],
+        env={"LATENTEDGE_INGEST_MAX_RPS": "2.5"},
+    )
+
+    assert captured["max_rps"] == 2.5
+
+
+def test_ingest_max_rps_defaults_when_env_var_omitted(monkeypatch: pytest.MonkeyPatch):
+    from latentedge.ingest.chunked import DEFAULT_MAX_RPS
+
+    captured: dict[str, object] = {}
+
+    def fake_ingest_range(pool_address, from_block, to_block, out, client, rpc_url, **kwargs):
+        captured["max_rps"] = kwargs["max_rps"]
+        return 0
+
+    monkeypatch.setattr("latentedge.cli.ingest_range", fake_ingest_range)
+
+    runner = CliRunner()
+    runner.invoke(cli, ["ingest", "--from-block", "1", "--to-block", "2"])
+
+    assert captured["max_rps"] == DEFAULT_MAX_RPS
