@@ -6,7 +6,7 @@ import httpx
 import pytest
 
 from latentedge.ingest.chunked import IngestCancelled, ingest_range
-from latentedge.ingest.progress import read_concurrency_limit, read_progress, write_progress
+from latentedge.ingest.progress import read_progress, read_rate_limit, write_progress, write_rate_limit
 from latentedge.ingest.rpc_logs import RateLimitError, RpcLogsError
 from latentedge.schema import SwapRecord
 from latentedge.store import read_swaps
@@ -31,7 +31,7 @@ def test_ingest_range_splits_into_chunks_and_writes_incrementally(tmp_path: Path
     calls: list[tuple[int, int]] = []
     lock = threading.Lock()
 
-    def fake_fetch(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str) -> list[SwapRecord]:
+    def fake_fetch(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str, **kwargs) -> list[SwapRecord]:
         with lock:
             calls.append((from_block, to_block))
         return [_record(from_block, 0)]
@@ -61,7 +61,7 @@ def test_ingest_range_resumes_from_progress_file_and_skips_completed_chunks(tmp_
     calls: list[tuple[int, int]] = []
     lock = threading.Lock()
 
-    def fake_fetch(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str) -> list[SwapRecord]:
+    def fake_fetch(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str, **kwargs) -> list[SwapRecord]:
         with lock:
             calls.append((from_block, to_block))
         return [_record(from_block, 0)]
@@ -88,7 +88,7 @@ def test_ingest_range_resumes_from_progress_file_and_skips_completed_chunks(tmp_
 
 
 def test_ingest_range_returns_zero_when_the_whole_requested_range_is_already_covered(tmp_path: Path):
-    def unexpected_fetch(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str) -> list[SwapRecord]:
+    def unexpected_fetch(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str, **kwargs) -> list[SwapRecord]:
         raise AssertionError("fetch must not be called for an already-covered range")
 
     out_path = tmp_path / "swaps.parquet"
@@ -107,7 +107,7 @@ def test_ingest_range_skips_a_covered_stretch_in_the_middle_of_the_requested_ran
     calls: list[tuple[int, int]] = []
     lock = threading.Lock()
 
-    def fake_fetch(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str) -> list[SwapRecord]:
+    def fake_fetch(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str, **kwargs) -> list[SwapRecord]:
         with lock:
             calls.append((from_block, to_block))
         return [_record(from_block, 0)]
@@ -132,7 +132,7 @@ def test_ingest_range_fetches_around_two_disjoint_pre_existing_intervals(tmp_pat
     calls: list[tuple[int, int]] = []
     lock = threading.Lock()
 
-    def fake_fetch(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str) -> list[SwapRecord]:
+    def fake_fetch(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str, **kwargs) -> list[SwapRecord]:
         with lock:
             calls.append((from_block, to_block))
         return [_record(from_block, 0)]
@@ -171,7 +171,7 @@ def test_ingest_range_records_each_disjoint_new_stretch_as_its_own_interval_befo
     original = chunked_module.add_interval
     chunked_module.add_interval = spy_add_interval
     try:
-        def fake_fetch(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str) -> list[SwapRecord]:
+        def fake_fetch(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str, **kwargs) -> list[SwapRecord]:
             return [_record(from_block, 0)]
 
         out_path = tmp_path / "swaps.parquet"
@@ -199,7 +199,7 @@ def test_ingest_range_flushes_correctly_when_failure_happens_after_crossing_a_ga
     # interval, not discarded.
     call_count = {"n": 0}
 
-    def succeed_first_gap_then_fail(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str) -> list[SwapRecord]:
+    def succeed_first_gap_then_fail(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str, **kwargs) -> list[SwapRecord]:
         call_count["n"] += 1
         if call_count["n"] > 1:
             raise RpcLogsError("simulated failure in the second gap")
@@ -225,7 +225,7 @@ def test_ingest_range_retries_transient_failures_then_succeeds(tmp_path: Path):
     attempts = {"count": 0}
     lock = threading.Lock()
 
-    def flaky_fetch(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str) -> list[SwapRecord]:
+    def flaky_fetch(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str, **kwargs) -> list[SwapRecord]:
         with lock:
             attempts["count"] += 1
             count = attempts["count"]
@@ -246,7 +246,7 @@ def test_ingest_range_retries_transient_failures_then_succeeds(tmp_path: Path):
 
 
 def test_ingest_range_gives_up_after_max_retries(tmp_path: Path):
-    def always_fails(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str) -> list[SwapRecord]:
+    def always_fails(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str, **kwargs) -> list[SwapRecord]:
         raise RpcLogsError("permanent failure")
 
     out_path = tmp_path / "swaps.parquet"
@@ -262,7 +262,7 @@ def test_ingest_range_gives_up_after_max_retries(tmp_path: Path):
 
 
 def test_ingest_range_handles_empty_chunk_without_crashing(tmp_path: Path):
-    def fake_fetch(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str) -> list[SwapRecord]:
+    def fake_fetch(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str, **kwargs) -> list[SwapRecord]:
         return []  # a quiet period with no swaps at all
 
     out_path = tmp_path / "swaps.parquet"
@@ -281,7 +281,7 @@ def test_ingest_range_runs_chunks_concurrently(tmp_path: Path):
     # blocks/call), a year of history is ~263,000 sequential requests —
     # concurrency is what makes that tractable. 20 chunks that each take
     # ~50ms must complete in well under 20*50ms if genuinely parallel.
-    def slow_fetch(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str) -> list[SwapRecord]:
+    def slow_fetch(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str, **kwargs) -> list[SwapRecord]:
         time.sleep(0.05)
         return [_record(from_block, 0)]
 
@@ -302,7 +302,7 @@ def test_ingest_range_stays_correct_with_out_of_order_chunk_completion(tmp_path:
     # Chunks complete in whatever order their network calls happen to
     # finish, not necessarily the order they were requested in. Progress
     # and written data must still end up complete and correct regardless.
-    def variable_speed_fetch(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str) -> list[SwapRecord]:
+    def variable_speed_fetch(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str, **kwargs) -> list[SwapRecord]:
         # Make earlier chunks artificially slower so later ones finish first.
         time.sleep(0.03 if from_block < 50 else 0.001)
         return [_record(from_block, 0)]
@@ -331,7 +331,7 @@ def test_ingest_range_batches_writes_instead_of_one_per_chunk(tmp_path: Path):
         write_calls["count"] += 1
         return original_write_swaps(records, path)
 
-    def fake_fetch(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str) -> list[SwapRecord]:
+    def fake_fetch(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str, **kwargs) -> list[SwapRecord]:
         return [_record(from_block, 0)]
 
     out_path = tmp_path / "swaps.parquet"
@@ -361,7 +361,7 @@ def test_ingest_range_progress_never_exceeds_what_was_actually_flushed(tmp_path:
     # blocks whose data was never actually written to disk.
     call_count = {"n": 0}
 
-    def fetch_then_die(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str) -> list[SwapRecord]:
+    def fetch_then_die(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str, **kwargs) -> list[SwapRecord]:
         call_count["n"] += 1
         if call_count["n"] > 15:
             raise RpcLogsError("simulated crash")
@@ -393,7 +393,7 @@ def test_ingest_range_backs_off_longer_for_rate_limit_errors(tmp_path: Path, mon
 
     attempts = {"count": 0}
 
-    def rate_limited_fetch(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str) -> list[SwapRecord]:
+    def rate_limited_fetch(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str, **kwargs) -> list[SwapRecord]:
         attempts["count"] += 1
         if attempts["count"] < 3:
             raise RateLimitError("simulated rate limit")
@@ -423,7 +423,7 @@ def test_ingest_range_never_gives_up_on_a_rate_limited_chunk_even_past_max_retri
     monkeypatch.setattr("latentedge.ingest.chunked.time.sleep", lambda seconds: None)
     attempts = {"count": 0}
 
-    def rate_limited_many_times(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str) -> list[SwapRecord]:
+    def rate_limited_many_times(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str, **kwargs) -> list[SwapRecord]:
         attempts["count"] += 1
         if attempts["count"] < 6:
             raise RateLimitError("simulated rate limit")
@@ -447,7 +447,7 @@ def test_ingest_range_caps_rate_limit_backoff_instead_of_growing_unbounded(tmp_p
     monkeypatch.setattr("latentedge.ingest.chunked.time.sleep", lambda seconds: sleeps.append(seconds))
     attempts = {"count": 0}
 
-    def rate_limited_many_times(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str) -> list[SwapRecord]:
+    def rate_limited_many_times(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str, **kwargs) -> list[SwapRecord]:
         attempts["count"] += 1
         if attempts["count"] < 8:
             raise RateLimitError("simulated rate limit")
@@ -471,7 +471,7 @@ def test_ingest_range_caps_rate_limit_backoff_instead_of_growing_unbounded(tmp_p
 def test_ingest_range_reports_no_retry_ceiling_for_a_rate_limited_retry(tmp_path: Path):
     attempts = {"count": 0}
 
-    def rate_limited_then_fine(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str) -> list[SwapRecord]:
+    def rate_limited_then_fine(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str, **kwargs) -> list[SwapRecord]:
         attempts["count"] += 1
         if attempts["count"] == 1:
             raise RateLimitError("simulated rate limit")
@@ -498,7 +498,7 @@ def test_ingest_range_calls_on_retry_for_each_failed_attempt(tmp_path: Path):
     retry_calls: list[tuple[int, int, int, int, float, str]] = []
     retry_lock = threading.Lock()
 
-    def flaky_fetch(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str) -> list[SwapRecord]:
+    def flaky_fetch(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str, **kwargs) -> list[SwapRecord]:
         with lock:
             attempts["count"] += 1
             count = attempts["count"]
@@ -533,7 +533,7 @@ def test_ingest_range_reports_queue_status_when_a_chunk_buffers_behind_a_straggl
     # into progress immediately. on_queue_status reports that buildup.
     release_first_chunk = threading.Event()
 
-    def gated_fetch(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str) -> list[SwapRecord]:
+    def gated_fetch(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str, **kwargs) -> list[SwapRecord]:
         if from_block == 0:
             release_first_chunk.wait()
         return [_record(from_block, 0)]
@@ -564,7 +564,7 @@ def test_ingest_range_reports_queue_status_when_a_chunk_buffers_behind_a_straggl
 def test_ingest_range_reports_worker_status_while_fetching_and_when_idle(tmp_path: Path):
     release_chunks = threading.Event()
 
-    def gated_fetch(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str) -> list[SwapRecord]:
+    def gated_fetch(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str, **kwargs) -> list[SwapRecord]:
         release_chunks.wait()
         return [_record(from_block, 0)]
 
@@ -598,7 +598,7 @@ def test_ingest_range_reports_worker_status_while_fetching_and_when_idle(tmp_pat
 def test_ingest_range_reports_worker_status_during_retries(tmp_path: Path):
     attempts = {"count": 0}
 
-    def flaky_fetch(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str) -> list[SwapRecord]:
+    def flaky_fetch(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str, **kwargs) -> list[SwapRecord]:
         attempts["count"] += 1
         if attempts["count"] < 3:
             raise RpcLogsError("transient failure")
@@ -620,96 +620,64 @@ def test_ingest_range_reports_worker_status_during_retries(tmp_path: Path):
 
     retry_statuses = [s[3] for s in statuses if s[3].startswith("retry")]
     assert retry_statuses == ["retry 1/5, waiting 0.0s", "retry 2/5, waiting 0.0s"]
-    # Each attempt reports "waiting" (for a free concurrency slot) before
-    # "fetching" (once it actually has one) — with only one worker and no
-    # rate limiting, the slot is always immediately free.
-    assert statuses[0] == (0, 0, 99, "waiting")
-    assert statuses[1] == (0, 0, 99, "fetching")
+    # No separate "waiting" phase anymore — pacing now happens inside
+    # fetch_fn's own per-call gating (see rpc_logs.py), not as a discrete
+    # per-chunk gate chunked.py can observe and report on its own.
+    assert statuses[0] == (0, 0, 99, "fetching")
     assert statuses[-1] == (0, 0, 99, "idle")
 
 
-def test_fetch_chunk_with_retries_reports_waiting_while_blocked_on_the_concurrency_gate(tmp_path: Path):
-    # Regression test: a throttled-down worker was reported as "fetching"
-    # the whole time it sat blocked on the concurrency gate, because the
-    # status was announced before limiter.acquire() — the one moment the
-    # throttle is actually visible was invisible in the UI.
-    from latentedge.ingest.chunked import _fetch_chunk_with_retries
-    from latentedge.ingest.concurrency import AdaptiveConcurrencyLimiter
-
-    limiter = AdaptiveConcurrencyLimiter(ceiling=1)
-    limiter.acquire()  # hold the only permit so the call under test must wait for it
-
-    statuses: list[str] = []
-    status_before_release: list[str] = []
-
-    def on_status(status: str) -> None:
-        statuses.append(status)
-
-    def fetch_fn(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str) -> list[SwapRecord]:
-        return [_record(from_block, 0)]
-
-    def release_after_delay() -> None:
-        time.sleep(0.05)
-        status_before_release.extend(statuses)
-        limiter.release("success")
-
-    releaser = threading.Thread(target=release_after_delay)
-    releaser.start()
-    try:
-        _fetch_chunk_with_retries(
-            fetch_fn, "0xpool", 0, 9, None, "http://fake",  # type: ignore[arg-type]
-            max_retries=1, backoff_seconds=0.001, limiter=limiter, on_status=on_status,
-        )
-    finally:
-        releaser.join(timeout=1.0)
-
-    assert status_before_release == ["waiting"]  # blocked on the gate, not "fetching"
-    assert statuses == ["waiting", "fetching"]
-
-
-def test_ingest_range_throttles_down_worker_concurrency_after_a_rate_limit(tmp_path: Path):
+def test_ingest_range_throttles_down_the_pacing_rate_after_a_rate_limit(tmp_path: Path):
     attempts = {"count": 0}
     lock = threading.Lock()
 
-    def one_rate_limit_then_fine(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str) -> list[SwapRecord]:
+    def one_rate_limit_then_fine(pool_address, from_block, to_block, client, rpc_url, rate_limiter=None, **kwargs):
         with lock:
             attempts["count"] += 1
             first = attempts["count"] == 1
         if first:
+            if rate_limiter is not None:
+                rate_limiter.release("rate_limited")
             raise RateLimitError("simulated rate limit")
+        if rate_limiter is not None:
+            rate_limiter.release("success")
         return [_record(from_block, 0)]
 
-    concurrency_changes: list[int] = []
+    rate_changes: list[float] = []
     changes_lock = threading.Lock()
 
-    def on_concurrency_change(new_limit: int) -> None:
+    def on_rate_change(new_rate: float) -> None:
         with changes_lock:
-            concurrency_changes.append(new_limit)
+            rate_changes.append(new_rate)
 
     out_path = tmp_path / "swaps.parquet"
     with httpx.Client() as client:
         total = ingest_range(
             pool_address="0xpool", from_block=0, to_block=99, out_path=out_path,
             client=client, rpc_url="http://fake", chunk_size=10, max_workers=4,
-            fetch_fn=one_rate_limit_then_fine, max_retries=3, retry_backoff_seconds=0.001,
+            max_rps=4.0, fetch_fn=one_rate_limit_then_fine, max_retries=3, retry_backoff_seconds=0.001,
             concurrency_cooldown_seconds=0,
-            on_concurrency_change=on_concurrency_change,
+            on_rate_change=on_rate_change,
         )
 
     assert total == 10
-    assert 2 in concurrency_changes  # halved from the ceiling of 4 after the one rate limit
+    assert 2.0 in rate_changes  # halved from the ceiling of 4.0 after the one rate limit
 
 
-def test_ingest_range_persists_the_settled_concurrency_limit_for_the_next_run(tmp_path: Path):
+def test_ingest_range_persists_the_settled_rate_for_the_next_run(tmp_path: Path):
     attempts = {"count": 0}
     lock = threading.Lock()
 
-    def one_rate_limit_then_fine(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str) -> list[SwapRecord]:
+    def one_rate_limit_then_fine(pool_address, from_block, to_block, client, rpc_url, rate_limiter=None, **kwargs):
         with lock:
             attempts["count"] += 1
             first = attempts["count"] == 1
         if first:
+            if rate_limiter is not None:
+                rate_limiter.release("rate_limited")
             raise RateLimitError("simulated rate limit")
+        if rate_limiter is not None:
+            rate_limiter.release("success")
         return [_record(from_block, 0)]
 
     out_path = tmp_path / "swaps.parquet"
@@ -717,64 +685,96 @@ def test_ingest_range_persists_the_settled_concurrency_limit_for_the_next_run(tm
         ingest_range(
             pool_address="0xpool", from_block=0, to_block=99, out_path=out_path,
             client=client, rpc_url="http://fake", chunk_size=10, max_workers=4,
-            fetch_fn=one_rate_limit_then_fine, max_retries=3, retry_backoff_seconds=0.001,
+            max_rps=4.0, fetch_fn=one_rate_limit_then_fine, max_retries=3, retry_backoff_seconds=0.001,
             concurrency_cooldown_seconds=0,
         )
 
-    # The run above halved from a ceiling of 4 down to 2 and never grew
-    # back (successes_before_increase defaults to 20, far more than the
-    # handful of chunks here) — a resumed run must start from that 2,
+    # Halved from a ceiling of 4.0 down to 2.0 and never climbed back
+    # (successes_before_increase defaults to 20, far more than the
+    # handful of chunks here) — a resumed run must start from that 2.0,
     # not silently reset to the ceiling and re-earn the same throttle.
-    assert read_concurrency_limit(out_path) == 2
+    assert read_rate_limit(out_path) == 2.0
 
-    seen_limits: list[int] = []
+    seen_rates: list[float] = []
 
-    def record_limit_seen_on_acquire(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str) -> list[SwapRecord]:
+    def record_rate_seen(pool_address, from_block, to_block, client, rpc_url, rate_limiter=None, **kwargs):
+        if rate_limiter is not None:
+            rate_limiter.release("success")
         return [_record(from_block, 0)]
 
-    def on_concurrency_change(new_limit: int) -> None:
-        seen_limits.append(new_limit)
+    def on_rate_change(new_rate: float) -> None:
+        seen_rates.append(new_rate)
 
     with httpx.Client() as client:
         ingest_range(
             pool_address="0xpool", from_block=100, to_block=109, out_path=out_path,
             client=client, rpc_url="http://fake", chunk_size=10, max_workers=4,
-            fetch_fn=record_limit_seen_on_acquire, concurrency_cooldown_seconds=0,
-            on_concurrency_change=on_concurrency_change,
+            max_rps=4.0, fetch_fn=record_rate_seen, concurrency_cooldown_seconds=0,
+            on_rate_change=on_rate_change,
         )
 
-    # Nothing rate-limited this time, so the limit should only ever have
-    # been read as 2 (the persisted value), never reported back up to
-    # the ceiling of 4 from a single chunk's worth of successes.
-    assert 4 not in seen_limits
-    assert read_concurrency_limit(out_path) == 2
+    # Nothing rate-limited this time, so the rate should only ever have
+    # been read starting from 2.0 (the persisted value), never jumped
+    # straight back to the ceiling of 4.0 from a single chunk's success.
+    assert 4.0 not in seen_rates
+    assert read_rate_limit(out_path) == 2.0
 
 
 def test_ingest_range_never_resumes_below_half_the_ceiling_even_if_a_prior_run_bottomed_out(tmp_path: Path):
-    # A prior run that bottomed all the way out to 1 (the AIMD floor)
-    # must not permanently pin every future run to 1 — recovering from 1
-    # needs successes_before_increase consecutive successes, which a
-    # flaky provider may never string together, so a bare persisted
-    # floor would ratchet throughput down forever with no way back up.
-    from latentedge.ingest.progress import write_concurrency_limit
-
     out_path = tmp_path / "swaps.parquet"
-    write_concurrency_limit(out_path, 1)
+    write_rate_limit(out_path, 0.5)
 
-    def fake_fetch(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str) -> list[SwapRecord]:
+    def fake_fetch(pool_address, from_block, to_block, client, rpc_url, **kwargs):
         return [_record(from_block, 0)]
 
     with httpx.Client() as client:
         ingest_range(
             pool_address="0xpool", from_block=0, to_block=9, out_path=out_path,
             client=client, rpc_url="http://fake", chunk_size=10, max_workers=4,
-            fetch_fn=fake_fetch, concurrency_cooldown_seconds=0,
+            max_rps=4.0, fetch_fn=fake_fetch, concurrency_cooldown_seconds=0,
         )
 
-    # Nothing rate-limited or grew the limit in this single-chunk run, so
-    # whatever it ends on is exactly what it started from — must be half
-    # the ceiling (2), not the persisted floor of 1.
-    assert read_concurrency_limit(out_path) == 2
+    # Nothing rate-limited or climbed in this single-chunk run, so
+    # whatever it ends on is exactly what it started from — must be
+    # half the ceiling (2.0), not the persisted floor of 0.5.
+    assert read_rate_limit(out_path) == 2.0
+
+
+def test_ingest_range_translates_cancelled_from_a_blocked_rate_limiter_acquire(tmp_path: Path):
+    # Regression test: gating now happens inside fetch_fn (deep inside
+    # fetch_swaps in production), several call-frames below chunked.py's
+    # own cancel_event check at the top of the retry loop. A cancel_event
+    # set while a worker is genuinely blocked in rate_limiter.acquire()
+    # must still surface as IngestCancelled within a cancel-poll interval,
+    # not only when the outer loop happens to re-check between attempts.
+    cancel_event = threading.Event()
+    entered_second_acquire = threading.Event()
+
+    def blocked_fetch(pool_address, from_block, to_block, client, rpc_url, rate_limiter=None, cancel_event=None, **kwargs):
+        rate_limiter.acquire(cancel_event)  # first call returns immediately (fresh limiter)
+        entered_second_acquire.set()
+        rate_limiter.acquire(cancel_event)  # blocks ~2s (RateLimiter floors max_rps=0.1 to DEFAULT_MIN_RPS=0.5) — long enough to cancel mid-wait
+        return [_record(from_block, 0)]
+
+    out_path = tmp_path / "swaps.parquet"
+
+    def set_cancel_once_blocked() -> None:
+        entered_second_acquire.wait(timeout=1.0)
+        time.sleep(0.05)
+        cancel_event.set()
+
+    setter = threading.Thread(target=set_cancel_once_blocked)
+    setter.start()
+    try:
+        with httpx.Client() as client:
+            with pytest.raises(IngestCancelled):
+                ingest_range(
+                    pool_address="0xpool", from_block=0, to_block=9, out_path=out_path,
+                    client=client, rpc_url="http://fake", chunk_size=10, max_workers=1,
+                    max_rps=0.1, fetch_fn=blocked_fetch, cancel_event=cancel_event,
+                )
+    finally:
+        setter.join(timeout=1.0)
 
 
 def test_ingest_range_flushes_completed_chunks_before_raising_on_a_later_failure(tmp_path: Path):
@@ -785,7 +785,7 @@ def test_ingest_range_flushes_completed_chunks_before_raising_on_a_later_failure
     # recover from in time.
     call_count = {"n": 0}
 
-    def succeed_then_fail(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str) -> list[SwapRecord]:
+    def succeed_then_fail(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str, **kwargs) -> list[SwapRecord]:
         call_count["n"] += 1
         if call_count["n"] > 5:
             raise RpcLogsError("simulated persistent rate limit")
@@ -817,7 +817,7 @@ def test_ingest_range_cancel_event_stops_cleanly_and_flushes_completed_chunks(tm
     cancel_event = threading.Event()
     call_count = {"n": 0}
 
-    def fake_fetch(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str) -> list[SwapRecord]:
+    def fake_fetch(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str, **kwargs) -> list[SwapRecord]:
         with threading.Lock():
             call_count["n"] += 1
         if call_count["n"] == 3:
