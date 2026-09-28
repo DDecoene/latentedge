@@ -14,6 +14,7 @@ from latentedge.training_data import AssembledTrainingData, SplitArrays
 from latentedge.tui.app import LatentEdgeApp
 from latentedge.tui.ingest_screen import IngestScreen
 from latentedge.tui.train_screen import TrainScreen
+from latentedge.tui.widgets import ProgressPanel
 
 
 def _placeholder_assemble(swaps_path: Path) -> AssembledTrainingData:
@@ -147,6 +148,63 @@ async def test_ingest_screen_progress_starts_from_resumed_block(tmp_path: Path):
 
     assert screen.is_complete
     assert screen.total_written == 2  # only blocks [10,29] were new
+
+
+@pytest.mark.asyncio
+async def test_ingest_screen_rate_is_a_cumulative_average_not_a_recent_window(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    # Regression test: a rate computed from only the most recent progress
+    # events swings wildly with normal throttle behavior — a burst of
+    # concurrent fetches right after a cooldown looks fast, then a
+    # rate-limit stall looks like a near-zero rate, even though both are
+    # expected. Anchoring on the first real fetch and averaging
+    # cumulatively since then stays stable across exactly that pattern.
+    rates: list[float] = []
+    original_update = ProgressPanel.update_progress
+
+    def spy_update(self, completed, total, unit_label, rate_per_sec, rate_unit):  # type: ignore[no-untyped-def]
+        rates.append(rate_per_sec)
+        return original_update(self, completed, total, unit_label, rate_per_sec, rate_unit)
+
+    monkeypatch.setattr(ProgressPanel, "update_progress", spy_update)
+
+    clock = {"t": 0.0}
+    screen = IngestScreen(
+        pool_address="0xpool", from_block=0, to_block=99, out_path=tmp_path / "swaps.parquet",
+        client_factory=lambda: httpx.Client(), rpc_url="http://fake",
+        chunk_size=10, max_workers=1, flush_every_n_chunks=1,
+        max_retries=1, retry_backoff_seconds=0.001, fetch_fn=_fake_fetch,
+        train_assemble_fn=_placeholder_assemble, time_fn=lambda: clock["t"],
+    )
+    app = LatentEdgeApp(start_screen=screen)
+
+    async with app.run_test():
+        # A fast burst: three 10-block chunks land close together.
+        clock["t"] = 1.0
+        screen._handle_progress(0, 9, 1)
+        clock["t"] = 3.0
+        screen._handle_progress(10, 19, 1)
+        clock["t"] = 5.0
+        screen._handle_progress(20, 29, 1)
+
+        # A rate-limit stall: the next chunk takes 20s longer to land.
+        clock["t"] = 25.0
+        screen._handle_progress(30, 39, 1)
+
+        # Another fast chunk right after the stall clears.
+        clock["t"] = 25.2
+        screen._handle_progress(40, 49, 1)
+
+    # rates[0] is on_mount's own initial (pre-fetch) update; the five
+    # _handle_progress calls above are rates[1:].
+    #
+    # Cumulative average since the first real fetch at t=1.0, not a
+    # recent-window delta — a windowed calc would show the stall as a
+    # near-zero rate and the chunk right after it as an implausible spike.
+    assert rates[1] == pytest.approx(0.0)  # no elapsed time yet on the very first real event
+    assert rates[2] == pytest.approx(10 / 2.0)
+    assert rates[3] == pytest.approx(20 / 4.0)
+    assert rates[4] == pytest.approx(30 / 24.0)
+    assert rates[5] == pytest.approx(40 / 24.2)
 
 
 @pytest.mark.asyncio

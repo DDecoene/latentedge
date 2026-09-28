@@ -2,7 +2,6 @@
 
 import shutil
 import time
-from collections import deque
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,7 +20,6 @@ from latentedge.ingest.rpc_logs import describe_error, fetch_swaps
 from latentedge.tui.train_screen import DEFAULT_MODEL_OUT_PATH, TrainAssembleFn, TrainScreen
 from latentedge.tui.widgets import LogPanel, ProgressPanel, StatsPanel, ThreadPanel
 
-RATE_WINDOW_SIZE = 20
 STATS_REFRESH_INTERVAL_SECONDS = 1.0
 # A run with nothing to report yet (no chunk has completed) isn't
 # "stalled" — only flag it once enough time has passed that a healthy
@@ -99,7 +97,14 @@ class IngestScreen(Screen[None]):
         # position — gap-fill means chunk_end no longer maps directly to
         # "blocks completed since from_block".
         self._completed = 0
-        self._rate_window: deque[tuple[float, int]] = deque(maxlen=RATE_WINDOW_SIZE)
+        # Anchored on the *first real fetch* (set in _handle_progress),
+        # not here at startup — a resumed run's already-on-disk blocks
+        # are folded into self._completed before that first callback, so
+        # _rate_start_completed's baseline already excludes them from
+        # the rate/ETA math below; only genuinely fetched blocks and the
+        # wall-clock time actually spent fetching them count.
+        self._rate_start_time: float | None = None
+        self._rate_start_completed: int | None = None
         self._last_progress_time = self.time_fn()
         self._buffered_count = 0
         self._blocking_chunk_start: int | None = None
@@ -199,14 +204,22 @@ class IngestScreen(Screen[None]):
         completed = self._completed
         now = self.time_fn()
         self._last_progress_time = now
-        self._rate_window.append((now, completed))
 
-        rate = 0.0
-        if len(self._rate_window) >= 2:
-            (t0, c0), (t1, c1) = self._rate_window[0], self._rate_window[-1]
-            elapsed = t1 - t0
-            if elapsed > 0:
-                rate = (c1 - c0) / elapsed
+        # Cumulative average since the first real fetch, not a recent
+        # window — a windowed rate swings wildly with a concurrency
+        # burst right after a cooldown followed by a rate-limit stall,
+        # even though both are normal, expected throttle behavior. The
+        # cumulative average smooths that out and gives a stable ETA
+        # extrapolated from total elapsed time and percent complete.
+        if self._rate_start_time is None:
+            self._rate_start_time = now
+            self._rate_start_completed = completed
+            rate = 0.0
+        else:
+            assert self._rate_start_completed is not None
+            elapsed = now - self._rate_start_time
+            blocks_fetched = completed - self._rate_start_completed
+            rate = blocks_fetched / elapsed if elapsed > 0 else 0.0
 
         self.query_one("#ingest-progress", ProgressPanel).update_progress(
             completed=completed, total=total, unit_label=f"block {chunk_end}",

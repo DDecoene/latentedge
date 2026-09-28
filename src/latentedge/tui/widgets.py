@@ -1,5 +1,8 @@
 """Shared dashboard widgets used by every long-running command's screen."""
 
+from collections.abc import Callable
+from datetime import datetime, timedelta
+
 from textual.app import ComposeResult
 from textual.containers import Vertical
 from textual.widget import Widget
@@ -18,6 +21,20 @@ def format_eta(seconds_remaining: float | None) -> str:
     if hours:
         return f"{hours}:{minutes:02d}:{seconds:02d}"
     return f"{minutes:02d}:{seconds:02d}"
+
+
+def format_landing_time(seconds_remaining: float | None, now: datetime) -> str:
+    """Render when an ETA duration actually lands as a wall-clock
+    date/time — a duration like "3:45:12" doesn't say whether that's
+    "done before lunch" or "done at 3am"; this does. The date is omitted
+    when it lands the same calendar day as `now`.
+    """
+    if seconds_remaining is None or seconds_remaining < 0:
+        return "--"
+    landing = now + timedelta(seconds=seconds_remaining)
+    if landing.date() == now.date():
+        return landing.strftime("%H:%M")
+    return landing.strftime("%b %d %H:%M")
 
 
 class ProgressPanel(Widget):
@@ -54,6 +71,7 @@ class ProgressPanel(Widget):
         unit_label: str,
         rate_per_sec: float,
         rate_unit: str,
+        now_fn: Callable[[], datetime] = datetime.now,
     ) -> None:
         total = max(total, 1)  # a zero-length range still renders a valid (complete) bar
         percent = min(100, round(completed / total * 100))
@@ -62,9 +80,11 @@ class ProgressPanel(Widget):
 
         remaining = total - completed
         eta_seconds = remaining / rate_per_sec if rate_per_sec > 0 else None
+        landing = format_landing_time(eta_seconds, now_fn())
         detail = self.query_one(f"#{self.id}-detail", Static)
         detail.update(
-            f"{percent}% — {unit_label} — {rate_per_sec:.1f} {rate_unit} — ETA {format_eta(eta_seconds)}"
+            f"{percent}% — {unit_label} — {rate_per_sec:.1f} {rate_unit} — "
+            f"ETA {format_eta(eta_seconds)} (lands {landing})"
         )
 
 

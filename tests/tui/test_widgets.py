@@ -1,9 +1,11 @@
+from datetime import datetime
+
 import pytest
 from textual.app import App, ComposeResult
 
 from textual.widgets import RichLog
 
-from latentedge.tui.widgets import LogPanel, ProgressPanel, StatsPanel, ThreadPanel, format_eta
+from latentedge.tui.widgets import LogPanel, ProgressPanel, StatsPanel, ThreadPanel, format_eta, format_landing_time
 
 
 class _ProgressPanelHarness(App[None]):
@@ -53,6 +55,36 @@ def test_format_eta_formats_minutes_and_seconds():
 
 def test_format_eta_formats_hours():
     assert format_eta(3725) == "1:02:05"
+
+
+def test_format_landing_time_handles_none():
+    assert format_landing_time(None, datetime(2026, 9, 29, 12, 0)) == "--"
+
+
+def test_format_landing_time_omits_date_when_landing_today():
+    now = datetime(2026, 9, 29, 12, 0)
+    assert format_landing_time(3600, now) == "13:00"  # 1 hour later, same day
+
+
+def test_format_landing_time_includes_date_when_landing_on_a_different_day():
+    now = datetime(2026, 9, 29, 23, 0)
+    assert format_landing_time(7200, now) == "Sep 30 01:00"  # 2 hours later, past midnight
+
+
+@pytest.mark.asyncio
+async def test_progress_panel_shows_a_landing_date_and_time():
+    app = _ProgressPanelHarness()
+    async with app.run_test() as pilot:
+        panel = app.query_one(ProgressPanel)
+        panel.update_progress(
+            completed=25, total=125, unit_label="block 1024",
+            rate_per_sec=1.0, rate_unit="blocks/sec",
+            now_fn=lambda: datetime(2026, 9, 29, 12, 0),
+        )
+        await pilot.pause()
+        detail_text = str(app.query_one("#panel-detail").content)
+
+    assert "lands 12:01" in detail_text  # 100 remaining / 1.0 per sec = 100s later
 
 
 class _StatsPanelHarness(App[None]):
