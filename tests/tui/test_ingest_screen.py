@@ -35,7 +35,7 @@ def _record(block_number: int) -> SwapRecord:
     )
 
 
-def _fake_fetch(pool_address, from_block, to_block, client, rpc_url):
+def _fake_fetch(pool_address, from_block, to_block, client, rpc_url, **kwargs):
     return [_record(from_block)]
 
 
@@ -80,7 +80,7 @@ async def test_ingest_screen_chains_through_remaining_ranges_inside_the_tui(tmp_
     # IngestScreen via remaining_ranges, and the screen itself chains
     # from one to the next by switching to a fresh IngestScreen on
     # completion, never dropping back to plain terminal output.
-    def slow_fetch(pool_address, from_block, to_block, client, rpc_url):
+    def slow_fetch(pool_address, from_block, to_block, client, rpc_url, **kwargs):
         time.sleep(0.05)
         return [_record(from_block)]
 
@@ -148,7 +148,7 @@ async def test_ingest_screen_ctrl_q_stops_cleanly_and_exits_instead_of_hanging(t
     # workers reported progress via call_from_thread against an event
     # loop that had just stopped, which blocked forever — the app never
     # actually exited, and the process had to be killed externally.
-    def slow_fetch(pool_address, from_block, to_block, client, rpc_url):
+    def slow_fetch(pool_address, from_block, to_block, client, rpc_url, **kwargs):
         time.sleep(0.03)
         return [_record(from_block)]
 
@@ -183,20 +183,24 @@ async def test_ingest_screen_ctrl_q_stops_cleanly_and_exits_instead_of_hanging(t
 
 
 @pytest.mark.asyncio
-async def test_ingest_screen_writes_retries_and_concurrency_changes_to_the_log_file(tmp_path: Path):
+async def test_ingest_screen_writes_retries_and_rate_changes_to_the_log_file(tmp_path: Path):
     attempts = {"count": 0}
 
-    def one_rate_limit_then_fine(pool_address, from_block, to_block, client, rpc_url):
+    def one_rate_limit_then_fine(pool_address, from_block, to_block, client, rpc_url, rate_limiter=None, **kwargs):
         attempts["count"] += 1
         if attempts["count"] == 1:
+            if rate_limiter is not None:
+                rate_limiter.release("rate_limited")
             raise RateLimitError("simulated rate limit")
+        if rate_limiter is not None:
+            rate_limiter.release("success")
         return [_record(from_block)]
 
     out_path = tmp_path / "swaps.parquet"
     screen = IngestScreen(
         pool_address="0xpool", from_block=0, to_block=39, out_path=out_path,
         client_factory=lambda: httpx.Client(), rpc_url="http://fake",
-        chunk_size=10, max_workers=4, flush_every_n_chunks=1,
+        chunk_size=10, max_workers=4, max_rps=4.0, flush_every_n_chunks=1,
         max_retries=3, retry_backoff_seconds=0.001, concurrency_cooldown_seconds=0,
         fetch_fn=one_rate_limit_then_fine,
         train_assemble_fn=_placeholder_assemble,
@@ -213,7 +217,7 @@ async def test_ingest_screen_writes_retries_and_concurrency_changes_to_the_log_f
     log_text = screen.log_path.read_text()
     assert "rate limited, retry 1" in log_text
     assert "simulated rate limit" in log_text
-    assert "throttled down to 2/4" in log_text
+    assert "throttled down to 2.0/4.0 req/s" in log_text
 
 
 @pytest.mark.asyncio
@@ -229,7 +233,7 @@ async def test_ingest_screen_progress_starts_from_resumed_block(tmp_path: Path):
 
     release_fetch = threading.Event()
 
-    def gated_fetch(pool_address, from_block, to_block, client, rpc_url):
+    def gated_fetch(pool_address, from_block, to_block, client, rpc_url, **kwargs):
         release_fetch.wait()
         return [_record(from_block)]
 
@@ -331,7 +335,7 @@ async def test_ingest_screen_progress_accounts_for_a_covered_gap_crossed_mid_run
     release_second_chunk = threading.Event()
     call_count = {"n": 0}
 
-    def gated_fetch(pool_address, from_block, to_block, client, rpc_url):
+    def gated_fetch(pool_address, from_block, to_block, client, rpc_url, **kwargs):
         call_count["n"] += 1
         if call_count["n"] > 1:
             release_second_chunk.wait()
@@ -413,7 +417,7 @@ async def test_ingest_screen_all_panels_are_visible_within_the_viewport(tmp_path
 async def test_ingest_screen_shows_retry_detail_in_log_and_stalled_stat(tmp_path: Path):
     attempts = {"count": 0}
 
-    def flaky_fetch(pool_address, from_block, to_block, client, rpc_url):
+    def flaky_fetch(pool_address, from_block, to_block, client, rpc_url, **kwargs):
         attempts["count"] += 1
         if attempts["count"] < 2:
             raise RpcLogsError("simulated rate limit")
@@ -449,7 +453,7 @@ async def test_ingest_screen_shows_retry_detail_in_log_and_stalled_stat(tmp_path
 async def test_ingest_screen_shows_per_worker_status(tmp_path: Path):
     release_chunks = threading.Event()
 
-    def gated_fetch(pool_address, from_block, to_block, client, rpc_url):
+    def gated_fetch(pool_address, from_block, to_block, client, rpc_url, **kwargs):
         release_chunks.wait()
         return [_record(from_block)]
 
@@ -486,56 +490,24 @@ async def test_ingest_screen_shows_per_worker_status(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_ingest_screen_renders_a_worker_waiting_for_a_free_concurrency_slot(tmp_path: Path):
-    # Regression test: a worker blocked on the concurrency gate must
-    # render distinctly from one actively fetching — otherwise the
-    # auto-throttle has no visible effect in the UI at all. Drives the
-    # screen's own handler directly rather than racing real threads,
-    # since forcing a real gate-block deterministically through
-    # ingest_range's timing would be flaky.
-    out_path = tmp_path / "swaps.parquet"
-    screen = IngestScreen(
-        pool_address="0xpool", from_block=0, to_block=9, out_path=out_path,
-        client_factory=lambda: httpx.Client(), rpc_url="http://fake",
-        chunk_size=10, max_workers=1, flush_every_n_chunks=1,
-        max_retries=1, retry_backoff_seconds=0.001, fetch_fn=_fake_fetch,
-        train_assemble_fn=_placeholder_assemble,
-    )
-    app = LatentEdgeApp(start_screen=screen)
-
-    async with app.run_test() as pilot:
-        for _ in range(50):
-            await pilot.pause(0.01)
-            if screen.is_complete:
-                break
-        screen._handle_worker_status(0, 0, 9, "waiting")
-        await pilot.pause()
-        threads_text = str(app.screen.query_one("#ingest-threads-body").content)
-        fetching_text = threads_text
-        screen._handle_worker_status(0, 0, 9, "fetching")
-        await pilot.pause()
-        fetching_text = str(app.screen.query_one("#ingest-threads-body").content)
-
-    assert "waiting for a free slot" in threads_text
-    assert "waiting for a free slot" not in fetching_text
-    assert "fetching" in fetching_text
-
-
-@pytest.mark.asyncio
-async def test_ingest_screen_shows_concurrency_limit_after_a_throttle_down(tmp_path: Path):
+async def test_ingest_screen_shows_the_pacing_rate_after_a_throttle_down(tmp_path: Path):
     attempts = {"count": 0}
 
-    def one_rate_limit_then_fine(pool_address, from_block, to_block, client, rpc_url):
+    def one_rate_limit_then_fine(pool_address, from_block, to_block, client, rpc_url, rate_limiter=None, **kwargs):
         attempts["count"] += 1
         if attempts["count"] == 1:
+            if rate_limiter is not None:
+                rate_limiter.release("rate_limited")
             raise RateLimitError("simulated rate limit")
+        if rate_limiter is not None:
+            rate_limiter.release("success")
         return [_record(from_block)]
 
     out_path = tmp_path / "swaps.parquet"
     screen = IngestScreen(
         pool_address="0xpool", from_block=0, to_block=39, out_path=out_path,
         client_factory=lambda: httpx.Client(), rpc_url="http://fake",
-        chunk_size=10, max_workers=4, flush_every_n_chunks=1,
+        chunk_size=10, max_workers=4, max_rps=4.0, flush_every_n_chunks=1,
         max_retries=3, retry_backoff_seconds=0.001, concurrency_cooldown_seconds=0,
         fetch_fn=one_rate_limit_then_fine,
         train_assemble_fn=_placeholder_assemble,
@@ -550,8 +522,32 @@ async def test_ingest_screen_shows_concurrency_limit_after_a_throttle_down(tmp_p
         stats_text = str(app.screen.query_one("#ingest-stats-body").content)
 
     assert screen.is_complete
-    assert "Concurrency" in stats_text
-    assert "2/4" in stats_text
+    assert "Rate" in stats_text
+    assert "2.0/4.0" in stats_text
+
+
+@pytest.mark.asyncio
+async def test_ingest_screen_renders_a_fractional_rate_without_truncating_it(tmp_path: Path):
+    # Regression guard: the old Concurrency row was int-based and could
+    # never show a fractional value. A rate limiter can settle anywhere
+    # (e.g. 0.5 req/s after repeated halvings) — the display must show
+    # that precisely, not round it down to something misleading like 0.
+    out_path = tmp_path / "swaps.parquet"
+    screen = IngestScreen(
+        pool_address="0xpool", from_block=0, to_block=9, out_path=out_path,
+        client_factory=lambda: httpx.Client(), rpc_url="http://fake",
+        chunk_size=10, max_workers=4, max_rps=4.0, flush_every_n_chunks=1,
+        max_retries=1, retry_backoff_seconds=0.001, fetch_fn=_fake_fetch,
+        train_assemble_fn=_placeholder_assemble,
+    )
+    app = LatentEdgeApp(start_screen=screen)
+
+    async with app.run_test() as pilot:
+        screen._handle_rate_change(0.5)
+        await pilot.pause()
+        stats_text = str(app.screen.query_one("#ingest-stats-body").content)
+
+    assert "0.5/4.0" in stats_text
 
 
 @pytest.mark.asyncio
@@ -562,7 +558,7 @@ async def test_ingest_screen_shows_estimated_final_file_size(tmp_path: Path):
     release_second_chunk = threading.Event()
     call_count = {"n": 0}
 
-    def gated_fetch(pool_address, from_block, to_block, client, rpc_url):
+    def gated_fetch(pool_address, from_block, to_block, client, rpc_url, **kwargs):
         call_count["n"] += 1
         if call_count["n"] > 1:
             release_second_chunk.wait()
@@ -665,7 +661,7 @@ async def test_ingest_screen_resumed_run_with_nothing_left_reaches_full_bar(tmp_
 @pytest.mark.asyncio
 async def test_ingest_screen_logs_error_on_exhausted_retries_without_crashing(tmp_path: Path):
     # A mid-run failure must surface in the log, not crash the app.
-    def always_fails(pool_address, from_block, to_block, client, rpc_url):
+    def always_fails(pool_address, from_block, to_block, client, rpc_url, **kwargs):
         raise RuntimeError("permanent failure")
 
     out_path = tmp_path / "swaps.parquet"
@@ -709,7 +705,7 @@ async def test_ingest_screen_shows_a_plain_language_message_for_a_connection_fai
     # Regression test: a raw httpx exception (errno numbers, internal
     # jargon) must not reach the screen verbatim — it should read like
     # something a person can act on.
-    def connection_refused(pool_address, from_block, to_block, client, rpc_url):
+    def connection_refused(pool_address, from_block, to_block, client, rpc_url, **kwargs):
         raise httpx.ConnectError("[Errno 8] nodename nor servname provided, or not known")
 
     out_path = tmp_path / "swaps.parquet"
@@ -860,7 +856,7 @@ async def test_ingest_screen_train_key_ignored_before_completion(tmp_path: Path)
     # raced against the pilot's own event-loop-idle wait and was flaky.
     release_fetch = threading.Event()
 
-    def gated_fetch(pool_address, from_block, to_block, client, rpc_url):
+    def gated_fetch(pool_address, from_block, to_block, client, rpc_url, **kwargs):
         release_fetch.wait()
         return [_record(from_block)]
 

@@ -17,6 +17,7 @@ from textual.widgets import Static
 from latentedge.ingest.chunked import (
     DEFAULT_CONCURRENCY_COOLDOWN_SECONDS,
     DEFAULT_MAX_RATE_LIMIT_BACKOFF_SECONDS,
+    DEFAULT_MAX_RPS,
     FetchFn,
     IngestCancelled,
 )
@@ -58,6 +59,7 @@ class IngestScreen(Screen[None]):
         max_retries: int,
         retry_backoff_seconds: float,
         train_assemble_fn: TrainAssembleFn,
+        max_rps: float = DEFAULT_MAX_RPS,
         concurrency_cooldown_seconds: float = DEFAULT_CONCURRENCY_COOLDOWN_SECONDS,
         max_rate_limit_backoff_seconds: float = DEFAULT_MAX_RATE_LIMIT_BACKOFF_SECONDS,
         model_out_path: Path = DEFAULT_MODEL_OUT_PATH,
@@ -91,6 +93,7 @@ class IngestScreen(Screen[None]):
         self.rpc_url = rpc_url
         self.chunk_size = chunk_size
         self.max_workers = max_workers
+        self.max_rps = max_rps
         self.flush_every_n_chunks = flush_every_n_chunks
         self.max_retries = max_retries
         self.retry_backoff_seconds = retry_backoff_seconds
@@ -130,7 +133,7 @@ class IngestScreen(Screen[None]):
         self._last_progress_time = self.time_fn()
         self._buffered_count = 0
         self._blocking_chunk_start: int | None = None
-        self._concurrency_limit = max_workers
+        self._rate_limit: float = max_rps
         # Set by request_stop() (ctrl+q) to cooperatively unwind the
         # background ingest thread's worker pool instead of exiting the
         # app immediately — an immediate app.exit() would leave those
@@ -196,7 +199,7 @@ class IngestScreen(Screen[None]):
 
         self._log(
             f"starting: blocks {self.from_block}-{self.to_block}{backfill_note}, chunk_size={self.chunk_size}, "
-            f"max_workers={self.max_workers}, concurrency_cooldown_seconds={self.concurrency_cooldown_seconds} "
+            f"max_workers={self.max_workers}, max_rps={self.max_rps}, concurrency_cooldown_seconds={self.concurrency_cooldown_seconds} "
             f"— full log at {self.log_path}"
         )
         self.run_worker(self._run_ingest, thread=True, exclusive=True)
@@ -220,8 +223,8 @@ class IngestScreen(Screen[None]):
         def on_worker_status(slot: int, chunk_start: int, chunk_end: int, status: str) -> None:
             self.app.call_from_thread(self._handle_worker_status, slot, chunk_start, chunk_end, status)
 
-        def on_concurrency_change(new_limit: int) -> None:
-            self.app.call_from_thread(self._handle_concurrency_change, new_limit)
+        def on_rate_change(new_rate: float) -> None:
+            self.app.call_from_thread(self._handle_rate_change, new_rate)
 
         try:
             with self.client_factory() as client:
@@ -230,13 +233,13 @@ class IngestScreen(Screen[None]):
                     client, self.rpc_url,
                     chunk_size=self.chunk_size, max_retries=self.max_retries,
                     retry_backoff_seconds=self.retry_backoff_seconds,
-                    max_workers=self.max_workers,
+                    max_workers=self.max_workers, max_rps=self.max_rps,
                     flush_every_n_chunks=self.flush_every_n_chunks,
                     concurrency_cooldown_seconds=self.concurrency_cooldown_seconds,
                     max_rate_limit_backoff_seconds=self.max_rate_limit_backoff_seconds,
                     on_progress=on_progress, on_retry=on_retry,
                     on_queue_status=on_queue_status, on_worker_status=on_worker_status,
-                    on_concurrency_change=on_concurrency_change,
+                    on_rate_change=on_rate_change,
                     fetch_fn=self.fetch_fn,
                     cancel_event=self._cancel_event,
                 )
@@ -292,10 +295,10 @@ class IngestScreen(Screen[None]):
         self._blocking_chunk_start = blocking_chunk_start
         self._refresh_disk_stats()
 
-    def _handle_concurrency_change(self, new_limit: int) -> None:
-        direction = "throttled down to" if new_limit < self._concurrency_limit else "raised to"
-        self._concurrency_limit = new_limit
-        self._log(f"concurrency {direction} {new_limit}/{self.max_workers}")
+    def _handle_rate_change(self, new_rate: float) -> None:
+        direction = "throttled down to" if new_rate < self._rate_limit else "raised to"
+        self._rate_limit = new_rate
+        self._log(f"rate {direction} {new_rate:.1f}/{self.max_rps:.1f} req/s")
         self._refresh_disk_stats()
 
     def _handle_worker_status(self, slot: int, chunk_start: int, chunk_end: int, status: str) -> None:
@@ -303,10 +306,6 @@ class IngestScreen(Screen[None]):
             detail = "[dim]○ idle[/dim]"
         elif status == "fetching":
             detail = f"[green]● blocks {chunk_start}-{chunk_end} — fetching[/green]"
-        elif status == "waiting":
-            # Blocked on the concurrency gate, not the network — the
-            # visible sign the auto-throttle is actually doing something.
-            detail = f"[cyan]◐ blocks {chunk_start}-{chunk_end} — waiting for a free slot[/cyan]"
         else:
             detail = f"[yellow]● blocks {chunk_start}-{chunk_end} — {status}[/yellow]"
         self.query_one("#ingest-threads", ThreadPanel).update_worker(slot, detail)
@@ -322,10 +321,10 @@ class IngestScreen(Screen[None]):
             else "0"
         )
         retries = f"[yellow]{self.retry_count}[/yellow]" if self.retry_count > 0 else "0"
-        concurrency = (
-            f"[yellow]{self._concurrency_limit}/{self.max_workers}[/yellow]"
-            if self._concurrency_limit < self.max_workers
-            else f"{self._concurrency_limit}/{self.max_workers}"
+        rate = (
+            f"[yellow]{self._rate_limit:.1f}/{self.max_rps:.1f} req/s[/yellow]"
+            if self._rate_limit < self.max_rps
+            else f"{self._rate_limit:.1f}/{self.max_rps:.1f} req/s"
         )
         self.query_one("#ingest-stats", StatsPanel).update_stats([
             ("File size", f"{file_size / 1_048_576:.1f} MB"),
@@ -334,7 +333,7 @@ class IngestScreen(Screen[None]):
             ("Retries", retries),
             ("Stalled", stalled),
             ("Buffered", buffered),
-            ("Concurrency", concurrency),
+            ("Rate", rate),
         ])
 
     def _format_estimated_final_size(self, file_size: int) -> str:
@@ -426,7 +425,7 @@ class IngestScreen(Screen[None]):
         return IngestScreen(
             pool_address=self.pool_address, from_block=from_block, to_block=to_block,
             out_path=self.out_path, client_factory=self.client_factory, rpc_url=self.rpc_url,
-            chunk_size=self.chunk_size, max_workers=self.max_workers,
+            chunk_size=self.chunk_size, max_workers=self.max_workers, max_rps=self.max_rps,
             flush_every_n_chunks=self.flush_every_n_chunks, max_retries=self.max_retries,
             retry_backoff_seconds=self.retry_backoff_seconds, train_assemble_fn=self.train_assemble_fn,
             concurrency_cooldown_seconds=self.concurrency_cooldown_seconds,
