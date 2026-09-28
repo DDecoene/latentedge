@@ -65,6 +65,17 @@ MIN_CLIMB_FACTOR = 1.01
 INITIAL_BACKOFF_FRACTION = 0.5
 MIN_BACKOFF_FRACTION = 0.1
 BACKOFF_FRACTION_DECAY = 0.7
+# The gentling fallback above still conflated two different situations: a
+# genuinely fresh limiter with zero evidence (a big first cut is the right
+# move), and a limiter that has already climbed successfully at least
+# once and is now getting throttled again right at its last proven point
+# (no successful climb happened in between) — the edge is close, evidenced
+# by 8.3 -> 5.4 in a real run instead of the expected 8.3 -> 8.2 -> 8.1.
+# Once any climb has ever succeeded, a throttle with nothing strictly
+# lower to revert to should nudge down by a small fixed fraction instead —
+# repeated small multiplicative steps naturally shrink in absolute size as
+# the rate falls, without needing their own decay schedule.
+FINE_STEP_FRACTION = 0.02
 
 ReleaseOutcome = Literal["success", "failed", "rate_limited"]
 
@@ -177,7 +188,19 @@ class RateLimiter:
                         self._climb_factor = max(
                             MIN_CLIMB_FACTOR, 1.0 + (self._climb_factor - 1.0) * CLIMB_FACTOR_DECAY
                         )
+                    elif self._last_stable_rate is not None:
+                        # Already proven a climb before, just not one
+                        # strictly below the current rate — we're right at
+                        # the edge, so probe down in a small step rather
+                        # than slashing back toward the last big cut.
+                        candidate = max(DEFAULT_MIN_RPS, self._rate * (1.0 - FINE_STEP_FRACTION))
+                        self._climb_factor = max(
+                            MIN_CLIMB_FACTOR, 1.0 + (self._climb_factor - 1.0) * CLIMB_FACTOR_DECAY
+                        )
                     else:
+                        # No evidence at all yet — the very first throttle
+                        # before any successful climb. A big first cut is
+                        # the right move here.
                         candidate = max(DEFAULT_MIN_RPS, self._rate * (1.0 - self._backoff_fraction))
                         self._backoff_fraction = max(
                             MIN_BACKOFF_FRACTION, self._backoff_fraction * BACKOFF_FRACTION_DECAY

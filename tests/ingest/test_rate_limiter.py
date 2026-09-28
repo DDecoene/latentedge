@@ -151,11 +151,10 @@ def test_limiter_halves_on_the_first_throttle_with_no_known_good_rate_proven_yet
     assert limiter.rate == pytest.approx(2.0)
 
 
-def test_limiter_gentles_the_fallback_cut_on_repeated_throttles_without_an_intervening_climb():
-    # Regression test: a burst of throttles hitting a rate that was
-    # already reverted to its last known-good point (no successful climb
-    # happened in between, so there's still no *lower* proven point to
-    # revert to) used to fall back to a flat halving every single time —
+def test_limiter_gentles_the_fallback_cut_on_repeated_throttles_with_zero_evidence():
+    # Regression test: a burst of throttles hitting a fresh limiter that
+    # has never once climbed successfully (zero evidence of any safe
+    # rate) used to fall back to a flat halving every single time —
     # sawing the rate down hard on every throttle in the burst instead of
     # converging. The fallback cut must gentle with each consecutive
     # throttle like this, not repeat the same aggressive halving forever.
@@ -167,6 +166,26 @@ def test_limiter_gentles_the_fallback_cut_on_repeated_throttles_without_an_inter
     second_rate = limiter.rate
     limiter.release("rate_limited")  # third: gentler still
     assert limiter.rate > second_rate * 0.5  # nowhere near another halving
+
+
+def test_limiter_steps_down_finely_once_throttled_right_at_a_previously_proven_rate():
+    # Regression test for a real run: rate climbed cleanly to 8.3, then a
+    # throttle dropped it straight to 5.4 (a ~35% cut) instead of easing
+    # down toward the edge (8.3 -> ~8.2 -> ~8.1 -> ...). Once at least one
+    # climb has ever succeeded, getting throttled with nothing *strictly
+    # lower* proven (i.e. right at the last proven rate, since nothing
+    # climbed further since the last revert) means the edge is close —
+    # the response must be a small step down, not the same big cut used
+    # for a totally fresh limiter with zero evidence.
+    limiter = RateLimiter(ceiling=100.0, start_rate=5.0, successes_before_increase=1, cooldown_seconds=0)
+    limiter.release("success")  # last-known-good 5.0, rate -> 5.5
+    limiter.release("rate_limited")  # reverts to 5.0 (known-good), climb factor narrows
+
+    # No successful climb has happened since the revert — last_stable_rate
+    # (5.0) now equals the current rate (5.0), so this is the "right at
+    # the edge" case, not a fresh-limiter one.
+    limiter.release("rate_limited")
+    assert limiter.rate == pytest.approx(5.0 * (1 - 0.02))  # a small 2% step, not another big cut
 
 
 def test_limiter_raises_its_own_ceiling_after_a_long_clean_streak_at_it():
