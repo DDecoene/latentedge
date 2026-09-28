@@ -113,6 +113,45 @@ def test_limiter_gradually_decays_the_backed_off_success_threshold_across_climbs
     assert changes == [pytest.approx(605.0)]  # 550.0 * 1.1
 
 
+def test_limiter_reverts_to_the_last_known_good_rate_instead_of_halving_after_a_proven_climb():
+    # Regression test: falling back to a flat half of whatever rate just
+    # got throttled (6.655 / 2 =~ 3.33) undershoots a level (6.05) that
+    # was proven to work moments earlier. The limiter must fall back to
+    # that known-good rate instead.
+    limiter = RateLimiter(ceiling=100.0, start_rate=5.0, successes_before_increase=1, cooldown_seconds=0)
+    limiter.release("success")  # last-known-good 5.0, rate -> 5.5
+    limiter.release("success")  # last-known-good 5.5, rate -> 6.05
+    limiter.release("success")  # last-known-good 6.05, rate -> 6.655
+    limiter.release("rate_limited")
+    assert limiter.rate == pytest.approx(6.05)
+
+
+def test_limiter_climbs_more_cautiously_after_reverting_to_a_known_good_rate():
+    # Regression test: after overshooting a known-good rate and reverting
+    # to it, the next climb step must be smaller than RATE_CLIMB_FACTOR —
+    # repeated approaches to the same danger zone should get more
+    # cautious, dampening the oscillation instead of repeating it at the
+    # same amplitude forever.
+    limiter = RateLimiter(ceiling=1000.0, start_rate=5.0, successes_before_increase=1, cooldown_seconds=0)
+    limiter.release("success")  # rate 5.0 -> 5.5
+    limiter.release("rate_limited")  # reverts to 5.0 (known-good), climb factor 1.1 -> 1.05
+
+    # successes_before_increase backed off from 1 to 1.5 by the throttle above.
+    limiter.release("success")  # consecutive 1, below 1.5
+    limiter.release("success")  # consecutive 2, clears it — climbs at the narrowed factor
+    assert limiter.rate == pytest.approx(5.0 * 1.05)
+
+
+def test_limiter_still_halves_when_no_known_good_rate_has_been_proven_yet():
+    # The revert-to-known-good path only applies once a climb has actually
+    # proven a lower rate was safe — a fresh limiter (or one that keeps
+    # getting throttled at or below its last known-good point) has no such
+    # evidence yet and must fall back to plain halving.
+    limiter = RateLimiter(ceiling=4.0, cooldown_seconds=0)
+    limiter.release("rate_limited")
+    assert limiter.rate == pytest.approx(2.0)
+
+
 def test_limiter_raises_its_own_ceiling_after_a_long_clean_streak_at_it():
     # successes_before_increase=1 -> ceiling_raise_successes = 5. Rate
     # starts at the ceiling (no start_rate given), so every success from

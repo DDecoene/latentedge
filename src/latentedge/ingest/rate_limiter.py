@@ -41,6 +41,17 @@ MAX_SUCCESSES_BEFORE_INCREASE = 100
 # no hard upper bound required.
 CEILING_RAISE_SUCCESS_MULTIPLIER = 5
 CEILING_RAISE_FACTOR = 1.5
+# Falling back to a flat half of whatever rate just got throttled can
+# undershoot a level that was proven to work moments earlier — reverting
+# to the last rate that survived a full climb-success-streak keeps
+# recovery close to the real limit instead of needlessly crawling back up
+# from far below it. Each time that known-good rate gets overshot again,
+# the climb step itself is narrowed (never below MIN_CLIMB_FACTOR) so
+# repeated approaches to the same danger zone get more cautious and the
+# oscillation converges instead of repeating at the same amplitude
+# forever.
+CLIMB_FACTOR_DECAY = 0.5
+MIN_CLIMB_FACTOR = 1.01
 
 ReleaseOutcome = Literal["success", "failed", "rate_limited"]
 
@@ -73,6 +84,11 @@ class RateLimiter:
         self._on_change = on_change
         self._on_ceiling_change = on_ceiling_change
         self._rate = max(DEFAULT_MIN_RPS, min(start_rate, self._ceiling)) if start_rate else self._ceiling
+        # The rate right before its most recent proven climb — the last
+        # value known to have survived a full success streak, so a real
+        # throttle can fall back to it instead of halving blindly.
+        self._last_stable_rate: float | None = None
+        self._climb_factor = RATE_CLIMB_FACTOR
         self._consecutive_successes = 0
         self._consecutive_successes_at_ceiling = 0
         self._cooldown_until = 0.0
@@ -142,7 +158,13 @@ class RateLimiter:
                     self._consecutive_successes = 0
                     self._cooldown_until = now + self._cooldown_seconds
                 else:
-                    candidate = max(DEFAULT_MIN_RPS, self._rate / 2)
+                    if self._last_stable_rate is not None and self._last_stable_rate < self._rate:
+                        candidate = max(DEFAULT_MIN_RPS, self._last_stable_rate)
+                        self._climb_factor = max(
+                            MIN_CLIMB_FACTOR, 1.0 + (self._climb_factor - 1.0) * CLIMB_FACTOR_DECAY
+                        )
+                    else:
+                        candidate = max(DEFAULT_MIN_RPS, self._rate / 2)
                     if candidate != self._rate:
                         self._rate = candidate
                         new_rate = candidate
@@ -160,7 +182,8 @@ class RateLimiter:
                 if self._rate < self._ceiling:
                     self._consecutive_successes_at_ceiling = 0
                     if self._consecutive_successes >= self._successes_before_increase:
-                        self._rate = min(self._rate * RATE_CLIMB_FACTOR, self._ceiling)
+                        self._last_stable_rate = self._rate
+                        self._rate = min(self._rate * self._climb_factor, self._ceiling)
                         new_rate = self._rate
                         self._consecutive_successes = 0
                         self._successes_before_increase = max(
