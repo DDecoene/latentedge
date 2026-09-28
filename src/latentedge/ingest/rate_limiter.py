@@ -30,6 +30,17 @@ RATE_CLIMB_FACTOR = 1.1
 RECOVERY_THRESHOLD_BACKOFF = 1.5
 RECOVERY_THRESHOLD_DECAY = 2.0
 MAX_SUCCESSES_BEFORE_INCREASE = 100
+# A fixed ceiling only protects against a limit nobody has measured — it
+# can't tell you the real one is higher. Once the rate has been sitting
+# cleanly *at* the ceiling for a long streak (no 429s at all, not even
+# ones that got absorbed into a cooldown), the ceiling itself is raised so
+# the climb logic keeps probing upward. If a 429 does eventually land near
+# the new ceiling, the rate settles into equilibrium below it (halving on
+# 429, climbing on success) and is no longer "at ceiling" — so the raise
+# streak never restarts and the search self-terminates at the real limit,
+# no hard upper bound required.
+CEILING_RAISE_SUCCESS_MULTIPLIER = 5
+CEILING_RAISE_FACTOR = 1.5
 
 ReleaseOutcome = Literal["success", "failed", "rate_limited"]
 
@@ -52,14 +63,18 @@ class RateLimiter:
         cooldown_seconds: float = DEFAULT_COOLDOWN_SECONDS,
         start_rate: float | None = None,
         on_change: Callable[[float], None] | None = None,
+        on_ceiling_change: Callable[[float], None] | None = None,
     ) -> None:
         self._ceiling = max(DEFAULT_MIN_RPS, ceiling)
         self._base_successes_before_increase = successes_before_increase
         self._successes_before_increase: float = successes_before_increase
+        self._ceiling_raise_successes = successes_before_increase * CEILING_RAISE_SUCCESS_MULTIPLIER
         self._cooldown_seconds = cooldown_seconds
         self._on_change = on_change
+        self._on_ceiling_change = on_ceiling_change
         self._rate = max(DEFAULT_MIN_RPS, min(start_rate, self._ceiling)) if start_rate else self._ceiling
         self._consecutive_successes = 0
+        self._consecutive_successes_at_ceiling = 0
         self._cooldown_until = 0.0
         self._next_allowed_time = time.monotonic()
         self._cond = threading.Condition()
@@ -68,6 +83,11 @@ class RateLimiter:
     def rate(self) -> float:
         with self._cond:
             return self._rate
+
+    @property
+    def ceiling(self) -> float:
+        with self._cond:
+            return self._ceiling
 
     def acquire(self, cancel_event: threading.Event | None = None) -> None:
         """Block until this call's scheduled slot arrives and any
@@ -104,6 +124,7 @@ class RateLimiter:
         anywhere that could consume one.
         """
         new_rate: float | None = None
+        new_ceiling: float | None = None
         with self._cond:
             if outcome == "rate_limited":
                 now = time.monotonic()
@@ -116,6 +137,7 @@ class RateLimiter:
                 # folded into that same event: it extends the cooldown
                 # (the burst may still be landing) without compounding the
                 # rate cut or the threshold backoff again.
+                self._consecutive_successes_at_ceiling = 0
                 if now < self._cooldown_until:
                     self._consecutive_successes = 0
                     self._cooldown_until = now + self._cooldown_seconds
@@ -132,16 +154,30 @@ class RateLimiter:
                     self._cooldown_until = now + self._cooldown_seconds
             elif outcome == "failed":
                 self._consecutive_successes = 0
+                self._consecutive_successes_at_ceiling = 0
             else:
                 self._consecutive_successes += 1
-                if self._consecutive_successes >= self._successes_before_increase and self._rate < self._ceiling:
-                    self._rate = min(self._rate * RATE_CLIMB_FACTOR, self._ceiling)
-                    new_rate = self._rate
-                    self._consecutive_successes = 0
-                    self._successes_before_increase = max(
-                        self._successes_before_increase - RECOVERY_THRESHOLD_DECAY,
-                        self._base_successes_before_increase,
-                    )
+                if self._rate < self._ceiling:
+                    self._consecutive_successes_at_ceiling = 0
+                    if self._consecutive_successes >= self._successes_before_increase:
+                        self._rate = min(self._rate * RATE_CLIMB_FACTOR, self._ceiling)
+                        new_rate = self._rate
+                        self._consecutive_successes = 0
+                        self._successes_before_increase = max(
+                            self._successes_before_increase - RECOVERY_THRESHOLD_DECAY,
+                            self._base_successes_before_increase,
+                        )
+                else:
+                    # Already at the ceiling with nothing knocking it back
+                    # down — a long enough clean streak here means there's
+                    # probably real headroom above it.
+                    self._consecutive_successes_at_ceiling += 1
+                    if self._consecutive_successes_at_ceiling >= self._ceiling_raise_successes:
+                        self._ceiling = self._ceiling * CEILING_RAISE_FACTOR
+                        new_ceiling = self._ceiling
+                        self._consecutive_successes_at_ceiling = 0
             self._cond.notify_all()
         if new_rate is not None and self._on_change is not None:
             self._on_change(new_rate)
+        if new_ceiling is not None and self._on_ceiling_change is not None:
+            self._on_ceiling_change(new_ceiling)

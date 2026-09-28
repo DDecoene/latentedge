@@ -6,9 +6,11 @@ from latentedge.ingest.progress import (
     extend_window_for_new_blocks,
     internal_gaps,
     read_progress,
+    read_rate_ceiling,
     read_rate_limit,
     uncovered_gaps,
     write_progress,
+    write_rate_ceiling,
     write_rate_limit,
 )
 from latentedge.schema import SwapRecord
@@ -54,6 +56,28 @@ def test_write_then_read_rate_limit_round_trips(tmp_path: Path):
     out_path = tmp_path / "swaps.parquet"
     write_rate_limit(out_path, 3.5)
     assert read_rate_limit(out_path) == 3.5
+
+
+def test_read_rate_ceiling_returns_none_when_no_file_exists(tmp_path: Path):
+    assert read_rate_ceiling(tmp_path / "swaps.parquet") is None
+
+
+def test_write_then_read_rate_ceiling_round_trips(tmp_path: Path):
+    out_path = tmp_path / "swaps.parquet"
+    write_rate_ceiling(out_path, 12.5)
+    assert read_rate_ceiling(out_path) == 12.5
+
+
+def test_rate_and_ceiling_are_independently_writable_without_clobbering_each_other(tmp_path: Path):
+    out_path = tmp_path / "swaps.parquet"
+    write_rate_limit(out_path, 3.5)
+    write_rate_ceiling(out_path, 12.5)
+    assert read_rate_limit(out_path) == 3.5
+    assert read_rate_ceiling(out_path) == 12.5
+
+    write_rate_limit(out_path, 4.0)
+    assert read_rate_limit(out_path) == 4.0
+    assert read_rate_ceiling(out_path) == 12.5
 
 
 def test_add_interval_merges_overlapping_ranges():

@@ -30,9 +30,11 @@ from latentedge.ingest.progress import (
     Interval,
     add_interval,
     read_progress,
+    read_rate_ceiling,
     read_rate_limit,
     uncovered_gaps,
     write_progress,
+    write_rate_ceiling,
     write_rate_limit,
 )
 from latentedge.ingest.rpc_logs import RateLimitError, fetch_swaps
@@ -185,6 +187,7 @@ def ingest_range(
     on_queue_status: Callable[[int, int | None], None] | None = None,
     on_worker_status: Callable[[int, int, int, str], None] | None = None,
     on_rate_change: Callable[[float], None] | None = None,
+    on_ceiling_change: Callable[[float], None] | None = None,
     fetch_fn: FetchFn = fetch_swaps,
     cancel_event: threading.Event | None = None,
 ) -> int:
@@ -246,23 +249,31 @@ def ingest_range(
         chunks_since_flush = 0
 
     persisted_rate = read_rate_limit(out_path)
+    persisted_ceiling = read_rate_ceiling(out_path)
+    # A self-raised ceiling from a prior run is real, measured headroom —
+    # never resume below the config default even if it's somehow higher
+    # (e.g. LATENTEDGE_INGEST_MAX_RPS was raised since that run).
+    ceiling = max(persisted_ceiling, max_rps) if persisted_ceiling is not None else max_rps
     # A floor, not a fixed resume point — see RateLimiter's docstring and
     # AdaptiveConcurrencyLimiter's history for why: never resume below
     # half the ceiling regardless of how low a prior run bottomed out.
-    start_rate = max(persisted_rate, max_rps / 2) if persisted_rate is not None else None
+    start_rate = max(persisted_rate, ceiling / 2) if persisted_rate is not None else None
     rate_limiter = RateLimiter(
-        ceiling=max_rps,
+        ceiling=ceiling,
         cooldown_seconds=concurrency_cooldown_seconds,
         start_rate=start_rate,
         on_change=on_rate_change,
+        on_ceiling_change=on_ceiling_change,
     )
-    # A resumed run can start below max_rps (the floor-clamped persisted
-    # rate above) — without this, a caller (e.g. the TUI) has no way to
-    # know the actual starting point and would assume the ceiling,
-    # misreporting both the rate and the direction of the first real
-    # adjustment.
-    if on_rate_change is not None and rate_limiter.rate != max_rps:
+    # A resumed run can start below its ceiling (the floor-clamped
+    # persisted rate above), or with a ceiling already raised past
+    # max_rps — without this, a caller (e.g. the TUI) has no way to know
+    # either actual starting point and would assume the config defaults,
+    # misreporting the rate, its direction of change, and the ceiling.
+    if on_rate_change is not None and rate_limiter.rate != ceiling:
         on_rate_change(rate_limiter.rate)
+    if on_ceiling_change is not None and rate_limiter.ceiling != max_rps:
+        on_ceiling_change(rate_limiter.ceiling)
 
     worker_slots: dict[int, int] = {}
     slots_lock = threading.Lock()
@@ -363,10 +374,11 @@ def ingest_range(
             with lock:
                 flush()
             # Persisted regardless of whether this run finished cleanly
-            # or was cut short — whatever rate the limiter actually
-            # settled at is the useful starting point for a resume,
-            # not just the happy-path ending level.
+            # or was cut short — whatever rate/ceiling the limiter
+            # actually settled at is the useful starting point for a
+            # resume, not just the happy-path ending level.
             write_rate_limit(out_path, rate_limiter.rate)
+            write_rate_ceiling(out_path, rate_limiter.ceiling)
 
     if cancelled:
         raise IngestCancelled(total_written)

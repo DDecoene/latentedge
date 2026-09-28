@@ -66,9 +66,12 @@ def test_limiter_climbs_gently_after_enough_consecutive_successes():
     assert limiter.rate == pytest.approx(2.2)
 
 
-def test_limiter_never_exceeds_its_ceiling():
+def test_limiter_never_exceeds_its_current_ceiling():
+    # 4 successes stays under the ceiling-raise threshold (successes_before_increase=1
+    # * CEILING_RAISE_SUCCESS_MULTIPLIER=5), isolating this assertion from the
+    # self-raising-ceiling behavior covered separately below.
     limiter = RateLimiter(ceiling=2.0, successes_before_increase=1, cooldown_seconds=0)
-    for _ in range(20):
+    for _ in range(4):
         limiter.release("success")
     assert limiter.rate == pytest.approx(2.0)
 
@@ -108,6 +111,64 @@ def test_limiter_gradually_decays_the_backed_off_success_threshold_across_climbs
     assert changes == []  # 12 < 13
     limiter.release("success")  # 13th clears it
     assert changes == [pytest.approx(605.0)]  # 550.0 * 1.1
+
+
+def test_limiter_raises_its_own_ceiling_after_a_long_clean_streak_at_it():
+    # successes_before_increase=1 -> ceiling_raise_successes = 5. Rate
+    # starts at the ceiling (no start_rate given), so every success from
+    # the first one lands in the "already at ceiling" branch.
+    ceiling_changes: list[float] = []
+    limiter = RateLimiter(
+        ceiling=2.0, successes_before_increase=1, cooldown_seconds=0,
+        on_ceiling_change=ceiling_changes.append,
+    )
+    for _ in range(4):
+        limiter.release("success")
+    assert ceiling_changes == []
+    assert limiter.ceiling == 2.0
+    limiter.release("success")  # 5th clean success at the ceiling
+    assert ceiling_changes == [pytest.approx(3.0)]  # 2.0 * CEILING_RAISE_FACTOR (1.5)
+    assert limiter.ceiling == pytest.approx(3.0)
+
+
+def test_limiter_resumes_climbing_toward_a_newly_raised_ceiling():
+    limiter = RateLimiter(ceiling=2.0, successes_before_increase=1, cooldown_seconds=0)
+    for _ in range(5):
+        limiter.release("success")  # raises ceiling to 3.0, rate still 2.0
+    assert limiter.rate == pytest.approx(2.0)
+    assert limiter.ceiling == pytest.approx(3.0)
+    limiter.release("success")  # rate is now below the new ceiling — climbs again
+    assert limiter.rate == pytest.approx(2.2)
+
+
+def test_limiter_stops_raising_the_ceiling_once_a_real_rate_limit_creates_equilibrium_below_it():
+    # A rate limit near the ceiling knocks the rate below it — the
+    # at-ceiling streak must not have survived that, so a caller that
+    # merely oscillates around the new, lower equilibrium never
+    # re-triggers a ceiling raise from a handful of ordinary successes.
+    ceiling_changes: list[float] = []
+    limiter = RateLimiter(
+        ceiling=2.0, successes_before_increase=1, cooldown_seconds=0,
+        on_ceiling_change=ceiling_changes.append,
+    )
+    for _ in range(4):
+        limiter.release("success")  # 4 clean successes at the ceiling, 1 short of raising
+    limiter.release("rate_limited")  # knocks the rate down, resets the at-ceiling streak
+    for _ in range(4):
+        limiter.release("success")  # climbs back toward 2.0 but doesn't reach/hold it yet
+    assert ceiling_changes == []
+
+
+def test_limiter_never_raises_the_ceiling_while_still_climbing_toward_it():
+    ceiling_changes: list[float] = []
+    limiter = RateLimiter(
+        ceiling=1000.0, start_rate=1.0, successes_before_increase=1, cooldown_seconds=0,
+        on_ceiling_change=ceiling_changes.append,
+    )
+    for _ in range(50):
+        limiter.release("success")  # 1.0 * 1.1**50 =~ 117.4, still well below the ceiling
+    assert ceiling_changes == []
+    assert limiter.ceiling == 1000.0
 
 
 def test_limiter_starts_from_a_persisted_rate_instead_of_the_ceiling():

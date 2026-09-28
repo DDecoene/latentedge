@@ -19,20 +19,50 @@ def _rate_path(out_path: Path) -> Path:
     return Path(str(out_path) + ".rate.json")
 
 
+def _read_rate_state(out_path: Path) -> dict:
+    path = _rate_path(out_path)
+    if not path.exists():
+        return {}
+    return json.loads(path.read_text())
+
+
+def _write_rate_state(out_path: Path, **updates: float) -> None:
+    # Read-modify-write rather than overwrite — rate and ceiling are
+    # written independently (chunked.py persists both at the end of a
+    # run), and each write must not clobber whichever field it isn't
+    # updating.
+    state = _read_rate_state(out_path)
+    state.update(updates)
+    _rate_path(out_path).write_text(json.dumps(state))
+
+
 def read_rate_limit(out_path: Path) -> float | None:
     """The req/s rate a prior ingest_range run settled on for this output
     file, if any — lets a resumed run start from a rate already known to
     avoid rate limiting instead of the full ceiling (which just re-earns
     the same throttle-down again).
     """
-    path = _rate_path(out_path)
-    if not path.exists():
-        return None
-    return float(json.loads(path.read_text())["rate"])
+    state = _read_rate_state(out_path)
+    return float(state["rate"]) if "rate" in state else None
 
 
 def write_rate_limit(out_path: Path, rate: float) -> None:
-    _rate_path(out_path).write_text(json.dumps({"rate": rate}))
+    _write_rate_state(out_path, rate=rate)
+
+
+def read_rate_ceiling(out_path: Path) -> float | None:
+    """The req/s ceiling a prior ingest_range run discovered for this
+    output file, if any — a self-raised ceiling from sustained clean
+    throughput is real, measured headroom; a fresh run should resume
+    probing from there rather than re-discovering it from the config
+    default every time.
+    """
+    state = _read_rate_state(out_path)
+    return float(state["ceiling"]) if "ceiling" in state else None
+
+
+def write_rate_ceiling(out_path: Path, ceiling: float) -> None:
+    _write_rate_state(out_path, ceiling=ceiling)
 
 
 def read_progress(out_path: Path) -> list[Interval]:

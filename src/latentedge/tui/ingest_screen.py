@@ -134,6 +134,11 @@ class IngestScreen(Screen[None]):
         self._buffered_count = 0
         self._blocking_chunk_start: int | None = None
         self._rate_limit: float = max_rps
+        # Tracks the limiter's own ceiling, which can self-raise above
+        # max_rps (the config default) once it proves there's real
+        # headroom — distinct from self.max_rps, which never changes and
+        # is only ever the starting point passed into ingest_fn.
+        self._rate_ceiling: float = max_rps
         # Set by request_stop() (ctrl+q) to cooperatively unwind the
         # background ingest thread's worker pool instead of exiting the
         # app immediately — an immediate app.exit() would leave those
@@ -226,6 +231,9 @@ class IngestScreen(Screen[None]):
         def on_rate_change(new_rate: float) -> None:
             self.app.call_from_thread(self._handle_rate_change, new_rate)
 
+        def on_ceiling_change(new_ceiling: float) -> None:
+            self.app.call_from_thread(self._handle_ceiling_change, new_ceiling)
+
         try:
             with self.client_factory() as client:
                 total = self.ingest_fn(
@@ -239,7 +247,7 @@ class IngestScreen(Screen[None]):
                     max_rate_limit_backoff_seconds=self.max_rate_limit_backoff_seconds,
                     on_progress=on_progress, on_retry=on_retry,
                     on_queue_status=on_queue_status, on_worker_status=on_worker_status,
-                    on_rate_change=on_rate_change,
+                    on_rate_change=on_rate_change, on_ceiling_change=on_ceiling_change,
                     fetch_fn=self.fetch_fn,
                     cancel_event=self._cancel_event,
                 )
@@ -298,7 +306,12 @@ class IngestScreen(Screen[None]):
     def _handle_rate_change(self, new_rate: float) -> None:
         direction = "throttled down to" if new_rate < self._rate_limit else "raised to"
         self._rate_limit = new_rate
-        self._log(f"rate {direction} {new_rate:.1f}/{self.max_rps:.1f} req/s")
+        self._log(f"rate {direction} {new_rate:.1f}/{self._rate_ceiling:.1f} req/s")
+        self._refresh_disk_stats()
+
+    def _handle_ceiling_change(self, new_ceiling: float) -> None:
+        self._rate_ceiling = new_ceiling
+        self._log(f"ceiling raised to {new_ceiling:.1f} req/s — real headroom found above the starting default")
         self._refresh_disk_stats()
 
     def _handle_worker_status(self, slot: int, chunk_start: int, chunk_end: int, status: str) -> None:
@@ -322,9 +335,9 @@ class IngestScreen(Screen[None]):
         )
         retries = f"[yellow]{self.retry_count}[/yellow]" if self.retry_count > 0 else "0"
         rate = (
-            f"[yellow]{self._rate_limit:.1f}/{self.max_rps:.1f} req/s[/yellow]"
-            if self._rate_limit < self.max_rps
-            else f"{self._rate_limit:.1f}/{self.max_rps:.1f} req/s"
+            f"[yellow]{self._rate_limit:.1f}/{self._rate_ceiling:.1f} req/s[/yellow]"
+            if self._rate_limit < self._rate_ceiling
+            else f"{self._rate_limit:.1f}/{self._rate_ceiling:.1f} req/s"
         )
         self.query_one("#ingest-stats", StatsPanel).update_stats([
             ("File size", f"{file_size / 1_048_576:.1f} MB"),

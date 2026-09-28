@@ -6,7 +6,14 @@ import httpx
 import pytest
 
 from latentedge.ingest.chunked import IngestCancelled, ingest_range
-from latentedge.ingest.progress import read_progress, read_rate_limit, write_progress, write_rate_limit
+from latentedge.ingest.progress import (
+    read_progress,
+    read_rate_ceiling,
+    read_rate_limit,
+    write_progress,
+    write_rate_ceiling,
+    write_rate_limit,
+)
 from latentedge.ingest.rpc_logs import RateLimitError, RpcLogsError
 from latentedge.schema import SwapRecord
 from latentedge.store import read_swaps
@@ -751,6 +758,65 @@ def test_ingest_range_reports_the_actual_starting_rate_when_resuming_below_the_c
     # floor-clamped to max_rps/2) — a caller must be told this starting
     # point immediately, not left assuming the run started at the ceiling.
     assert seen_rates[0] == 2.0
+
+
+def test_ingest_range_self_raises_and_persists_its_ceiling(tmp_path: Path):
+    out_path = tmp_path / "swaps.parquet"
+
+    def fake_fetch(pool_address, from_block, to_block, client, rpc_url, rate_limiter=None, **kwargs):
+        if rate_limiter is not None:
+            # Simulate a long clean streak at the ceiling in one chunk
+            # rather than needing hundreds of real chunks to accumulate
+            # it (DEFAULT_SUCCESSES_BEFORE_INCREASE=20 * the ceiling-raise
+            # multiplier of 5 = 100 consecutive successes at the ceiling).
+            for _ in range(150):
+                rate_limiter.release("success")
+        return [_record(from_block, 0)]
+
+    ceiling_changes: list[float] = []
+
+    def on_ceiling_change(new_ceiling: float) -> None:
+        ceiling_changes.append(new_ceiling)
+
+    with httpx.Client() as client:
+        ingest_range(
+            pool_address="0xpool", from_block=0, to_block=9, out_path=out_path,
+            client=client, rpc_url="http://fake", chunk_size=10, max_workers=1,
+            max_rps=4.0, fetch_fn=fake_fetch, concurrency_cooldown_seconds=0,
+            on_ceiling_change=on_ceiling_change,
+        )
+
+    # 4.0 * CEILING_RAISE_FACTOR (1.5) after the 100th clean success at
+    # the ceiling — real, measured headroom above the conservative
+    # config default, not a value anyone had to guess up front.
+    assert ceiling_changes == [pytest.approx(6.0)]
+    assert read_rate_ceiling(out_path) == pytest.approx(6.0)
+
+
+def test_ingest_range_resumes_using_a_previously_self_raised_ceiling(tmp_path: Path):
+    out_path = tmp_path / "swaps.parquet"
+    write_rate_ceiling(out_path, 8.0)  # a prior run discovered real headroom above the 4.0 default
+
+    def fake_fetch(pool_address, from_block, to_block, client, rpc_url, **kwargs):
+        return [_record(from_block, 0)]
+
+    seen_ceilings: list[float] = []
+
+    def on_ceiling_change(new_ceiling: float) -> None:
+        seen_ceilings.append(new_ceiling)
+
+    with httpx.Client() as client:
+        ingest_range(
+            pool_address="0xpool", from_block=0, to_block=9, out_path=out_path,
+            client=client, rpc_url="http://fake", chunk_size=10, max_workers=4,
+            max_rps=4.0, fetch_fn=fake_fetch, concurrency_cooldown_seconds=0,
+            on_ceiling_change=on_ceiling_change,
+        )
+
+    # The self-raised 8.0 is real, measured headroom — a resumed run must
+    # start from it, not silently reset to the 4.0 config default.
+    assert seen_ceilings[0] == 8.0
+    assert read_rate_ceiling(out_path) == 8.0
 
 
 def test_ingest_range_never_resumes_below_half_the_ceiling_even_if_a_prior_run_bottomed_out(tmp_path: Path):

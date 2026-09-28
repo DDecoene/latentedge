@@ -551,6 +551,28 @@ async def test_ingest_screen_renders_a_fractional_rate_without_truncating_it(tmp
 
 
 @pytest.mark.asyncio
+async def test_ingest_screen_shows_a_self_raised_ceiling(tmp_path: Path):
+    out_path = tmp_path / "swaps.parquet"
+    screen = IngestScreen(
+        pool_address="0xpool", from_block=0, to_block=9, out_path=out_path,
+        client_factory=lambda: httpx.Client(), rpc_url="http://fake",
+        chunk_size=10, max_workers=4, max_rps=4.0, flush_every_n_chunks=1,
+        max_retries=1, retry_backoff_seconds=0.001, fetch_fn=_fake_fetch,
+        train_assemble_fn=_placeholder_assemble,
+    )
+    app = LatentEdgeApp(start_screen=screen)
+
+    async with app.run_test() as pilot:
+        screen._handle_ceiling_change(6.0)
+        await pilot.pause()
+        stats_text = str(app.screen.query_one("#ingest-stats-body").content)
+
+    # The denominator moves with the self-raised ceiling, not the static
+    # max_rps config default the screen was constructed with.
+    assert "4.0/6.0" in stats_text
+
+
+@pytest.mark.asyncio
 async def test_ingest_screen_shows_estimated_final_file_size(tmp_path: Path):
     # Regression test: the stats panel should extrapolate the file's
     # final size from bytes written so far vs. blocks remaining, not
