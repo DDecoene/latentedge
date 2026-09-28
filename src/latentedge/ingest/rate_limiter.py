@@ -106,16 +106,30 @@ class RateLimiter:
         new_rate: float | None = None
         with self._cond:
             if outcome == "rate_limited":
-                candidate = max(DEFAULT_MIN_RPS, self._rate / 2)
-                if candidate != self._rate:
-                    self._rate = candidate
-                    new_rate = candidate
-                self._consecutive_successes = 0
-                self._successes_before_increase = min(
-                    self._successes_before_increase * RECOVERY_THRESHOLD_BACKOFF,
-                    MAX_SUCCESSES_BEFORE_INCREASE,
-                )
-                self._cooldown_until = time.monotonic() + self._cooldown_seconds
+                now = time.monotonic()
+                # Every request already in flight when a provider starts
+                # 429ing reports its own "rate_limited" outcome — without
+                # this check, a burst of N in-flight requests would halve
+                # the rate and back off the recovery threshold N times for
+                # what is really one throttle event. A report arriving
+                # while the previous one's cooldown is still active is
+                # folded into that same event: it extends the cooldown
+                # (the burst may still be landing) without compounding the
+                # rate cut or the threshold backoff again.
+                if now < self._cooldown_until:
+                    self._consecutive_successes = 0
+                    self._cooldown_until = now + self._cooldown_seconds
+                else:
+                    candidate = max(DEFAULT_MIN_RPS, self._rate / 2)
+                    if candidate != self._rate:
+                        self._rate = candidate
+                        new_rate = candidate
+                    self._consecutive_successes = 0
+                    self._successes_before_increase = min(
+                        self._successes_before_increase * RECOVERY_THRESHOLD_BACKOFF,
+                        MAX_SUCCESSES_BEFORE_INCREASE,
+                    )
+                    self._cooldown_until = now + self._cooldown_seconds
             elif outcome == "failed":
                 self._consecutive_successes = 0
             else:

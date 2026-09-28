@@ -720,6 +720,39 @@ def test_ingest_range_persists_the_settled_rate_for_the_next_run(tmp_path: Path)
     assert read_rate_limit(out_path) == 2.0
 
 
+def test_ingest_range_reports_the_actual_starting_rate_when_resuming_below_the_ceiling(tmp_path: Path):
+    # Regression test (final review finding): a resumed run can start
+    # below its ceiling (the floor-clamped persisted rate), but nothing
+    # told a caller (e.g. the TUI) that starting point — it would assume
+    # the run started at the ceiling and misreport both the rate and the
+    # direction of the first real adjustment.
+    out_path = tmp_path / "swaps.parquet"
+    write_rate_limit(out_path, 1.0)  # a prior run settled low
+
+    def fake_fetch(pool_address, from_block, to_block, client, rpc_url, rate_limiter=None, **kwargs):
+        if rate_limiter is not None:
+            rate_limiter.release("success")
+        return [_record(from_block, 0)]
+
+    seen_rates: list[float] = []
+
+    def on_rate_change(new_rate: float) -> None:
+        seen_rates.append(new_rate)
+
+    with httpx.Client() as client:
+        ingest_range(
+            pool_address="0xpool", from_block=0, to_block=9, out_path=out_path,
+            client=client, rpc_url="http://fake", chunk_size=10, max_workers=4,
+            max_rps=4.0, fetch_fn=fake_fetch, concurrency_cooldown_seconds=0,
+            on_rate_change=on_rate_change,
+        )
+
+    # Resumed at half the ceiling (2.0, since the persisted 1.0 is
+    # floor-clamped to max_rps/2) — a caller must be told this starting
+    # point immediately, not left assuming the run started at the ceiling.
+    assert seen_rates[0] == 2.0
+
+
 def test_ingest_range_never_resumes_below_half_the_ceiling_even_if_a_prior_run_bottomed_out(tmp_path: Path):
     out_path = tmp_path / "swaps.parquet"
     write_rate_limit(out_path, 0.5)

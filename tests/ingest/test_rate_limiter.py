@@ -19,6 +19,25 @@ def test_limiter_halves_on_rate_limited_release():
     assert changes == [2.0]
 
 
+def test_limiter_does_not_compound_multiple_rate_limits_within_the_same_cooldown_window():
+    # Regression test (final review finding): every request already in
+    # flight when a provider starts 429ing reports its own "rate_limited"
+    # outcome. Without deduping, a burst of N in-flight requests halves
+    # the rate N times and inflates the recovery threshold N times for
+    # what is really one throttle event, turning a brief 429 into many
+    # minutes of near-floor throughput. A second rate_limited report
+    # arriving while the first one's cooldown is still active must be
+    # treated as the same event: it extends the cooldown but does not
+    # halve the rate or back off the threshold again.
+    changes: list[float] = []
+    limiter = RateLimiter(ceiling=4.0, cooldown_seconds=10.0, on_change=changes.append)
+    limiter.release("rate_limited")  # 4.0 -> 2.0
+    limiter.release("rate_limited")  # same event (still within cooldown) — no further halving
+    limiter.release("rate_limited")  # still the same event
+    assert limiter.rate == 2.0
+    assert changes == [2.0]
+
+
 def test_limiter_never_drops_below_the_floor():
     limiter = RateLimiter(ceiling=4.0, cooldown_seconds=0)
     for _ in range(10):

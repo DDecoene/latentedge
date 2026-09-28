@@ -256,6 +256,13 @@ def ingest_range(
         start_rate=start_rate,
         on_change=on_rate_change,
     )
+    # A resumed run can start below max_rps (the floor-clamped persisted
+    # rate above) — without this, a caller (e.g. the TUI) has no way to
+    # know the actual starting point and would assume the ceiling,
+    # misreporting both the rate and the direction of the first real
+    # adjustment.
+    if on_rate_change is not None and rate_limiter.rate != max_rps:
+        on_rate_change(rate_limiter.rate)
 
     worker_slots: dict[int, int] = {}
     slots_lock = threading.Lock()
