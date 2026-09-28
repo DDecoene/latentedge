@@ -5,11 +5,11 @@ from latentedge.ingest.progress import (
     add_interval,
     extend_window_for_new_blocks,
     internal_gaps,
-    read_concurrency_limit,
     read_progress,
+    read_rate_limit,
     uncovered_gaps,
-    write_concurrency_limit,
     write_progress,
+    write_rate_limit,
 )
 from latentedge.schema import SwapRecord
 from latentedge.store import write_swaps
@@ -46,14 +46,14 @@ def test_write_then_read_progress_round_trips(tmp_path: Path):
     assert read_progress(out_path) == [(0, 99), (200, 299)]
 
 
-def test_read_concurrency_limit_returns_none_when_no_file_exists(tmp_path: Path):
-    assert read_concurrency_limit(tmp_path / "swaps.parquet") is None
+def test_read_rate_limit_returns_none_when_no_file_exists(tmp_path: Path):
+    assert read_rate_limit(tmp_path / "swaps.parquet") is None
 
 
-def test_write_then_read_concurrency_limit_round_trips(tmp_path: Path):
+def test_write_then_read_rate_limit_round_trips(tmp_path: Path):
     out_path = tmp_path / "swaps.parquet"
-    write_concurrency_limit(out_path, 3)
-    assert read_concurrency_limit(out_path) == 3
+    write_rate_limit(out_path, 3.5)
+    assert read_rate_limit(out_path) == 3.5
 
 
 def test_add_interval_merges_overlapping_ranges():

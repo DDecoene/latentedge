@@ -15,24 +15,24 @@ def _progress_path(out_path: Path) -> Path:
     return Path(str(out_path) + ".progress.json")
 
 
-def _concurrency_path(out_path: Path) -> Path:
-    return Path(str(out_path) + ".concurrency.json")
+def _rate_path(out_path: Path) -> Path:
+    return Path(str(out_path) + ".rate.json")
 
 
-def read_concurrency_limit(out_path: Path) -> int | None:
-    """The worker-concurrency limit a prior ingest_range run settled on
-    for this output file, if any — lets a resumed run start from a level
-    already known to avoid rate limiting instead of the full ceiling
-    (which just re-earns the same throttle-down again).
+def read_rate_limit(out_path: Path) -> float | None:
+    """The req/s rate a prior ingest_range run settled on for this output
+    file, if any — lets a resumed run start from a rate already known to
+    avoid rate limiting instead of the full ceiling (which just re-earns
+    the same throttle-down again).
     """
-    path = _concurrency_path(out_path)
+    path = _rate_path(out_path)
     if not path.exists():
         return None
-    return int(json.loads(path.read_text())["limit"])
+    return float(json.loads(path.read_text())["rate"])
 
 
-def write_concurrency_limit(out_path: Path, limit: int) -> None:
-    _concurrency_path(out_path).write_text(json.dumps({"limit": limit}))
+def write_rate_limit(out_path: Path, rate: float) -> None:
+    _rate_path(out_path).write_text(json.dumps({"rate": rate}))
 
 
 def read_progress(out_path: Path) -> list[Interval]:
