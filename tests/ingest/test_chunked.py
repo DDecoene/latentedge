@@ -5,7 +5,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from latentedge.ingest.chunked import ingest_range
+from latentedge.ingest.chunked import IngestCancelled, ingest_range
 from latentedge.ingest.progress import read_concurrency_limit, read_progress, write_progress
 from latentedge.ingest.rpc_logs import RateLimitError, RpcLogsError
 from latentedge.schema import SwapRecord
@@ -806,3 +806,37 @@ def test_ingest_range_flushes_completed_chunks_before_raising_on_a_later_failure
     # though the whole call ultimately raised.
     assert read_progress(out_path) == [(0, 49)]  # end of the 5th chunk (blocks 0-49)
     assert len(read_swaps(out_path)) == 5
+
+
+def test_ingest_range_cancel_event_stops_cleanly_and_flushes_completed_chunks(tmp_path: Path):
+    # Regression test for the ctrl+q TUI hang: a cancel_event set mid-run
+    # must interrupt outstanding chunks quickly (not after a full
+    # rate-limit backoff), flush whatever already completed exactly like
+    # a normal run, and surface IngestCancelled — never silently hang
+    # and never lose or corrupt already-fetched data.
+    cancel_event = threading.Event()
+    call_count = {"n": 0}
+
+    def fake_fetch(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str) -> list[SwapRecord]:
+        with threading.Lock():
+            call_count["n"] += 1
+        if call_count["n"] == 3:
+            cancel_event.set()
+        return [_record(from_block, 0)]
+
+    out_path = tmp_path / "swaps.parquet"
+    with httpx.Client() as client:
+        with pytest.raises(IngestCancelled) as exc_info:
+            ingest_range(
+                pool_address="0xpool", from_block=0, to_block=99, out_path=out_path,
+                client=client, rpc_url="http://fake", chunk_size=10, max_workers=1,
+                fetch_fn=fake_fetch, cancel_event=cancel_event,
+            )
+
+    # Exactly the chunks fetched before cancellation was noticed are
+    # flushed — nothing beyond that, nothing lost from before it.
+    written = exc_info.value.total_written
+    assert written == len(read_swaps(out_path))
+    assert written >= 3
+    progress = read_progress(out_path)
+    assert progress and progress[0][0] == 0

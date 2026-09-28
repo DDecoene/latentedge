@@ -25,7 +25,7 @@ from pathlib import Path
 import httpx
 
 from latentedge.ingest import concurrency as _concurrency
-from latentedge.ingest.concurrency import AdaptiveConcurrencyLimiter, ReleaseOutcome
+from latentedge.ingest.concurrency import AdaptiveConcurrencyLimiter, Cancelled, ReleaseOutcome
 from latentedge.ingest.progress import (
     Interval,
     add_interval,
@@ -74,6 +74,30 @@ DEFAULT_MAX_RATE_LIMIT_BACKOFF_SECONDS = 120.0
 FetchFn = Callable[[str, int, int, httpx.Client, str], list[SwapRecord]]
 
 
+class IngestCancelled(Exception):
+    """A cancel_event was set mid-run (e.g. the TUI's ctrl+q handler) —
+    distinct from a real error so a caller can tell "the user asked to
+    stop" apart from "something broke", and report accordingly. Carries
+    however many records this call had already written before stopping.
+    """
+
+    def __init__(self, total_written: int = 0) -> None:
+        super().__init__("ingest cancelled")
+        self.total_written = total_written
+
+
+def _interruptible_sleep(seconds: float, cancel_event: threading.Event | None) -> None:
+    """time.sleep(seconds), but a set cancel_event wakes it immediately
+    instead of letting a chunk wait out a full (up to 120s) rate-limit
+    backoff before noticing a user-requested stop.
+    """
+    if cancel_event is not None:
+        if cancel_event.wait(seconds):
+            raise IngestCancelled()
+    else:
+        time.sleep(seconds)
+
+
 # max_retries (5th positional) is None for a rate-limited retry — there is
 # no ceiling to report since it never gives up.
 OnRetryFn = Callable[[int, int, int, int | None, float, str], None]
@@ -93,6 +117,7 @@ def _fetch_chunk_with_retries(
     on_concurrency_change: Callable[[int], None] | None = None,
     on_status: Callable[[str], None] | None = None,
     max_rate_limit_backoff_seconds: float = DEFAULT_MAX_RATE_LIMIT_BACKOFF_SECONDS,
+    cancel_event: threading.Event | None = None,
 ) -> list[SwapRecord]:
     # Two independent counters: a rate limit is expected, temporary
     # provider behavior and retries forever (capped backoff, uncapped
@@ -103,12 +128,17 @@ def _fetch_chunk_with_retries(
     failure_attempt = 0
     rate_limit_attempt = 0
     while True:
+        if cancel_event is not None and cancel_event.is_set():
+            raise IngestCancelled()
         # Blocking on the gate is the one moment the throttle is actually
         # visible — report it distinctly from "fetching" rather than
         # announcing "fetching" before the wait even starts.
         if on_status is not None:
             on_status("waiting")
-        limiter.acquire()
+        try:
+            limiter.acquire(cancel_event)
+        except Cancelled:
+            raise IngestCancelled() from None
         if on_status is not None:
             on_status("fetching")
         try:
@@ -130,7 +160,7 @@ def _fetch_chunk_with_retries(
                 )
                 if on_retry is not None:
                     on_retry(from_block, to_block, rate_limit_attempt, None, sleep_seconds, str(exc))
-                time.sleep(sleep_seconds)
+                _interruptible_sleep(sleep_seconds, cancel_event)
                 continue
 
             failure_attempt += 1
@@ -139,7 +169,7 @@ def _fetch_chunk_with_retries(
             sleep_seconds = backoff_seconds * (2 ** (failure_attempt - 1))
             if on_retry is not None:
                 on_retry(from_block, to_block, failure_attempt, max_retries, sleep_seconds, str(exc))
-            time.sleep(sleep_seconds)
+            _interruptible_sleep(sleep_seconds, cancel_event)
         else:
             new_limit, changed = limiter.release("success")
             if changed and on_concurrency_change is not None:
@@ -167,6 +197,7 @@ def ingest_range(
     on_worker_status: Callable[[int, int, int, str], None] | None = None,
     on_concurrency_change: Callable[[int], None] | None = None,
     fetch_fn: FetchFn = fetch_swaps,
+    cancel_event: threading.Event | None = None,
 ) -> int:
     """Ingest [from_block, to_block] concurrently, in chunks, flushing to
     disk (and recording newly-covered intervals in the resumable
@@ -176,6 +207,13 @@ def ingest_range(
     number of swap records written in this call. Any sub-range of
     [from_block, to_block] already present in a prior run's progress is
     skipped, never re-fetched.
+
+    A caller (the TUI's ctrl+q handler) can set cancel_event to stop
+    early — in-flight chunks are given a chance to finish or notice the
+    cancellation quickly (rather than being abandoned mid-flight), then
+    whatever completed gets flushed exactly like a normal run, and
+    IngestCancelled is raised (carrying the partial total_written) so
+    the caller can tell a deliberate stop apart from a real failure.
     """
     progress_intervals = read_progress(out_path)
     gaps = uncovered_gaps(progress_intervals, from_block, to_block)
@@ -265,7 +303,7 @@ def ingest_range(
         records = _fetch_chunk_with_retries(
             fetch_fn, pool_address, chunk_start, chunk_end, client, rpc_url,
             max_retries, retry_backoff_seconds, limiter, retry_hook, on_concurrency_change, status_hook,
-            max_rate_limit_backoff_seconds,
+            max_rate_limit_backoff_seconds, cancel_event,
         )
 
         if on_worker_status is not None:
@@ -274,9 +312,18 @@ def ingest_range(
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(process_chunk, cs): cs for cs in chunk_order}
+        cancelled = False
         try:
             for future in as_completed(futures):
-                chunk_start, chunk_end, records = future.result()
+                try:
+                    chunk_start, chunk_end, records = future.result()
+                except IngestCancelled:
+                    # One cancelled chunk means every not-yet-started
+                    # chunk will raise the same way in turn — no point
+                    # waiting for the rest of as_completed to churn
+                    # through them one at a time.
+                    cancelled = True
+                    break
 
                 with lock:
                     completed[chunk_start] = (chunk_end, records)
@@ -329,4 +376,6 @@ def ingest_range(
             # not just the happy-path ending level.
             write_concurrency_limit(out_path, limiter.limit)
 
+    if cancelled:
+        raise IngestCancelled(total_written)
     return total_written

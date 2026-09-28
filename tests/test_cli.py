@@ -5,6 +5,7 @@ import pytest
 from click.testing import CliRunner
 
 from latentedge.cli import DEFAULT_RPC_URL, cli
+from latentedge.ingest.progress import write_progress
 from latentedge.training_data import AssembledTrainingData, SplitArrays
 
 
@@ -359,6 +360,64 @@ def test_ingest_explicit_block_range_takes_priority_over_days(monkeypatch: pytes
     assert result.exit_code == 0, result.output
     assert captured["from_block"] == 10
     assert captured["to_block"] == 20
+
+
+def test_ingest_backfills_previously_skipped_gaps_before_the_requested_range(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+):
+    # Regression test for a real incident: an earlier run jumped straight
+    # to an explicit --from-block/--to-block that left a large stretch of
+    # history between two already-ingested ranges never fetched. Nothing
+    # else in the codebase ever goes back to look for a gap like this, so
+    # it must be closed automatically, before the range this invocation
+    # actually asked for, and the user must be told it happened.
+    out_path = tmp_path / "swaps.parquet"
+    write_progress(out_path, [(0, 99), (500, 599)])  # a skipped gap at 100-499
+
+    calls: list[tuple[int, int]] = []
+
+    def fake_ingest_range(pool_address, from_block, to_block, out, client, rpc_url, **kwargs):
+        calls.append((from_block, to_block))
+        return 0
+
+    monkeypatch.setattr("latentedge.cli.ingest_range", fake_ingest_range)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["ingest", "--from-block", "700", "--to-block", "800", "--out", str(out_path)],
+    )
+
+    assert result.exit_code == 0, result.output
+    # The gap is backfilled first, in order, before the requested range.
+    assert calls == [(100, 499), (700, 800)]
+    assert "previously-skipped" in result.output
+    assert "100-499" in result.output
+
+
+def test_ingest_skips_backfill_entirely_when_progress_has_no_internal_gaps(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+):
+    out_path = tmp_path / "swaps.parquet"
+    write_progress(out_path, [(0, 99)])  # a single interval — nothing to backfill
+
+    calls: list[tuple[int, int]] = []
+
+    def fake_ingest_range(pool_address, from_block, to_block, out, client, rpc_url, **kwargs):
+        calls.append((from_block, to_block))
+        return 0
+
+    monkeypatch.setattr("latentedge.cli.ingest_range", fake_ingest_range)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["ingest", "--from-block", "200", "--to-block", "300", "--out", str(out_path)],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls == [(200, 300)]
+    assert "previously-skipped" not in result.output
 
 
 def test_ingest_rejects_only_one_of_from_block_to_block(tmp_path: Path):

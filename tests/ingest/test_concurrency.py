@@ -1,7 +1,9 @@
 import threading
 import time
 
-from latentedge.ingest.concurrency import AdaptiveConcurrencyLimiter
+import pytest
+
+from latentedge.ingest.concurrency import AdaptiveConcurrencyLimiter, Cancelled
 
 
 def test_limiter_starts_at_the_ceiling():
@@ -139,3 +141,40 @@ def test_limiter_does_not_reset_the_cooldown_on_a_plain_failure():
     start = time.monotonic()
     limiter.acquire()
     assert time.monotonic() - start < 0.1
+
+
+def test_limiter_acquire_raises_cancelled_immediately_if_already_set():
+    limiter = AdaptiveConcurrencyLimiter(ceiling=4, cooldown_seconds=0)
+    cancel_event = threading.Event()
+    cancel_event.set()
+    with pytest.raises(Cancelled):
+        limiter.acquire(cancel_event)
+
+
+def test_limiter_acquire_wakes_promptly_on_cancel_event_instead_of_waiting_for_a_release():
+    # Regression test for the ctrl+q TUI hang: a worker blocked here
+    # (limit exhausted, no other worker about to release soon) must
+    # notice a cancel_event well within its cancel-poll interval, not
+    # only when some unrelated worker happens to call release().
+    limiter = AdaptiveConcurrencyLimiter(ceiling=1, cooldown_seconds=0)
+    limiter.acquire()  # hold the only permit — a second acquire() would block forever otherwise
+
+    cancel_event = threading.Event()
+    raised = threading.Event()
+
+    def acquire_blocked() -> None:
+        try:
+            limiter.acquire(cancel_event)
+        except Cancelled:
+            raised.set()
+
+    thread = threading.Thread(target=acquire_blocked)
+    thread.start()
+    try:
+        time.sleep(0.05)
+        assert not raised.is_set()  # genuinely blocked, not a fluke pass
+        cancel_event.set()
+        thread.join(timeout=1.0)
+        assert raised.is_set()
+    finally:
+        thread.join(timeout=1.0)

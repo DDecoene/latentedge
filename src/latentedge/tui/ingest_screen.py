@@ -1,6 +1,7 @@
 """The ingest command's progress screen."""
 
 import shutil
+import threading
 import time
 from collections.abc import Callable
 from datetime import datetime, timezone
@@ -13,7 +14,12 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import Screen
 from textual.widgets import Static
 
-from latentedge.ingest.chunked import DEFAULT_CONCURRENCY_COOLDOWN_SECONDS, DEFAULT_MAX_RATE_LIMIT_BACKOFF_SECONDS, FetchFn
+from latentedge.ingest.chunked import (
+    DEFAULT_CONCURRENCY_COOLDOWN_SECONDS,
+    DEFAULT_MAX_RATE_LIMIT_BACKOFF_SECONDS,
+    FetchFn,
+    IngestCancelled,
+)
 from latentedge.ingest.chunked import ingest_range as default_ingest_range
 from latentedge.ingest.progress import read_progress, uncovered_gaps
 from latentedge.ingest.rpc_logs import describe_error, fetch_swaps
@@ -60,12 +66,22 @@ class IngestScreen(Screen[None]):
         ingest_fn: Callable[..., int] = default_ingest_range,
         fetch_fn: FetchFn = fetch_swaps,
         time_fn: Callable[[], float] = time.monotonic,
+        remaining_ranges: list[tuple[int, int]] | None = None,
     ) -> None:
         super().__init__()
         self.pool_address = pool_address
         self.from_block = from_block
         self.to_block = to_block
         self.out_path = out_path
+        # Ranges still queued to run after this one, in order — set when
+        # the CLI found previously-skipped history to backfill ahead of
+        # the range actually requested. By convention the requested range
+        # is always last, so "there's something queued after this one"
+        # is exactly what makes this particular leg a backfill leg,
+        # rather than needing a separate flag the two could drift out of
+        # sync with.
+        self.remaining_ranges = list(remaining_ranges) if remaining_ranges else []
+        self.is_backfill_leg = bool(self.remaining_ranges)
         # Everything that scrolls off the top of the on-screen log panel
         # is still available here afterward — the panel itself only ever
         # keeps its last MAX_LOG_LINES, but a long run's retry/timing
@@ -105,10 +121,22 @@ class IngestScreen(Screen[None]):
         # wall-clock time actually spent fetching them count.
         self._rate_start_time: float | None = None
         self._rate_start_completed: int | None = None
+        # File size at the same anchor point as the rate/ETA baseline
+        # above — lets the size estimate use a bytes-per-block figure
+        # measured only over blocks actually fetched this run, rather
+        # than being skewed by whatever the file already held (e.g. from
+        # other block ranges) before this run started.
+        self._size_rate_start_bytes: int | None = None
         self._last_progress_time = self.time_fn()
         self._buffered_count = 0
         self._blocking_chunk_start: int | None = None
         self._concurrency_limit = max_workers
+        # Set by request_stop() (ctrl+q) to cooperatively unwind the
+        # background ingest thread's worker pool instead of exiting the
+        # app immediately — an immediate app.exit() would leave those
+        # threads calling call_from_thread against an event loop that no
+        # longer exists, which hangs them (and the process) forever.
+        self._cancel_event = threading.Event()
 
     def _log(self, message: str) -> None:
         self.query_one("#ingest-log", LogPanel).log_line(message)
@@ -143,13 +171,31 @@ class IngestScreen(Screen[None]):
         self._completed = max(total - uncovered, 0)
         unit_label = f"resuming ({self._completed} blocks already ingested)" if self._completed > 0 else "starting..."
 
-        self.query_one("#ingest-progress", ProgressPanel).update_progress(
+        progress_panel = self.query_one("#ingest-progress", ProgressPanel)
+        progress_panel.update_progress(
             completed=self._completed, total=total, unit_label=unit_label,
             rate_per_sec=0.0, rate_unit="blocks/sec",
         )
         self.set_interval(STATS_REFRESH_INTERVAL_SECONDS, self._refresh_disk_stats)
+
+        # A backfill leg needs to stay visibly distinct for its whole
+        # run, not just as a one-line log entry at the start — the panel
+        # border and action bar are what's actually on screen the rest
+        # of the time, and the log line scrolls out of view within
+        # seconds on a busy run.
+        if self.is_backfill_leg:
+            backfill_note = f", backfilling previously-skipped history ({len(self.remaining_ranges)} range(s) queued after this) "
+            queued_note = "range" if len(self.remaining_ranges) == 1 else "ranges"
+            progress_panel.border_title = f"Progress — Backfilling skipped history ({len(self.remaining_ranges)} {queued_note} queued after this)"
+            self.query_one("#ingest-action-bar", Static).update(
+                "Backfilling previously-skipped history before the range you requested — this isn't the run you asked for yet."
+            )
+        else:
+            backfill_note = ""
+            progress_panel.border_title = "Progress — requested range"
+
         self._log(
-            f"starting: blocks {self.from_block}-{self.to_block}, chunk_size={self.chunk_size}, "
+            f"starting: blocks {self.from_block}-{self.to_block}{backfill_note}, chunk_size={self.chunk_size}, "
             f"max_workers={self.max_workers}, concurrency_cooldown_seconds={self.concurrency_cooldown_seconds} "
             f"— full log at {self.log_path}"
         )
@@ -192,7 +238,11 @@ class IngestScreen(Screen[None]):
                     on_queue_status=on_queue_status, on_worker_status=on_worker_status,
                     on_concurrency_change=on_concurrency_change,
                     fetch_fn=self.fetch_fn,
+                    cancel_event=self._cancel_event,
                 )
+        except IngestCancelled as exc:
+            self.app.call_from_thread(self._handle_stopped, exc.total_written)
+            return
         except Exception as exc:
             self.app.call_from_thread(self._handle_error, describe_error(self.rpc_url, exc))
             return
@@ -214,6 +264,7 @@ class IngestScreen(Screen[None]):
         if self._rate_start_time is None:
             self._rate_start_time = now
             self._rate_start_completed = completed
+            self._size_rate_start_bytes = self.out_path.stat().st_size if self.out_path.exists() else 0
             rate = 0.0
         else:
             assert self._rate_start_completed is not None
@@ -278,12 +329,28 @@ class IngestScreen(Screen[None]):
         )
         self.query_one("#ingest-stats", StatsPanel).update_stats([
             ("File size", f"{file_size / 1_048_576:.1f} MB"),
+            ("Est. final size", self._format_estimated_final_size(file_size)),
             ("Free disk", f"{free_bytes / 1_073_741_824:.1f} GB"),
             ("Retries", retries),
             ("Stalled", stalled),
             ("Buffered", buffered),
             ("Concurrency", concurrency),
         ])
+
+    def _format_estimated_final_size(self, file_size: int) -> str:
+        total = max(self.to_block - self.from_block + 1, 0)
+        remaining = max(total - self._completed, 0)
+        if remaining == 0:
+            return f"{file_size / 1_048_576:.1f} MB"
+        if (
+            self._rate_start_completed is None
+            or self._size_rate_start_bytes is None
+            or self._completed <= self._rate_start_completed
+        ):
+            return "-- (estimating...)"
+        bytes_per_block = (file_size - self._size_rate_start_bytes) / (self._completed - self._rate_start_completed)
+        estimated_final = file_size + bytes_per_block * remaining
+        return f"{estimated_final / 1_048_576:.1f} MB"
 
     def _handle_complete(self, total: int) -> None:
         self.is_complete = True
@@ -295,6 +362,17 @@ class IngestScreen(Screen[None]):
             completed=range_total, total=range_total, unit_label="complete",
             rate_per_sec=0.0, rate_unit="blocks/sec",
         )
+
+        if self.remaining_ranges:
+            # A backfill leg auto-continues into the next queued range
+            # (and eventually the range actually requested) without
+            # stopping for the T/Q prompt below — the user asked for one
+            # ingest run, not one prompt per previously-skipped gap.
+            next_from, next_to = self.remaining_ranges[0]
+            rest = self.remaining_ranges[1:]
+            self._log(f"continuing: {len(rest)} range(s) still queued after this one")
+            self.app.switch_screen(self._build_next_screen(next_from, next_to, rest))
+            return
 
         if self.train_after_ingest:
             self._log("train_after_ingest is on — starting training now")
@@ -313,6 +391,50 @@ class IngestScreen(Screen[None]):
         self.error = message
         self._log(f"ERROR: {message}")
         self.query_one("#ingest-action-bar", Static).update(f"Ingestion failed: {message}. Press [b]Q[/b] to exit.")
+
+    def request_stop(self) -> bool:
+        """Called by the app on ctrl+q instead of exiting immediately.
+
+        Returns True to tell the app "I'm handling this, don't exit yet"
+        — the background thread notices cancel_event, lets in-flight
+        chunks finish or bail out quickly, flushes whatever completed,
+        then reports back via _handle_stopped, which is what actually
+        exits the app. Returns False once there's no run left to stop
+        (already complete/errored, or a stop is already in flight), so
+        ctrl+q falls through to the app's normal immediate exit.
+        """
+        if self.is_complete or self.error is not None:
+            return False
+        if self._cancel_event.is_set():
+            # Already stopping — ignore a repeated press rather than
+            # forcing app.exit() while worker threads may still be
+            # unwinding, which would reintroduce the exact hang this
+            # exists to prevent.
+            return True
+        self._cancel_event.set()
+        self._log("stopping: user requested termination (ctrl+q) — waiting for in-flight requests to finish and flushing progress")
+        self.query_one("#ingest-action-bar", Static).update(
+            "Terminating — waiting for in-flight requests to finish and flushing progress..."
+        )
+        return True
+
+    def _handle_stopped(self, total_written: int) -> None:
+        self._log(f"terminated: stopped by user, {total_written} swaps written this run before stopping")
+        self.app.exit()
+
+    def _build_next_screen(self, from_block: int, to_block: int, remaining_ranges: list[tuple[int, int]]) -> "IngestScreen":
+        return IngestScreen(
+            pool_address=self.pool_address, from_block=from_block, to_block=to_block,
+            out_path=self.out_path, client_factory=self.client_factory, rpc_url=self.rpc_url,
+            chunk_size=self.chunk_size, max_workers=self.max_workers,
+            flush_every_n_chunks=self.flush_every_n_chunks, max_retries=self.max_retries,
+            retry_backoff_seconds=self.retry_backoff_seconds, train_assemble_fn=self.train_assemble_fn,
+            concurrency_cooldown_seconds=self.concurrency_cooldown_seconds,
+            max_rate_limit_backoff_seconds=self.max_rate_limit_backoff_seconds,
+            model_out_path=self.model_out_path, train_epochs=self.train_epochs,
+            train_after_ingest=self.train_after_ingest, ingest_fn=self.ingest_fn,
+            fetch_fn=self.fetch_fn, time_fn=self.time_fn, remaining_ranges=remaining_ranges,
+        )
 
     def _push_train_screen(self) -> None:
         self.app.push_screen(TrainScreen(

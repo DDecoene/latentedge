@@ -30,6 +30,16 @@ DEFAULT_COOLDOWN_SECONDS = 2.0
 
 ReleaseOutcome = Literal["success", "failed", "rate_limited"]
 
+# How often acquire()'s wait loop wakes on its own to recheck cancel_event,
+# even with nothing to notify it — the only way a blocked worker notices a
+# user-requested stop without waiting out a full cooldown or the limiter
+# gate first.
+_CANCEL_POLL_SECONDS = 0.5
+
+
+class Cancelled(Exception):
+    """A cancel_event was set while a worker was blocked in acquire()."""
+
 
 class AdaptiveConcurrencyLimiter:
     def __init__(
@@ -53,18 +63,27 @@ class AdaptiveConcurrencyLimiter:
         with self._cond:
             return self._limit
 
-    def acquire(self) -> None:
+    def acquire(self, cancel_event: threading.Event | None = None) -> None:
         """Block until fewer than the current limit are in flight and
         any post-rate-limit cooldown has elapsed.
+
+        Waits use a short timeout (rather than an unbounded
+        threading.Condition.wait()) purely so a set cancel_event is
+        noticed within _CANCEL_POLL_SECONDS instead of only on the next
+        release() — otherwise a worker blocked here during a user-
+        requested stop would hang until some other, unrelated worker
+        happens to release and notify.
         """
         with self._cond:
             while True:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise Cancelled()
                 remaining_cooldown = self._cooldown_until - time.monotonic()
                 if remaining_cooldown > 0:
-                    self._cond.wait(timeout=remaining_cooldown)
+                    self._cond.wait(timeout=min(remaining_cooldown, _CANCEL_POLL_SECONDS))
                     continue
                 if self._in_flight >= self._limit:
-                    self._cond.wait()
+                    self._cond.wait(timeout=_CANCEL_POLL_SECONDS)
                     continue
                 break
             self._in_flight += 1

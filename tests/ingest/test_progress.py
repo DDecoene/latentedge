@@ -4,6 +4,7 @@ from pathlib import Path
 from latentedge.ingest.progress import (
     add_interval,
     extend_window_for_new_blocks,
+    internal_gaps,
     read_concurrency_limit,
     read_progress,
     uncovered_gaps,
@@ -106,6 +107,26 @@ def test_extend_window_returns_naive_from_when_already_enough_new_blocks():
     assert result == 100
 
 
+def test_extend_window_bridges_a_disconnected_naive_window_back_to_existing_coverage():
+    # Regression test for a real incident: a quick --days run long after
+    # the previous ingest left a naive near-head window that, on its
+    # own, already had plenty of new blocks (1000-1099) — but it never
+    # touched the old watermark at block 99, so returning naive_from
+    # as-is would strand blocks 100-999 as a permanent, silent gap.
+    intervals = [(0, 99)]
+    result = extend_window_for_new_blocks(intervals, naive_from=1000, naive_to=1099, desired_new_blocks=50, floor_block=0)
+    assert result == 100  # bridges all the way back to touch the existing coverage
+    assert uncovered_gaps([*intervals, (result, 1099)], 0, 1099) == []
+
+
+def test_extend_window_does_not_bridge_when_naive_window_already_touches_coverage():
+    # The common case (no gap has ever formed) must be unaffected —
+    # bridging only kicks in when the naive window is disconnected.
+    intervals = [(0, 999)]
+    result = extend_window_for_new_blocks(intervals, naive_from=950, naive_to=1099, desired_new_blocks=50, floor_block=0)
+    assert result == 950
+
+
 def test_extend_window_walks_back_when_naive_window_fully_covered():
     intervals = [(100, 199)]
     result = extend_window_for_new_blocks(intervals, naive_from=100, naive_to=199, desired_new_blocks=100, floor_block=0)
@@ -132,3 +153,23 @@ def test_extend_window_never_returns_below_floor_block_when_naive_from_is_alread
     # extend to get there".
     result = extend_window_for_new_blocks([], naive_from=50, naive_to=199, desired_new_blocks=100, floor_block=100)
     assert result == 100
+
+
+def test_internal_gaps_empty_with_no_intervals():
+    assert internal_gaps([]) == []
+
+
+def test_internal_gaps_empty_with_a_single_interval():
+    assert internal_gaps([(10, 20)]) == []
+
+
+def test_internal_gaps_finds_the_skipped_range_between_two_intervals():
+    assert internal_gaps([(0, 99), (500, 599)]) == [(100, 499)]
+
+
+def test_internal_gaps_handles_unsorted_input_and_multiple_gaps():
+    assert internal_gaps([(500, 599), (0, 99), (700, 799)]) == [(100, 499), (600, 699)]
+
+
+def test_internal_gaps_empty_when_intervals_are_adjacent():
+    assert internal_gaps([(0, 99), (100, 199)]) == []

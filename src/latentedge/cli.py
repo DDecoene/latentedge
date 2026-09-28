@@ -23,7 +23,7 @@ from latentedge.ingest.chunked import (
     RATE_LIMIT_BACKOFF_MULTIPLIER,
     ingest_range,
 )
-from latentedge.ingest.progress import extend_window_for_new_blocks, read_progress
+from latentedge.ingest.progress import extend_window_for_new_blocks, internal_gaps, read_progress
 from latentedge.ingest.rpc_logs import RateLimitError, RpcLogsError, describe_error, get_latest_block
 from latentedge.model import NetReturnRegressor, save
 from latentedge.model import train as train_model
@@ -193,9 +193,25 @@ def ingest(
 
     out.parent.mkdir(parents=True, exist_ok=True)
 
+    # Backfill anything a prior run skipped over (e.g. one that jumped
+    # straight to an explicit --from-block/--to-block without checking
+    # what came before) before touching the range this invocation was
+    # actually asked for. Left alone, gaps like this only ever get wider
+    # — nothing else in the codebase ever goes back to look for them —
+    # so every run closes them first rather than compounding the debt.
+    gaps = internal_gaps(read_progress(out))
+
     if sys.stdout.isatty():
+        # The TUI is the only UI in a TTY session — a backfill must run
+        # as leading IngestScreen instances the dashboard chains through
+        # itself (see IngestScreen.remaining_ranges), never as plain
+        # click.echo lines ahead of it. Mixing the two means real work
+        # (and its only Ctrl+C-safe cancellation path) happens outside
+        # the TUI the user is looking at.
+        first_from, first_to = (gaps[0] if gaps else (from_block, to_block))
+        remaining_ranges = [*gaps[1:], (from_block, to_block)] if gaps else []
         screen = IngestScreen(
-            pool_address=config.POOL_ADDRESS, from_block=from_block, to_block=to_block,
+            pool_address=config.POOL_ADDRESS, from_block=first_from, to_block=first_to,
             out_path=out, client_factory=lambda: httpx.Client(timeout=30.0), rpc_url=rpc_url,
             chunk_size=chunk_size, max_workers=max_workers,
             flush_every_n_chunks=flush_every_n_chunks, max_retries=max_retries,
@@ -204,6 +220,7 @@ def ingest(
             max_rate_limit_backoff_seconds=max_rate_limit_backoff_seconds, ingest_fn=ingest_range,
             train_assemble_fn=_assemble_train_data,
             model_out_path=train_out, train_epochs=train_epochs, train_after_ingest=train_after_ingest,
+            remaining_ranges=remaining_ranges,
         )
         LatentEdgeApp(start_screen=screen).run()
         if screen.error is not None:
@@ -211,11 +228,31 @@ def ingest(
             raise SystemExit(1)
         return
 
+    if gaps:
+        gap_block_total = sum(end - start + 1 for start, end in gaps)
+        click.echo(
+            f"{out} has {len(gaps)} previously-skipped block range(s) "
+            f"({gap_block_total} blocks total) — backfilling before the requested range:"
+        )
+        for gap_start, gap_end in gaps:
+            click.echo(f"  {gap_start}-{gap_end} ({gap_end - gap_start + 1} blocks)")
+
     def report(chunk_start: int, chunk_end: int, count: int) -> None:
         click.echo(f"  blocks {chunk_start}-{chunk_end}: {count} swaps")
 
     with httpx.Client(timeout=30.0) as client:
         try:
+            for gap_start, gap_end in gaps:
+                ingest_range(
+                    config.POOL_ADDRESS, gap_start, gap_end, out, client, rpc_url,
+                    chunk_size=chunk_size, max_retries=max_retries, retry_backoff_seconds=retry_backoff_seconds,
+                    max_workers=max_workers, flush_every_n_chunks=flush_every_n_chunks,
+                    concurrency_cooldown_seconds=concurrency_cooldown_seconds,
+                    max_rate_limit_backoff_seconds=max_rate_limit_backoff_seconds,
+                    on_progress=report,
+                )
+            if gaps:
+                click.echo(f"backfill complete — {sum(e - s + 1 for s, e in gaps)} previously-skipped blocks recovered")
             total = ingest_range(
                 config.POOL_ADDRESS, from_block, to_block, out, client, rpc_url,
                 chunk_size=chunk_size, max_retries=max_retries, retry_backoff_seconds=retry_backoff_seconds,
