@@ -2,6 +2,7 @@ import threading
 from pathlib import Path
 
 import httpx
+import numpy as np
 import pytest
 
 from latentedge.ingest.chunked import ingest_range
@@ -9,9 +10,17 @@ from latentedge.ingest.progress import read_progress, write_progress
 from latentedge.ingest.rpc_logs import RateLimitError, RpcLogsError
 from latentedge.schema import SwapRecord
 from latentedge.store import read_swaps
+from latentedge.training_data import AssembledTrainingData, SplitArrays
 from latentedge.tui.app import LatentEdgeApp
 from latentedge.tui.ingest_screen import IngestScreen
 from latentedge.tui.train_screen import TrainScreen
+
+
+def _placeholder_assemble(swaps_path: Path) -> AssembledTrainingData:
+    empty = SplitArrays(x=np.zeros((1, 1), dtype="float32"), y=np.zeros(1, dtype="float32"))
+    return AssembledTrainingData(
+        train=empty, validate=empty, test=empty, input_dim=1, stats={"net_return": (0.0, 1.0)}
+    )
 
 
 def _record(block_number: int) -> SwapRecord:
@@ -35,7 +44,7 @@ async def test_ingest_screen_reaches_complete_state(tmp_path: Path):
         client_factory=lambda: httpx.Client(), rpc_url="http://fake",
         chunk_size=10, max_workers=1, flush_every_n_chunks=1,
         max_retries=1, retry_backoff_seconds=0.001, fetch_fn=_fake_fetch,
-        train_assemble_fn=lambda p: (None, None, 0, {}),
+        train_assemble_fn=_placeholder_assemble,
     )
     app = LatentEdgeApp(start_screen=screen)
 
@@ -77,7 +86,7 @@ async def test_ingest_screen_writes_retries_and_concurrency_changes_to_the_log_f
         chunk_size=10, max_workers=4, flush_every_n_chunks=1,
         max_retries=3, retry_backoff_seconds=0.001, concurrency_cooldown_seconds=0,
         fetch_fn=one_rate_limit_then_fine,
-        train_assemble_fn=lambda p: (None, None, 0, {}),
+        train_assemble_fn=_placeholder_assemble,
     )
     app = LatentEdgeApp(start_screen=screen)
 
@@ -116,7 +125,7 @@ async def test_ingest_screen_progress_starts_from_resumed_block(tmp_path: Path):
         client_factory=lambda: httpx.Client(), rpc_url="http://fake",
         chunk_size=10, max_workers=1, flush_every_n_chunks=1,
         max_retries=1, retry_backoff_seconds=0.001, fetch_fn=gated_fetch,
-        train_assemble_fn=lambda p: (None, None, 0, {}),
+        train_assemble_fn=_placeholder_assemble,
     )
     app = LatentEdgeApp(start_screen=screen)
 
@@ -163,7 +172,7 @@ async def test_ingest_screen_progress_accounts_for_a_covered_gap_crossed_mid_run
         client_factory=lambda: httpx.Client(), rpc_url="http://fake",
         chunk_size=10, max_workers=1, flush_every_n_chunks=1,
         max_retries=1, retry_backoff_seconds=0.001, fetch_fn=gated_fetch,
-        train_assemble_fn=lambda p: (None, None, 0, {}),
+        train_assemble_fn=_placeholder_assemble,
     )
     app = LatentEdgeApp(start_screen=screen)
 
@@ -206,7 +215,7 @@ async def test_ingest_screen_all_panels_are_visible_within_the_viewport(tmp_path
         client_factory=lambda: httpx.Client(), rpc_url="http://fake",
         chunk_size=10, max_workers=1, flush_every_n_chunks=1,
         max_retries=1, retry_backoff_seconds=0.001, fetch_fn=_fake_fetch,
-        train_assemble_fn=lambda p: (None, None, 0, {}),
+        train_assemble_fn=_placeholder_assemble,
     )
     app = LatentEdgeApp(start_screen=screen)
 
@@ -246,7 +255,7 @@ async def test_ingest_screen_shows_retry_detail_in_log_and_stalled_stat(tmp_path
         client_factory=lambda: httpx.Client(), rpc_url="http://fake",
         chunk_size=10, max_workers=1, flush_every_n_chunks=1,
         max_retries=3, retry_backoff_seconds=0.001, fetch_fn=flaky_fetch,
-        train_assemble_fn=lambda p: (None, None, 0, {}),
+        train_assemble_fn=_placeholder_assemble,
     )
     app = LatentEdgeApp(start_screen=screen)
 
@@ -280,7 +289,7 @@ async def test_ingest_screen_shows_per_worker_status(tmp_path: Path):
         client_factory=lambda: httpx.Client(), rpc_url="http://fake",
         chunk_size=10, max_workers=2, flush_every_n_chunks=1,
         max_retries=1, retry_backoff_seconds=0.001, fetch_fn=gated_fetch,
-        train_assemble_fn=lambda p: (None, None, 0, {}),
+        train_assemble_fn=_placeholder_assemble,
     )
     app = LatentEdgeApp(start_screen=screen)
 
@@ -320,7 +329,7 @@ async def test_ingest_screen_renders_a_worker_waiting_for_a_free_concurrency_slo
         client_factory=lambda: httpx.Client(), rpc_url="http://fake",
         chunk_size=10, max_workers=1, flush_every_n_chunks=1,
         max_retries=1, retry_backoff_seconds=0.001, fetch_fn=_fake_fetch,
-        train_assemble_fn=lambda p: (None, None, 0, {}),
+        train_assemble_fn=_placeholder_assemble,
     )
     app = LatentEdgeApp(start_screen=screen)
 
@@ -359,7 +368,7 @@ async def test_ingest_screen_shows_concurrency_limit_after_a_throttle_down(tmp_p
         chunk_size=10, max_workers=4, flush_every_n_chunks=1,
         max_retries=3, retry_backoff_seconds=0.001, concurrency_cooldown_seconds=0,
         fetch_fn=one_rate_limit_then_fine,
-        train_assemble_fn=lambda p: (None, None, 0, {}),
+        train_assemble_fn=_placeholder_assemble,
     )
     app = LatentEdgeApp(start_screen=screen)
 
@@ -384,7 +393,7 @@ async def test_ingest_screen_handles_zero_length_range_without_hanging(tmp_path:
         client_factory=lambda: httpx.Client(), rpc_url="http://fake",
         chunk_size=10, max_workers=1, flush_every_n_chunks=1,
         max_retries=1, retry_backoff_seconds=0.001, fetch_fn=_fake_fetch,
-        train_assemble_fn=lambda p: (None, None, 0, {}),
+        train_assemble_fn=_placeholder_assemble,
     )
     app = LatentEdgeApp(start_screen=screen)
 
@@ -417,7 +426,7 @@ async def test_ingest_screen_resumed_run_with_nothing_left_reaches_full_bar(tmp_
         client_factory=lambda: httpx.Client(), rpc_url="http://fake",
         chunk_size=10, max_workers=1, flush_every_n_chunks=1,
         max_retries=1, retry_backoff_seconds=0.001, fetch_fn=_fake_fetch,
-        train_assemble_fn=lambda p: (None, None, 0, {}),
+        train_assemble_fn=_placeholder_assemble,
     )
     app = LatentEdgeApp(start_screen=screen)
 
@@ -445,7 +454,7 @@ async def test_ingest_screen_logs_error_on_exhausted_retries_without_crashing(tm
         client_factory=lambda: httpx.Client(), rpc_url="http://fake",
         chunk_size=10, max_workers=1, flush_every_n_chunks=1,
         max_retries=1, retry_backoff_seconds=0.001, fetch_fn=always_fails,
-        train_assemble_fn=lambda p: (None, None, 0, {}),
+        train_assemble_fn=_placeholder_assemble,
     )
     app = LatentEdgeApp(start_screen=screen)
 
@@ -489,7 +498,7 @@ async def test_ingest_screen_shows_a_plain_language_message_for_a_connection_fai
         client_factory=lambda: httpx.Client(), rpc_url="http://fake-rpc.invalid",
         chunk_size=10, max_workers=1, flush_every_n_chunks=1,
         max_retries=1, retry_backoff_seconds=0.001, fetch_fn=connection_refused,
-        train_assemble_fn=lambda p: (None, None, 0, {}),
+        train_assemble_fn=_placeholder_assemble,
     )
     app = LatentEdgeApp(start_screen=screen)
 
@@ -512,7 +521,7 @@ async def test_ingest_screen_shows_completion_prompt(tmp_path: Path):
         client_factory=lambda: httpx.Client(), rpc_url="http://fake",
         chunk_size=10, max_workers=1, flush_every_n_chunks=1,
         max_retries=1, retry_backoff_seconds=0.001, fetch_fn=_fake_fetch,
-        train_assemble_fn=lambda p: (None, None, 0, {}),
+        train_assemble_fn=_placeholder_assemble,
     )
     app = LatentEdgeApp(start_screen=screen)
 
@@ -529,8 +538,9 @@ async def test_ingest_screen_shows_completion_prompt(tmp_path: Path):
     assert str(out_path) in text or "1" in text  # swap count or path present
 
 
-def _fake_assemble(swaps_path: Path):
-    return [[0.0]], [0.0], 1, {}
+def _fake_assemble(swaps_path: Path) -> AssembledTrainingData:
+    split = SplitArrays(x=np.array([[0.0]], dtype="float32"), y=np.array([0.0], dtype="float32"))
+    return AssembledTrainingData(train=split, validate=split, test=split, input_dim=1, stats={"net_return": (0.0, 1.0)})
 
 
 @pytest.mark.asyncio
@@ -564,6 +574,66 @@ async def test_ingest_screen_train_key_pushes_train_screen(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_ingest_screen_auto_starts_training_when_train_after_ingest_is_on(tmp_path: Path):
+    out_path = tmp_path / "swaps.parquet"
+    model_out_path = tmp_path / "model.safetensors"
+    screen = IngestScreen(
+        pool_address="0xpool", from_block=0, to_block=9, out_path=out_path,
+        client_factory=lambda: httpx.Client(), rpc_url="http://fake",
+        chunk_size=10, max_workers=1, flush_every_n_chunks=1,
+        max_retries=1, retry_backoff_seconds=0.001, fetch_fn=_fake_fetch,
+        train_assemble_fn=_fake_assemble, model_out_path=model_out_path,
+        train_after_ingest=True,
+    )
+    app = LatentEdgeApp(start_screen=screen)
+
+    async with app.run_test() as pilot:
+        for _ in range(50):
+            await pilot.pause(0.01)
+            if isinstance(app.screen, TrainScreen):
+                break
+        active_screen = app.screen
+        assert isinstance(active_screen, TrainScreen)
+        # Let the pushed screen's own background worker finish before the
+        # context manager tears the app down — otherwise a still-running
+        # worker's queued call_from_thread update can hit an
+        # already-unmounted widget tree (a test-only race: the fake train
+        # function here completes near-instantly).
+        for _ in range(50):
+            await pilot.pause(0.01)
+            if active_screen.is_complete:
+                break
+
+    # No [T] keypress — completion alone must have pushed TrainScreen.
+    assert isinstance(active_screen, TrainScreen)
+    assert active_screen.swaps_path == out_path
+    assert active_screen.out_path == model_out_path
+
+
+@pytest.mark.asyncio
+async def test_ingest_screen_pauses_for_prompt_when_train_after_ingest_is_off(tmp_path: Path):
+    out_path = tmp_path / "swaps.parquet"
+    screen = IngestScreen(
+        pool_address="0xpool", from_block=0, to_block=9, out_path=out_path,
+        client_factory=lambda: httpx.Client(), rpc_url="http://fake",
+        chunk_size=10, max_workers=1, flush_every_n_chunks=1,
+        max_retries=1, retry_backoff_seconds=0.001, fetch_fn=_fake_fetch,
+        train_assemble_fn=_fake_assemble, train_after_ingest=False,
+    )
+    app = LatentEdgeApp(start_screen=screen)
+
+    async with app.run_test() as pilot:
+        for _ in range(50):
+            await pilot.pause(0.01)
+            if screen.is_complete:
+                break
+        await pilot.pause()
+        active_screen = app.screen
+
+    assert not isinstance(active_screen, TrainScreen)
+
+
+@pytest.mark.asyncio
 async def test_ingest_screen_train_key_ignored_before_completion(tmp_path: Path):
     # A fetch gated on an Event, so completion is deterministically held
     # back until the test explicitly releases it — a fixed time.sleep
@@ -580,7 +650,7 @@ async def test_ingest_screen_train_key_ignored_before_completion(tmp_path: Path)
         client_factory=lambda: httpx.Client(), rpc_url="http://fake",
         chunk_size=10, max_workers=1, flush_every_n_chunks=1,
         max_retries=1, retry_backoff_seconds=0.001, fetch_fn=gated_fetch,
-        train_assemble_fn=lambda p: (None, None, 0, {}),
+        train_assemble_fn=_placeholder_assemble,
     )
     app = LatentEdgeApp(start_screen=screen)
 

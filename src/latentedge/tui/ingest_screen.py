@@ -58,6 +58,7 @@ class IngestScreen(Screen[None]):
         max_rate_limit_backoff_seconds: float = DEFAULT_MAX_RATE_LIMIT_BACKOFF_SECONDS,
         model_out_path: Path = DEFAULT_MODEL_OUT_PATH,
         train_epochs: int = 100,
+        train_after_ingest: bool = False,
         ingest_fn: Callable[..., int] = default_ingest_range,
         fetch_fn: FetchFn = fetch_swaps,
         time_fn: Callable[[], float] = time.monotonic,
@@ -84,6 +85,7 @@ class IngestScreen(Screen[None]):
         self.train_assemble_fn = train_assemble_fn
         self.model_out_path = model_out_path
         self.train_epochs = train_epochs
+        self.train_after_ingest = train_after_ingest
         self.ingest_fn = ingest_fn
         self.fetch_fn = fetch_fn
         self.time_fn = time_fn
@@ -280,6 +282,15 @@ class IngestScreen(Screen[None]):
             completed=range_total, total=range_total, unit_label="complete",
             rate_per_sec=0.0, rate_unit="blocks/sec",
         )
+
+        if self.train_after_ingest:
+            self._log("train_after_ingest is on — starting training now")
+            self.query_one("#ingest-action-bar", Static).update(
+                f"Ingestion complete — wrote {total} swaps to {self.out_path}. Starting training now."
+            )
+            self._push_train_screen()
+            return
+
         self.query_one("#ingest-action-bar", Static).update(
             f"Ingestion complete — wrote {total} swaps to {self.out_path}. "
             "Press [b]T[/b] to train now, or [b]Q[/b] to exit."
@@ -290,13 +301,16 @@ class IngestScreen(Screen[None]):
         self._log(f"ERROR: {message}")
         self.query_one("#ingest-action-bar", Static).update(f"Ingestion failed: {message}. Press [b]Q[/b] to exit.")
 
-    def action_train_now(self) -> None:
-        if not self.is_complete:
-            return
+    def _push_train_screen(self) -> None:
         self.app.push_screen(TrainScreen(
             swaps_path=self.out_path, out_path=self.model_out_path, epochs=self.train_epochs,
             assemble_fn=self.train_assemble_fn,
         ))
+
+    def action_train_now(self) -> None:
+        if not self.is_complete:
+            return
+        self._push_train_screen()
 
     def action_exit_now(self) -> None:
         if not (self.is_complete or self.error is not None):
