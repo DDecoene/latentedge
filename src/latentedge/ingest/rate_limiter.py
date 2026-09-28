@@ -52,6 +52,19 @@ CEILING_RAISE_FACTOR = 1.5
 # forever.
 CLIMB_FACTOR_DECAY = 0.5
 MIN_CLIMB_FACTOR = 1.01
+# The known-good revert above only applies once a climb has proven a
+# *lower* rate safe. Getting throttled again with no such point below the
+# current rate — the very first throttle ever, or a throttle right at the
+# rate that was just reverted to — used to fall back to a flat halving
+# every time, undoing the whole point of converging: a burst of throttles
+# with no intervening successful climb would still saw the rate down hard
+# on every single one. This fraction now starts at a full halving but
+# gentles toward MIN_BACKOFF_FRACTION with each consecutive throttle that
+# isn't preceded by a new proven climb, so repeated throttling at the same
+# danger zone backs off by less and less instead of by half every time.
+INITIAL_BACKOFF_FRACTION = 0.5
+MIN_BACKOFF_FRACTION = 0.1
+BACKOFF_FRACTION_DECAY = 0.7
 
 ReleaseOutcome = Literal["success", "failed", "rate_limited"]
 
@@ -89,6 +102,7 @@ class RateLimiter:
         # throttle can fall back to it instead of halving blindly.
         self._last_stable_rate: float | None = None
         self._climb_factor = RATE_CLIMB_FACTOR
+        self._backoff_fraction = INITIAL_BACKOFF_FRACTION
         self._consecutive_successes = 0
         self._consecutive_successes_at_ceiling = 0
         self._cooldown_until = 0.0
@@ -164,7 +178,10 @@ class RateLimiter:
                             MIN_CLIMB_FACTOR, 1.0 + (self._climb_factor - 1.0) * CLIMB_FACTOR_DECAY
                         )
                     else:
-                        candidate = max(DEFAULT_MIN_RPS, self._rate / 2)
+                        candidate = max(DEFAULT_MIN_RPS, self._rate * (1.0 - self._backoff_fraction))
+                        self._backoff_fraction = max(
+                            MIN_BACKOFF_FRACTION, self._backoff_fraction * BACKOFF_FRACTION_DECAY
+                        )
                     if candidate != self._rate:
                         self._rate = candidate
                         new_rate = candidate

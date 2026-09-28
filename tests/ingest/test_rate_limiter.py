@@ -3,7 +3,7 @@ import time
 
 import pytest
 
-from latentedge.ingest.rate_limiter import RateLimiter, Cancelled, DEFAULT_MIN_RPS
+from latentedge.ingest.rate_limiter import RateLimiter, Cancelled, DEFAULT_MIN_RPS, BACKOFF_FRACTION_DECAY
 
 
 def test_limiter_starts_at_the_ceiling():
@@ -142,14 +142,31 @@ def test_limiter_climbs_more_cautiously_after_reverting_to_a_known_good_rate():
     assert limiter.rate == pytest.approx(5.0 * 1.05)
 
 
-def test_limiter_still_halves_when_no_known_good_rate_has_been_proven_yet():
+def test_limiter_halves_on_the_first_throttle_with_no_known_good_rate_proven_yet():
     # The revert-to-known-good path only applies once a climb has actually
-    # proven a lower rate was safe — a fresh limiter (or one that keeps
-    # getting throttled at or below its last known-good point) has no such
-    # evidence yet and must fall back to plain halving.
+    # proven a lower rate was safe — a fresh limiter has no such evidence
+    # yet, so its very first throttle still falls back to a full halving.
     limiter = RateLimiter(ceiling=4.0, cooldown_seconds=0)
     limiter.release("rate_limited")
     assert limiter.rate == pytest.approx(2.0)
+
+
+def test_limiter_gentles_the_fallback_cut_on_repeated_throttles_without_an_intervening_climb():
+    # Regression test: a burst of throttles hitting a rate that was
+    # already reverted to its last known-good point (no successful climb
+    # happened in between, so there's still no *lower* proven point to
+    # revert to) used to fall back to a flat halving every single time —
+    # sawing the rate down hard on every throttle in the burst instead of
+    # converging. The fallback cut must gentle with each consecutive
+    # throttle like this, not repeat the same aggressive halving forever.
+    limiter = RateLimiter(ceiling=4.0, cooldown_seconds=0)
+    limiter.release("rate_limited")  # first throttle: full halving, 4.0 -> 2.0
+    assert limiter.rate == pytest.approx(2.0)
+    limiter.release("rate_limited")  # second, with no intervening climb: gentler cut
+    assert limiter.rate == pytest.approx(2.0 * (1 - 0.5 * BACKOFF_FRACTION_DECAY))
+    second_rate = limiter.rate
+    limiter.release("rate_limited")  # third: gentler still
+    assert limiter.rate > second_rate * 0.5  # nowhere near another halving
 
 
 def test_limiter_raises_its_own_ceiling_after_a_long_clean_streak_at_it():
