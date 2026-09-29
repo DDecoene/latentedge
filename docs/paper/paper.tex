@@ -22,21 +22,22 @@ We ask whether a purpose-trained neural network can find a tradable
 short-horizon signal in the public swap history of the most liquid Uniswap~v3
 pool, WETH/USDC at the 0.05\% fee tier. We ingest about 200 days of swap
 events directly from an archive node, build one-minute bars, label each bar
-with the return of a 30-minute triple-barrier trade net of pool fees, slippage
-and gas, and evaluate on a chronological hold-out window. We find no
-tradable edge. Every trading rule loses money on both the validation and the
-test window, and the model's rankings are no better per trade than trading
-every bar. The result comes with a decomposition. A model trained on net
-return reached a test correlation of 0.35 with its label, but that correlation
-was cost prediction: the predictions correlated $-0.96$ with the cost part of
-the label and $+0.01$ with the price move. A model trained directly on the
-pre-cost price move finds a correlation of $+0.03$ to $+0.04$ on every split,
-which is inside sampling error. Adding order-flow features and a larger network
-leaves this unchanged. The same pipeline recovers planted signals in synthetic
-data (correlation 0.82 to 0.85) and finds nothing in a random walk, so the
-null result is not a failure of the machinery. A back-of-envelope calculation
-shows that a correlation near 0.3 would be needed to trade the best 1\% of
-predictions profitably, against 0.04 observed. We also report a failed earlier
+with the return of a triple-barrier trade, and evaluate on chronological
+hold-out data. We find a signal, and it is not tradable. Under a walk-forward
+study with five folds, five seeds and purged, overlapping-label-aware
+inference, a model trained on the 30-minute pre-cost price move reaches a
+pooled out-of-sample correlation of $+0.034$ (95\% interval $+0.023$ to
+$+0.045$, permutation $p=0.001$), positive in every fold and stable across
+seeds. It weakens at 120 minutes ($+0.021$) and is indistinguishable from
+zero at 240 minutes. The signal is about a twelfth of the size needed: the
+model's most confident 1\% of bars average a gross move of $+0.012\%$
+against a round-trip cost of $0.148\%$, and every trading rule we replay
+loses money on both the validation and the test window. An earlier model
+trained on net return reached a test correlation of 0.35, but that was cost
+prediction ($-0.96$ with the cost part of the label, $+0.01$ with the price
+move). Order-flow features and a larger network do not change the signal. The
+pipeline recovers planted signals in synthetic data (correlation 0.82 to
+0.85) and finds nothing in a random walk. We also report a failed earlier
 attempt with a general-purpose language model, and a unit error in the signal
 path that produced a spurious $-43\%$ backtest.
 \end{abstract}
@@ -52,8 +53,8 @@ noise in its training data, so only performance on data it has not seen
 separates a pattern from a fit. And a real pattern must still be large enough
 to pay for the cost of trading on it.
 
-This paper documents one complete attempt to find such a pattern and reports
-that there was none to find. The setting is favourable to a search: the data
+This paper documents one complete attempt to find such a pattern. It finds a
+real one, and shows that it is far too small to trade. The setting is favourable to a search: the data
 are public, complete and free of survivorship problems, since every swap is a
 log entry on chain, and the venue's cost structure (a fixed fee, gas, and a
 price-impact curve determined by the pool's liquidity) can be computed for
@@ -66,8 +67,11 @@ The contributions are modest and practical.
 \item A leakage-controlled pipeline from raw swap logs to a cost-aware
       backtest, with a planted-signal test showing it finds signals that
       exist.
-\item A null result on about 200 days of WETH/USDC data across five
-      experiments, with the sweep records that support it.
+\item A measured result on about 200 days of WETH/USDC data: a faint but
+      statistically detectable direction signal at 30 minutes, with
+      walk-forward evaluation, seed spread, block-bootstrap intervals and a
+      permutation test, and the sweep records that support it. No trading
+      rule is profitable.
 \item A diagnostic, splitting each label into its price move and its cost,
       that shows a good-looking fit statistic under a net-return target was
       cost prediction and carried no information about direction.
@@ -75,18 +79,20 @@ The contributions are modest and practical.
       Section~\ref{sec:validity}) that are as instructive as the result.
 \end{enumerate}
 
-We claim ``no detectable signal'', not ``no information''. Section~\ref{sec:power}
-states how small a signal our sample could and could not distinguish from
-zero.
+We separate statistical from economic significance. Section~\ref{sec:study_results}
+shows the signal is distinguishable from zero; Section~\ref{sec:power} shows why
+it cannot pay for the cost of trading it.
 
 \section{Background}
 
 \paragraph{Market efficiency.}
 The weak form of the efficient-market hypothesis~\cite{fama1970} says that
 prices already reflect the information in past prices, so patterns in past
-prices and volumes should not predict returns after costs. A null result here
-is what that hypothesis predicts. The value of the experiment is in showing
-where a plausible-looking signal came from, not in overturning it.
+prices and volumes should not predict returns after costs. The claim is about
+profit after costs, so a faint pattern that costs more to trade than it earns
+is consistent with it. The value of the experiment is in measuring how faint
+the pattern is, and in showing where a plausible-looking signal came from, not
+in overturning the hypothesis.
 
 \paragraph{Uniswap v3.}
 Uniswap~v3~\cite{adams2021} is a constant-product market maker with
@@ -412,7 +418,7 @@ equity. Returns are over the roughly 30-day window.}
 Trading every bar loses about \$0.83 per trade on average. The ranked slices
 lose about the same per trade at every cut (roughly \$0.8 to \$1.2), so the
 total loss shrinks only because fewer trades are taken. The model's ranking
-has no per-trade value on this data. Against the shuffled control, run 4's
+has no per-trade value net of costs on this window. Against the shuffled control, run 4's
 top-1\% slice on the test window is worse than random (\$2.5 lost per trade
 against \$1.3, on 298 trades), and the other slices match it to within the
 noise of a few hundred trades. The minimum-edge rule takes zero to three
@@ -424,6 +430,85 @@ agrees with the finding above, and every rule still lost.
 The oracle earns only \$0.10 to \$0.14 per trade and +15\% to +20\% per window
 even with perfect foresight of every trade, because typical 30-minute moves
 (about 0.17\%) are small against a round-trip cost of about 0.13\%.
+
+\subsection{Walk-forward study: the signal is real and small}
+\label{sec:study_results}
+
+The study of Section~\ref{sec:study} covers the full 200 days: the last half
+of the history, 144,850 bars or about 100 days, is judged in five consecutive
+test folds, each by models trained only on earlier bars. It uses the 64,64
+network on all eleven features and the gross target. The sweep record is
+\texttt{docs/paper/results/studies/20260929T192107Z.json}.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}rcccccc@{}}
+\toprule
+Horizon & Band & Gross corr. & 95\% interval & $p$ & Seeds & Folds \\
+(min) & (std) & (pooled) & & & (range) & (range) \\
+\midrule
+30  & 2.0 & $+0.034$ & $+0.023,\ +0.045$ & 0.001 & $+0.027,\ +0.032$ & $+0.018,\ +0.064$ \\
+120 & 4.0 & $+0.021$ & $+0.002,\ +0.040$ & 0.047 & $+0.011,\ +0.026$ & $+0.008,\ +0.036$ \\
+240 & 5.7 & $+0.014$ & $-0.010,\ +0.036$ & 0.340 & $-0.006,\ +0.024$ & $-0.028,\ +0.053$ \\
+\bottomrule
+\end{tabular}
+\caption{Pooled out-of-sample gross correlation. Intervals are moving-block
+bootstrap with blocks of one label length; $p$ is a circular-shift permutation
+test, 1,000 resamples each, so 0.001 is the smallest value attainable. The
+effective number of independent labels is about 4,800, 1,200 and 600 at the
+three horizons. Seeds and folds give the range of the correlation over the five
+seeds (all folds pooled) and over the five folds (seeds averaged).}
+\label{tab:study}
+\end{table}
+
+At 30 minutes the correlation is $+0.034$ with an interval that excludes zero,
+is positive in all five folds, and varies little across seeds (0.027 to 0.032).
+The single-window figures of the earlier runs, which looked like noise, fit
+this: with about 1,400 effective labels one window has a standard error near
+0.03, and pooling 100 days cuts it to about 0.014. The signal weakens as the
+horizon grows and disappears at 240 minutes, where the interval includes zero
+and one fold is negative. With three horizons tested, the 30-minute result
+survives a Bonferroni correction ($0.001\times 3<0.05$) and the 120-minute
+result ($0.047\times 3=0.14$) does not, so we treat only the 30-minute signal
+as established. The permutation test gives 0.001, its smallest attainable
+value, so the true $p$ may be lower.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}rlrrrrl@{}}
+\toprule
+Horizon & Bars traded & $n$ & Gross & Cost & Net & Net 95\% interval \\
+\midrule
+30  & top 1\%  & 2,204   & $+0.012\%$ & $0.148\%$ & $-0.136\%$ & $-0.159,\ -0.114$ \\
+30  & top 10\% & 17,050  & $+0.005\%$ & $0.123\%$ & $-0.119\%$ & $-0.126,\ -0.111$ \\
+30  & all       & 144,854 & $-0.005\%$ & $0.114\%$ & $-0.120\%$ & \\
+120 & top 1\%  & 1,965   & $+0.023\%$ & $0.154\%$ & $-0.131\%$ & $-0.184,\ -0.085$ \\
+120 & top 10\% & 16,416  & $+0.008\%$ & $0.124\%$ & $-0.117\%$ & $-0.137,\ -0.095$ \\
+120 & all       & 144,850 & $-0.001\%$ & $0.114\%$ & $-0.116\%$ & \\
+240 & top 1\%  & 1,054   & $+0.031\%$ & $0.281\%$ & $-0.250\%$ & $-0.454,\ -0.099$ \\
+240 & top 10\% & 14,484  & $+0.022\%$ & $0.131\%$ & $-0.109\%$ & $-0.148,\ -0.074$ \\
+240 & all       & 144,848 & $+0.006\%$ & $0.114\%$ & $-0.108\%$ & \\
+\bottomrule
+\end{tabular}
+\caption{Mean return per bar of the model's top slices, on a \$1,000 round
+trip, pooled over the five folds. Each fold's cutoff comes from its own
+validation predictions. Per-trade means, without capital or position limits.}
+\label{tab:slices}
+\end{table}
+
+Table~\ref{tab:slices} shows why this does not trade. The gross move of the
+selected bars rises with selectivity (at 30 minutes $+0.001\%$ for the top
+quarter, $+0.005\%$ for the top 10\%, $+0.012\%$ for the top 1\%), which is
+what a real ranking signal looks like, but the largest gross move, $+0.012\%$,
+is a twelfth of the $0.148\%$ cost of the same bars. Selected bars are also
+dearer to trade than average (cost $0.148\%$ against $0.114\%$), because the
+model's predictions correlate $+0.13$ with cost: it favours volatile,
+high-fee moments, where moves are larger and costs larger too. The net return
+of every slice is negative with an interval that excludes zero, and the top 1\%
+is worse than trading every bar. At 240 minutes the correlation with cost
+rises to $+0.35$ and the top 1\% pays $0.281\%$.
 
 \subsection{Why a small correlation cannot be traded here}
 \label{sec:power}
@@ -437,17 +522,19 @@ breaks even when this equals the round-trip cost $c\approx 0.13\%$, so
 \rho\,z \;\approx\; \frac{c}{\sigma} \;\approx\; 0.76 .
 \]
 Trading only the top 1\% of predictions (mean $z\approx 2.7$) still needs
-$\rho\approx 0.29$, against $0.04$ observed. At longer horizons the arithmetic
-does not rescue the strategy: a four-hour horizon needs $\rho\approx 0.27$ at
-$z=1$, and more for a rank rule.
+$\rho\approx 0.29$, against $0.034$ observed, and the direct measurement in
+Table~\ref{tab:slices} agrees. The longer horizons do not rescue the strategy:
+a four-hour horizon needs $\rho\approx 0.27$ at $z=1$, and the measured
+correlation there is $+0.014$.
 
-On the other side of the ledger, the sample cannot detect a small $\rho$. Labels
-overlap: one 30-minute label per one-minute bar means the effective number of
-independent points per window is about $1/30$ of the bar count, roughly
-1,400. The standard error of a correlation is then about 0.03, so
-correlations under about 0.03 are indistinguishable from zero. The observed
-$+0.03$ to $+0.04$ is at that boundary, and it matches the 0.02 to 0.03 that
-the pipeline gives on a pure random walk.
+The other side of the ledger is detection. Labels overlap: one 30-minute label
+per one-minute bar means the effective number of independent points is about
+$1/30$ of the bar count. A single 30-day window gives roughly 1,400, a standard
+error near 0.03, so correlations under about 0.03 cannot be told from zero in
+one window, which is why the earlier single-split runs were inconclusive. The
+pooled walk-forward sample has about 4,800 effective labels and a standard
+error near 0.014, enough to see $+0.034$. Detecting a signal and being able to
+trade it are separate questions, and here the answers differ.
 
 \section{Discussion}
 
@@ -466,13 +553,18 @@ attempt looked better than it was. Five points summarize it.
 \item \textbf{Unseen data is what separates a real pattern from a fitted
   one.} The chronological split is the instrument: 0.19 on training and 0.02
   on unseen data for the random walk.
-\item \textbf{Absence of a pattern is the expected result.} The inputs were
-  the last few minutes of price and volume in the most watched pool
-  on chain. Easy patterns in public inputs are traded away, which removes
-  them.
+\item \textbf{A faint pattern that does not pay is the expected result.}
+  The inputs were the last few minutes of price and volume in the most watched
+  pool on chain. Easy patterns in public inputs are traded away, and what
+  remains is small: a correlation of $+0.034$ that fades with the horizon and
+  is gone at four hours.
 \item \textbf{A real pattern must also clear cost.} Even perfect foresight
   earned only +15\% to +20\% per 30-day window here, so a weak signal is
   not enough.
+\item \textbf{Statistical and economic significance differ.} The 30-minute
+  signal has $p=0.001$ and is a twelfth of the cost of trading it. Reporting
+  only the first would suggest an edge; reporting only the second would
+  hide that a signal exists.
 \end{enumerate}
 
 \section{Threats to validity}
@@ -488,10 +580,11 @@ produced before the fix is invalid and none is reported here.
 
 \paragraph{Other threats.}
 \begin{itemize}
-\item \emph{One pool, one 30-day test window.} The test window may be a
-  particular regime; test correlations were higher than validation
-  correlations for the net model, which looks like a regime difference and
-  not skill.
+\item \emph{One pool, one period.} The walk-forward study spans about 100
+  days of test data in five folds, which addresses the single 30-day window,
+  but all of it is one pool in one stretch of 2026. The fold correlations at
+  30 minutes range from $+0.018$ to $+0.064$, so regime dependence is real
+  though its sign did not change.
 \item \emph{Simplified costs.} Slippage uses a depth approximation, not
   tick-crossing math, and gas uses the base fee at 150,000 gas per swap,
   ignoring priority fees and aggregator routing. Real costs may be higher.
@@ -500,22 +593,29 @@ produced before the fix is invalid and none is reported here.
   understates capital efficiency when exits are early.
 \item \emph{Validation window used for early stopping.} Validation figures
   for run 5 are slightly optimistic; the test window is unaffected.
-\item \emph{Sampling error.} Labels overlap, and the gross correlations we
-  report are inside about one standard error of zero.
+\item \emph{Multiple comparisons and design selection.} Three horizons are
+  tested, and we correct for that (Section~\ref{sec:study_results}). The
+  features, the target and the network sizes were chosen after seeing the
+  earlier runs, whose test windows overlap the folds of the study, so the
+  study is a robustness check of a fixed design, not a fully blind test.
+  The permutation $p$-value is bounded below by 0.001 at 1,000 resamples.
 \item \emph{Gaps in the data.} Ingestion tracks fetched intervals and
   training refuses holes, but the archive endpoint itself is a single source.
-\item \emph{One seed.} Each configuration was trained once.
+\item \emph{Cost model.} The slice costs in Table~\ref{tab:slices} use the
+  same simplified cost model as the labels, and the model's mild preference
+  for costly bars means a better cost model would change the net figures.
 \end{itemize}
 
 \section{Limitations and future work}
 
-The following were not tested and are not claimed: horizons beyond 30
-minutes (the arithmetic above says a longer horizon is unlikely to help, but
-the claim is argued, not measured), other pools and less liquid ones, other
-bar sizes, model families other than a small feed-forward network,
-walk-forward evaluation, several seeds, data outside these 200 days, a control
+The following were not tested and are not claimed: horizons beyond four
+hours, other pools and less liquid ones, other bar sizes, model families other
+than a small feed-forward network, data outside these 200 days, a control
 without gas price and volatility, and information outside the swap logs such
-as other venues or the mempool. Liquidity-provision fee income, which turns
+as other venues or the mempool. The signal's decay with horizon is measured at
+three horizons only. Shorter horizons, where a signal of this size is a larger
+share of the typical move, are the natural next step, though they face the same
+fixed cost per trade. Liquidity-provision fee income, which turns
 the question from prediction into carry, is also untested. Cross-market
 transfer and a less liquid pool are the most obvious next experiments.
 
@@ -546,15 +646,17 @@ a chronological split with a test window used once.
 
 \section{Conclusion}
 
-On about 200 days of WETH/USDC 0.05\% swaps, a small neural network trained
-to predict 30-minute trade returns finds no tradable edge. What looked like
-skill under a net-return target was cost prediction. Under a price-move
-target the signal is at the noise floor, adding order flow and network size
-does not move it, and a correlation near 0.3 would be needed before costs
-allow a profit on the best predictions. The pipeline recovers planted
-signals, so the result is about the market and its inputs, not about the
-machinery. We publish it as a result because a search that cannot report
-a null is not a search.
+On about 200 days of WETH/USDC 0.05\% swaps, a small neural network trained on
+the pre-cost price move finds a faint direction signal at a 30-minute horizon:
+a pooled out-of-sample correlation of $+0.034$ (95\% interval $+0.023$ to
+$+0.045$), positive in every walk-forward fold and stable across seeds. It fades
+at 120 minutes and is absent at 240. It is about a twelfth of the size needed
+to cover the cost of trading it, and every trading rule loses. What looked like
+much stronger skill under a net-return target was cost prediction. Order flow
+and network size do not move the signal, and the pipeline recovers planted
+signals, so the result concerns the market and its inputs and not the machinery.
+The finding is a measurement of how small the predictable part of a liquid
+on-chain market is, and that it does not pay for trading it.
 
 \begin{thebibliography}{9}
 

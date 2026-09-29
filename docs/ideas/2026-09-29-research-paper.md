@@ -371,3 +371,14 @@ Measured rate limit and ingest time (to be written up as a short subsection):
 - No tooling or process fingerprints in anything committed.
 - Report null and negative results as results.
 - No claim of an edge without out-of-sample evidence.
+
+## Walk-forward study result (2026-09-29, late)
+
+`latentedge study`, 200 days, last half in five walk-forward folds, five seeds,
+64,64 network, gross target. Pooled out-of-sample gross correlation: 30 min
++0.034 [+0.023, +0.045], p=0.001, all five folds positive, seeds 0.027 to 0.032;
+120 min +0.021 [+0.002, +0.040], p=0.047; 240 min +0.014 [-0.010, +0.036],
+p=0.34. Top 1% of bars at 30 min: gross +0.012% against cost 0.148%, net
+-0.136%. The paper's claim changed from "no detectable signal" to "a real,
+faint signal that is a twelfth of the cost of trading it". Record copied to
+`docs/paper/results/studies/`.

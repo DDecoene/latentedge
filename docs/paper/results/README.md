@@ -19,3 +19,14 @@ position.
 
 Not cited: `20260929T180148Z` (a re-run of the `20260929T175549Z` model with
 identical results).
+
+## Walk-forward study
+
+`studies/20260929T192107Z.json`: the robustness study (`latentedge study`) at
+horizons of 30, 120 and 240 minutes, five seeds, five walk-forward test folds
+over the last half of the same history, 64,64 network, gross target, all eleven
+features, 1,000 bootstrap and 1,000 permutation resamples. Holds every
+(horizon, seed, fold) row and each horizon's pooled summary: gross correlation
+with block-bootstrap interval and permutation p-value, correlation by seed and
+by fold, and the mean gross, cost and net return of the top slices against all
+bars. The config and the git state of the run are recorded in the file.
