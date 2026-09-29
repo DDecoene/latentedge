@@ -72,6 +72,55 @@ suspicious result was investigated, fixed in the signal client, and covered by
 a regression test. Any result produced before that fix (including a -43%
 backtest) is invalid and should not be cited.
 
+## The narrative: what a learned pattern is, and why this one failed
+
+Part of the story, and probably the paper's most useful teaching thread. The
+working idea at the start: give a model data, let its weights adjust until a
+pattern emerges, apply that pattern to unseen data to predict where the price
+goes in the next window, and trade on the prediction. That describes the
+mechanism correctly. What it leaves out, and what the project made concrete:
+
+1. A model can only find a pattern that is in the data. Weights adjust toward
+   whatever regularity exists and cannot create one. Shown directly: on
+   synthetic swaps with a planted drift the pipeline recovers it (gross
+   correlation 0.82 to 0.85 on unseen data); on a pure random walk it finds
+   nothing on unseen data (0.02 to 0.03), while its fit on the training
+   data alone was 0.19.
+2. The pattern the model did learn was the wrong one. Gas price and
+   volatility make a trade cheaper or dearer, which is easy to predict, so
+   the model learned trading cost (correlation -0.96 with cost, +0.01 with
+   the pre-cost price move). It raised the headline correlation with net
+   return to 0.35 without saying anything about direction. A good-looking
+   fit statistic was cost prediction, found only by splitting the label
+   into price move and cost.
+3. Unseen data is what separates a real pattern from a fitted one. Any
+   flexible model fits noise on its training data; the chronological split
+   is the instrument that exposes it (train 0.19, unseen 0.02 on the random
+   walk).
+4. Absence of a pattern here is the expected result, not a defect. The inputs
+   were the last minutes of price and volume in the most watched pool
+   on-chain, visible to every participant, and easy patterns in public
+   inputs are traded away, which removes them. That is market efficiency in
+   miniature.
+5. A real pattern must also clear the trading cost. A round trip costs about
+   0.13%, and even perfect foresight of every trade earned only +15.5% over
+   the test window, so a weak signal is not enough; it has to be a strong
+   one.
+
+What follows for the design: the test was validated (the pipeline can find
+direction when it exists), so the open question is the information, not the
+machinery. Inputs others cannot act on quickly are the next candidates,
+starting with signed order flow (direction and size of swaps), which price
+bars discard. Every experiment is gated the same way: gross (pre-cost)
+correlation must be clearly above zero on both validate and test before
+costs matter. A null result under that gate, with the planted-signal check
+behind it, is a result the paper can defend.
+
+Wording note: claim "no detectable signal", not "no information". Labels
+overlap (one 30-minute label per 1-minute bar), so the effective sample is
+about 1/30 of the bar count and correlations under roughly 0.03 cannot be
+told apart from zero.
+
 ## Experiments the paper needs
 
 Done (2026-09-29):
@@ -116,6 +165,17 @@ label settings and the feature set with it.
 |---|---|---|---|---|---|
 | 20260929T173520Z | all 7 | 30 min, 2 std | not measured | not measured | no edge (first sweep) |
 | 20260929T175549Z | all 7 | 30 min, 2 std | +0.01 | -0.96 | no edge; model predicts cost |
+
+Pipeline validation (synthetic data, `tests/test_cli_backtest.py`): on swaps
+whose price follows a hidden drift that flips sign every two hours, the same
+pipeline (features, labels, net-return target, training, metrics) recovers
+the planted signal, with gross correlation 0.82 (validate) and 0.85 (test).
+On a pure random walk the same run gives 0.03 and 0.02. The real-data figures
+(0.025 and 0.01) sit at the random-walk level. Caveat for the write-up: labels
+overlap (a 30-minute label per 1-minute bar), so the effective sample is
+roughly 1/30 of the bar count and a correlation must be about 0.03 or more
+before it is distinguishable from zero. "No detectable signal" is the claim,
+not "no information".
 
 Planned: without gas and volatility at 30 minutes; all features at 240
 minutes with a 6 std band; both together.

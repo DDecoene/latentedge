@@ -233,3 +233,50 @@ def test_train_can_chain_the_sweep_and_then_the_backtest(tmp_path: Path):
     assert len(list((tmp_path / "sweeps").glob("*.json"))) == 1
     assert Path(str(model) + ".backtest.json").exists()
     assert result.output.index("scenarios saved") < result.output.index("backtest over")
+
+
+def _write_trending_swaps(path: Path, n_minutes: int = 8000, seed: int = 5) -> None:
+    """Swaps whose price follows a hidden drift that flips sign every couple
+    of hours, so the last few bars' return genuinely predicts the next
+    half hour's. A pipeline that cannot find this has a bug."""
+    rng = np.random.default_rng(seed)
+    rows = []
+    price, drift, log_index = 3000.0, 0.0, 0
+    for minute in range(n_minutes):
+        if minute % 120 == 0:
+            drift = rng.choice([-1.0, 1.0]) * 0.0004
+        for _ in range(2):
+            price *= 1 + drift / 2 + rng.normal(0, 0.0004)
+            log_index += 1
+            rows.append(
+                {
+                    "block_number": 1_000 + minute // 12,
+                    "timestamp": 1_700_000_000 + minute * 60,
+                    "tx_hash": f"0x{log_index:064x}",
+                    "log_index": log_index,
+                    "sqrt_price_x96": str(price_to_sqrt_price_x96(1.0 / price, decimals0=6, decimals1=18)),
+                    "tick": 0,
+                    "liquidity": str(10**18),
+                    "amount0": float(abs(rng.normal(5000, 1000)) * 10**6),
+                    "amount1": 0.0,
+                    "base_fee_wei": 15_000_000_000,
+                }
+            )
+    df = pd.DataFrame(rows)
+    df.to_parquet(path, index=False)
+    write_progress(path, [(int(df["block_number"].min()), int(df["block_number"].max()))])
+
+
+def test_the_pipeline_finds_a_planted_direction_signal(tmp_path: Path):
+    swaps = tmp_path / "swaps.parquet"
+    model = tmp_path / "model.safetensors"
+    _write_trending_swaps(swaps)
+
+    result = CliRunner().invoke(
+        cli, ["train", "--swaps", str(swaps), "--out", str(model), "--epochs", "500", "--no-sweep-after-train"]
+    )
+
+    assert result.exit_code == 0, result.output
+    splits = json.loads(Path(str(model) + ".metrics.json").read_text())["splits"]
+    for name in ("validate", "test"):
+        assert splits[name]["gross_correlation"] > 0.15, (name, splits[name])
