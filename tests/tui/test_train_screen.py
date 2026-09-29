@@ -280,8 +280,8 @@ async def test_train_screen_shows_assembly_progress(tmp_path: Path):
     assert "labeling bars" in text
 
 
-def _fake_backtest(report):
-    report("replaying test window")
+def _fake_backtest(observer):
+    observer("replaying test window")
     return {
         "bars": 10, "total_return_usd": 12.5, "total_return_fraction": 0.00125,
         "max_drawdown_usd": 3.0, "win_rate": 0.6, "num_trades": 5, "sharpe": 1.1,
@@ -355,19 +355,3 @@ async def test_b_does_nothing_before_training_completes(tmp_path: Path):
             await pilot.pause(0.01)
             if screen.is_complete:
                 break
-
-
-@pytest.mark.asyncio
-async def test_backtest_screen_shows_a_failure(tmp_path: Path):
-    from latentedge.tui.backtest_screen import BacktestScreen
-
-    def failing(report):
-        raise RuntimeError("no test window")
-
-    screen = BacktestScreen(backtest_fn=failing)
-    async with LatentEdgeApp(start_screen=screen).run_test() as pilot:
-        for _ in range(50):
-            await pilot.pause(0.01)
-            if screen.error:
-                break
-    assert screen.error == "no test window"

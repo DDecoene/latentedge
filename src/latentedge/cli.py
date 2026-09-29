@@ -3,7 +3,7 @@ import os
 import sys
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import click
@@ -13,7 +13,7 @@ import pandas as pd
 from dotenv import load_dotenv
 
 from latentedge import config
-from latentedge.backtest import build_backtest_inputs, daily_sharpe, run_backtest
+from latentedge.backtest import BacktestObserver, build_backtest_inputs, daily_sharpe, run_backtest
 from latentedge.bars import build_bars
 from latentedge.features import compute_feature_stats, save_feature_stats, standardize_features, standardize_value
 from latentedge.metrics import build_training_metrics, load_training_metrics, save_training_metrics
@@ -42,10 +42,12 @@ from latentedge.model import train as train_model
 from latentedge.safety_guard import SafetyGuard
 from latentedge.signal_client import SignalClient
 from latentedge.split import chronological_split
+from latentedge import sweep as sweeping
 from latentedge.store import read_swaps
 from latentedge.training_data import FEATURE_COLUMNS, AssembledTrainingData, SplitArrays, assemble_training_data
 from latentedge.tui.app import LatentEdgeApp
 from latentedge.tui.backtest_screen import BacktestScreen, describe_summary
+from latentedge.tui.sweep_screen import SweepScreen
 from latentedge.tui.ingest_screen import IngestScreen
 from latentedge.tui.train_screen import TrainScreen
 
@@ -505,7 +507,7 @@ def backtest(
     """
     params = BacktestParams(initial_equity, max_position_fraction, daily_loss_limit_fraction, full_size_return)
     if sys.stdout.isatty():
-        screen = BacktestScreen(backtest_fn=lambda report: _compute_backtest(swaps, model, params, report))
+        screen = BacktestScreen(backtest_fn=lambda observer: _compute_backtest(swaps, model, params, observer))
         LatentEdgeApp(start_screen=screen).run()
         if screen.error is not None:
             click.echo(f"backtest failed: {screen.error}", err=True)
@@ -542,19 +544,20 @@ class BacktestParams:
             raise click.UsageError(f"invalid LATENTEDGE_BACKTEST_* value: {exc}") from None
 
 
-def _chained_backtest_fn(swaps: Path, model: Path) -> Callable[[Callable[..., None]], dict]:
+def _chained_backtest_fn(swaps: Path, model: Path) -> Callable[[BacktestObserver], dict]:
     """The backtest a TrainScreen chains into, configured from env vars
     (resolved now, so a bad value fails before the TUI starts)."""
     params = BacktestParams.from_env()
-    return lambda report: _compute_backtest(swaps, model, params, report)
+    return lambda observer: _compute_backtest(swaps, model, params, observer)
 
 
 def _compute_backtest(
-    swaps: Path, model: Path, params: BacktestParams, report: Callable[..., None]
+    swaps: Path, model: Path, params: BacktestParams, observer: BacktestObserver
 ) -> dict:
     """Runs the backtest and writes <model>.backtest.json; returns the
-    summary. report(stage, done, total) is called between and within the
-    slow stages and may raise to abort. Failures raise ClickException."""
+    summary. The observer is told of each slow stage and then watches the
+    replay itself; any of its callbacks may raise to abort. Failures raise
+    ClickException."""
     metrics_path = Path(str(model) + ".metrics.json")
     if not metrics_path.exists():
         raise click.ClickException(f"{metrics_path} not found — train the model first.")
@@ -565,12 +568,12 @@ def _compute_backtest(
             "backtest can't be guaranteed — retrain the model."
         )
 
-    assembled, swap_df = _prepare_labeled_bars(swaps, report)
+    assembled, swap_df = _prepare_labeled_bars(swaps, observer)
     window = assembled[assembled["bar_start"] >= test_start]
     if window.empty:
         raise click.ClickException(f"no labeled bars at or after the model's test window start ({test_start}).")
 
-    report("replaying test window")
+    observer("replaying test window")
     inputs = build_backtest_inputs(window, swap_df, FEATURE_COLUMNS)
     client = SignalClient(model, input_dim=len(FEATURE_COLUMNS), feature_columns=FEATURE_COLUMNS)
     guard = SafetyGuard(
@@ -588,6 +591,7 @@ def _compute_backtest(
         guard=guard,
         initial_equity_usd=params.initial_equity,
         timestamps=inputs.timestamps,
+        observer=observer,
     )
 
     summary = {
@@ -611,6 +615,149 @@ def _compute_backtest(
 def _run_backtest_direct(swaps: Path, model: Path, params: BacktestParams) -> None:
     """Backtests without the TUI — used by `backtest` when stdout isn't a
     tty and by the non-tty chained (--backtest-after-train) runs."""
-    summary = _compute_backtest(swaps, model, params, lambda *_: None)
+    summary = _compute_backtest(swaps, model, params, BacktestObserver())
     click.echo(f"backtest over {describe_summary(summary)}")
     click.echo(f"summary saved to {model}.backtest.json")
+
+
+DEFAULT_SWEEP_MIN_EDGES = "0,0.0013"
+DEFAULT_SWEEP_FULL_SIZE_RETURNS = "0.002"
+DEFAULT_SWEEP_TOP_FRACTIONS = "0.01,0.05,0.10,0.25,0.50,1.0"
+
+
+def _parse_float_list(name: str, raw: str) -> list[float]:
+    try:
+        values = [float(part) for part in raw.split(",") if part.strip()]
+    except ValueError:
+        raise click.UsageError(f"{name} must be a comma-separated list of numbers, got {raw!r}.") from None
+    if not values:
+        raise click.UsageError(f"{name} must list at least one number.")
+    return values
+
+
+@dataclass(frozen=True)
+class SweepGrid:
+    min_edges: list[float]
+    full_size_returns: list[float]
+    top_fractions: list[float]
+
+
+def _compute_sweep(
+    swaps: Path, model: Path, params: BacktestParams, grid: SweepGrid, out_dir: Path,
+    observer: sweeping.SweepObserver,
+) -> dict:
+    """Runs every scenario of the grid on the validation and test windows
+    plus the reference strategies, saves the lot under out_dir and returns
+    {"path", "scenarios", "selection"}. Failures raise ClickException."""
+    metrics_path = Path(str(model) + ".metrics.json")
+    if not metrics_path.exists():
+        raise click.ClickException(f"{metrics_path} not found — train the model first.")
+    metrics = load_training_metrics(metrics_path)
+    test_start = metrics.get("test_start")
+    if test_start is None:
+        raise click.ClickException(
+            f"{metrics_path} has no recorded test window (trained before this was tracked) — retrain the model."
+        )
+    validate_bars = int(metrics["splits"]["validate"]["n"])
+
+    assembled, swap_df = _prepare_labeled_bars(swaps, observer)
+    windows = sweeping.split_windows(assembled, test_start, validate_bars)
+    for name, window in windows.items():
+        if window.empty:
+            raise click.ClickException(f"the {name} window has no labeled bars.")
+
+    observer("computing model predictions")
+    client = SignalClient(model, input_dim=len(FEATURE_COLUMNS), feature_columns=FEATURE_COLUMNS)
+    inputs = {name: build_backtest_inputs(window, swap_df, FEATURE_COLUMNS) for name, window in windows.items()}
+    model_predictions = {name: client.predict_batch(inputs[name].features) for name in windows}
+
+    scenarios = sweeping.build_scenarios(grid.min_edges, grid.full_size_returns, grid.top_fractions)
+    rows: list[dict] = []
+    for index, scenario in enumerate(scenarios):
+        observer(
+            f"{scenario.window} / {scenario.signal} / {sweeping.describe_rule(asdict(scenario))}",
+            index, len(scenarios),
+        )
+        predictions = sweeping.predictions_for(
+            scenario, model_predictions[scenario.window], model_predictions[sweeping.WINDOW_VALIDATE],
+            windows[scenario.window],
+        )
+        row = sweeping.run_scenario(
+            scenario, inputs[scenario.window], predictions, params.max_position_fraction,
+            params.daily_loss_limit_fraction, params.initial_equity,
+        )
+        rows.append(row)
+        observer.on_scenario(row)
+
+    meta = {
+        "model": str(model),
+        "model_sha256": sweeping.file_sha256(model),
+        "swaps": str(swaps),
+        "ingested_block_ranges": read_progress(swaps),
+        "test_start": test_start,
+        "validate_bars": validate_bars,
+        "initial_equity_usd": params.initial_equity,
+        "max_position_fraction": params.max_position_fraction,
+        "daily_loss_limit_fraction": params.daily_loss_limit_fraction,
+        "min_edges": grid.min_edges,
+        "full_size_returns": grid.full_size_returns,
+        "top_fractions": grid.top_fractions,
+        "bar_interval_seconds": config.BAR_INTERVAL_SECONDS,
+        "label_horizon_seconds": config.LABEL_HORIZON_SECONDS,
+        "training_metrics": metrics,
+    }
+    path = sweeping.write_sweep(out_dir, meta, rows)
+    return {"path": str(path), "scenarios": rows, "selection": sweeping.select_on_validate(rows)}
+
+
+@cli.command()
+@click.option(
+    "--swaps", type=click.Path(path_type=Path), default=Path("data/swaps.parquet"), envvar="LATENTEDGE_SWEEP_SWAPS",
+    help="Falls back to the LATENTEDGE_SWEEP_SWAPS env var (or a .env file).",
+)
+@click.option(
+    "--model", type=click.Path(path_type=Path), default=Path("data/model.safetensors"), envvar="LATENTEDGE_SWEEP_MODEL",
+    help="Falls back to the LATENTEDGE_SWEEP_MODEL env var (or a .env file).",
+)
+@click.option(
+    "--out-dir", type=click.Path(path_type=Path), default=Path("data/sweeps"), envvar="LATENTEDGE_SWEEP_OUT_DIR",
+    help="Where each sweep is saved (one timestamped .json and .csv per run, never overwritten). "
+    "Falls back to the LATENTEDGE_SWEEP_OUT_DIR env var (or a .env file).",
+)
+@click.option(
+    "--min-edges", default=DEFAULT_SWEEP_MIN_EDGES, envvar="LATENTEDGE_SWEEP_MIN_EDGES",
+    help="Comma-separated minimum predicted returns a trade must clear. Falls back to LATENTEDGE_SWEEP_MIN_EDGES.",
+)
+@click.option(
+    "--top-fractions", default=DEFAULT_SWEEP_TOP_FRACTIONS, envvar="LATENTEDGE_SWEEP_TOP_FRACTIONS",
+    help="Comma-separated shares of bars the model trades, the ones it ranks highest, at full size — a rule "
+    "that works even when no prediction is above zero. The cutoff is set on the validation window. "
+    "Falls back to LATENTEDGE_SWEEP_TOP_FRACTIONS.",
+)
+@click.option(
+    "--full-size-returns", default=DEFAULT_SWEEP_FULL_SIZE_RETURNS, envvar="LATENTEDGE_SWEEP_FULL_SIZE_RETURNS",
+    help="Comma-separated predicted returns at which a position sizes at the full maximum. "
+    "Falls back to LATENTEDGE_SWEEP_FULL_SIZE_RETURNS.",
+)
+def sweep(
+    swaps: Path, model: Path, out_dir: Path, min_edges: str, full_size_returns: str, top_fractions: str
+) -> None:
+    """Replays the model under a grid of trading rules on the validation and
+    test windows, next to an always-trade and an oracle reference, and
+    keeps every result for comparison. Equity and risk limits come from the
+    LATENTEDGE_BACKTEST_* settings."""
+    params = BacktestParams.from_env()
+    grid = SweepGrid(
+        _parse_float_list("--min-edges", min_edges), _parse_float_list("--full-size-returns", full_size_returns),
+        _parse_float_list("--top-fractions", top_fractions),
+    )
+    if sys.stdout.isatty():
+        screen = SweepScreen(sweep_fn=lambda observer: _compute_sweep(swaps, model, params, grid, out_dir, observer))
+        LatentEdgeApp(start_screen=screen).run()
+        if screen.error is not None:
+            click.echo(f"sweep failed: {screen.error}", err=True)
+            raise SystemExit(1)
+        return
+
+    result = _compute_sweep(swaps, model, params, grid, out_dir, sweeping.SweepObserver())
+    click.echo(sweeping.describe_sweep(result))

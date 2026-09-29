@@ -34,15 +34,19 @@ class SafetyGuard(BaseModel):
     # with the prediction's magnitude — per spec 3.5, the guard uses the
     # predicted return's magnitude directly for sizing, not just its sign.
     full_size_return: float
+    # A trade is only taken when the predicted return is strictly above
+    # this, so a model whose predictions don't clear the round-trip cost
+    # can be made to sit out. 0 keeps the plain "predicted > 0" rule.
+    min_edge: float = 0.0
 
     def size_position(self, state: GuardState, predicted_return: float, timestamp: int) -> tuple[float, GuardState]:
         state = roll_to_day(state, timestamp)
 
-        # `not (predicted_return > 0)` rather than `<= 0` also catches
+        # `not (predicted_return > min_edge)` rather than `<=` also catches
         # NaN, which fails every comparison (NaN <= 0 is False) — the
         # signal client should already reject NaN before it gets here,
         # but the guard defends itself too rather than relying on that.
-        if state.locked_out or not (predicted_return > 0) or state.equity_usd <= 0:
+        if state.locked_out or not (predicted_return > self.min_edge) or state.equity_usd <= 0:
             return 0.0, state
 
         confidence = min(predicted_return / self.full_size_return, 1.0)

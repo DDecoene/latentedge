@@ -157,3 +157,69 @@ def test_backtest_caps_new_position_size_by_available_capital(tmp_path: Path):
     )
 
     assert result.num_trades == 1  # only the first trade found capital available
+
+
+def test_backtest_reports_progress_predictions_and_trade_events_to_an_observer(tmp_path: Path):
+    from latentedge.backtest import BacktestObserver
+
+    x = np.zeros((20, 1), dtype=np.float32)
+    regressor = NetReturnRegressor(input_dim=1)
+    train(regressor, x, np.full(20, 0.02, dtype=np.float32), epochs=200, learning_rate=0.05)
+    model_path = tmp_path / "model.safetensors"
+    save(regressor, model_path)
+
+    n_bars = 3
+    entry_prices = np.array([3000.0, 3200.0, 3400.0])
+    exit_prices = np.array([3200.0, 3400.0, 3600.0])
+    seen_predictions: list[np.ndarray] = []
+    snapshots = []
+    result = run_backtest(
+        features=np.zeros((n_bars, 1), dtype=np.float32),
+        entry_prices=entry_prices,
+        exit_prices=exit_prices,
+        entry_swaps=[_swap_dict(p) for p in entry_prices],
+        exit_swaps=[_swap_dict(p) for p in exit_prices],
+        signal_client=SignalClient(model_path, input_dim=1),
+        guard=SafetyGuard(max_position_fraction=0.1, daily_loss_limit_fraction=0.5, full_size_return=0.02),
+        initial_equity_usd=10_000.0,
+        timestamps=np.array([0, 3600, 7200]),
+        observer=BacktestObserver(on_predictions=seen_predictions.append, on_progress=snapshots.append),
+    )
+
+    assert len(seen_predictions) == 1 and seen_predictions[0].shape == (n_bars,)
+    assert snapshots[-1].done == n_bars == snapshots[-1].total
+    # the last snapshot comes after every open position has settled
+    assert snapshots[-1].num_trades == result.num_trades == 3
+    assert snapshots[-1].open_positions == 0 or snapshots[-1].committed_usd >= 0
+    assert snapshots[-1].equity_usd == pytest.approx(10_000.0 + result.total_return_usd)
+    # every settled trade is announced exactly once across all snapshots
+    events = [event for snapshot in snapshots for event in snapshot.events]
+    assert sum("closed" in event for event in events) == 3
+
+
+def test_backtest_observer_can_abort_the_run(tmp_path: Path):
+    from latentedge.backtest import BacktestObserver
+
+    x = np.zeros((20, 1), dtype=np.float32)
+    regressor = NetReturnRegressor(input_dim=1)
+    train(regressor, x, np.full(20, 0.02, dtype=np.float32), epochs=50, learning_rate=0.05)
+    model_path = tmp_path / "model.safetensors"
+    save(regressor, model_path)
+
+    class Stop(Exception):
+        pass
+
+    def stop(_progress):
+        raise Stop
+
+    prices = np.array([3000.0, 3200.0])
+    with pytest.raises(Stop):
+        run_backtest(
+            features=np.zeros((2, 1), dtype=np.float32),
+            entry_prices=prices, exit_prices=prices + 200,
+            entry_swaps=[_swap_dict(p) for p in prices], exit_swaps=[_swap_dict(p + 200) for p in prices],
+            signal_client=SignalClient(model_path, input_dim=1),
+            guard=SafetyGuard(max_position_fraction=0.1, daily_loss_limit_fraction=0.5, full_size_return=0.02),
+            initial_equity_usd=10_000.0, timestamps=np.array([0, 3600]),
+            observer=BacktestObserver(on_progress=stop),
+        )

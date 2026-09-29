@@ -1,3 +1,6 @@
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any, NamedTuple
 
 import numpy as np
@@ -72,6 +75,61 @@ def daily_sharpe(equity_curve: np.ndarray, timestamps: np.ndarray) -> float:
     return float(returns.mean() / std * np.sqrt(365))
 
 
+@dataclass(frozen=True)
+class BacktestProgress:
+    """A point-in-time view of a running backtest, for a live display.
+    `events` are the trades settled and lockouts hit since the previous
+    snapshot."""
+
+    done: int
+    total: int
+    timestamp: int
+    equity_usd: float
+    peak_equity_usd: float
+    max_drawdown_usd: float
+    num_trades: int
+    wins: int
+    open_positions: int
+    committed_usd: float
+    lockout_days: int
+    events: list[str] = field(default_factory=list)
+
+
+def _noop_stage(*_: object) -> None:
+    pass
+
+
+def _noop_predictions(_: np.ndarray) -> None:
+    pass
+
+
+def _noop_progress(_: BacktestProgress) -> None:
+    pass
+
+
+@dataclass
+class BacktestObserver:
+    """Everything a caller can watch of a backtest run. Calling the observer
+    itself reports a preparation stage (stage, done, total), so it can be
+    passed wherever a plain progress callback is expected. Any callback may
+    raise to abort the run."""
+
+    on_stage: Callable[..., None] = _noop_stage
+    on_predictions: Callable[[np.ndarray], None] = _noop_predictions
+    on_progress: Callable[[BacktestProgress], None] = _noop_progress
+
+    def __call__(self, *args: Any) -> None:
+        self.on_stage(*args)
+
+
+# Roughly this many progress snapshots per run, however long the window.
+PROGRESS_SNAPSHOTS = 300
+
+
+def _format_time(timestamp: int) -> str:
+    return datetime.fromtimestamp(timestamp, UTC).strftime("%b %d %H:%M")
+
+
 class BacktestResult(BaseModel):
     total_return_usd: float
     max_drawdown_usd: float
@@ -96,6 +154,7 @@ def run_backtest(
     guard: SafetyGuard,
     initial_equity_usd: float,
     timestamps: np.ndarray,
+    observer: BacktestObserver | None = None,
 ) -> BacktestResult:
     """Backtest with realistic accounting: a position's P&L is realized at
     its actual exit time (entry + the label horizon), not the moment it
@@ -104,7 +163,9 @@ def run_backtest(
     account doesn't actually have free. Inputs are assumed sorted by
     timestamp, matching how bars are produced upstream.
     """
+    observer = observer or BacktestObserver()
     predictions = signal_client.predict_batch(features)
+    observer.on_predictions(predictions)
 
     state = GuardState(equity_usd=initial_equity_usd, daily_loss_usd=0.0, current_day=0, locked_out=False)
 
@@ -116,14 +177,38 @@ def run_backtest(
     num_trades = 0
     peak_equity = initial_equity_usd
     max_drawdown = 0.0
+    lockout_days = 0
+    events: list[str] = []
+    total_bars = len(features)
+    snapshot_every = max(total_bars // PROGRESS_SNAPSHOTS, 1)
 
     def settle(position: "_OpenPosition") -> None:
-        nonlocal state, committed_capital, wins
+        nonlocal state, committed_capital, wins, lockout_days
         state = roll_to_day(state, position.exit_timestamp)
+        was_locked_out = state.locked_out
         state = record_trade_result(state, pnl_usd=position.pnl_usd, daily_loss_limit_fraction=guard.daily_loss_limit_fraction)
         committed_capital -= position.size_usd
         if position.pnl_usd > 0:
             wins += 1
+        events.append(
+            f"{_format_time(position.exit_timestamp)} closed ${position.size_usd:,.0f} position: "
+            f"{position.pnl_usd:+,.2f} USD, equity ${state.equity_usd:,.2f}"
+        )
+        if state.locked_out and not was_locked_out:
+            lockout_days += 1
+            events.append(
+                f"{_format_time(position.exit_timestamp)} daily loss limit hit "
+                f"(${state.daily_loss_usd:,.2f}) — no new trades until the next day"
+            )
+
+    def report(done: int, timestamp: int) -> None:
+        observer.on_progress(BacktestProgress(
+            done=done, total=total_bars, timestamp=timestamp, equity_usd=state.equity_usd,
+            peak_equity_usd=peak_equity, max_drawdown_usd=max_drawdown, num_trades=num_trades, wins=wins,
+            open_positions=len(open_positions), committed_usd=committed_capital, lockout_days=lockout_days,
+            events=list(events),
+        ))
+        events.clear()
 
     for i in range(len(features)):
         entry_timestamp = int(timestamps[i])
@@ -159,10 +244,15 @@ def run_backtest(
         peak_equity = max(peak_equity, state.equity_usd)
         max_drawdown = max(max_drawdown, peak_equity - state.equity_usd)
 
+        if (i + 1) % snapshot_every == 0:
+            report(i + 1, entry_timestamp)
+
     # Settle whatever is still open at the end of the backtest window —
     # every opened trade must be accounted for in the final result.
     for position in open_positions:
         settle(position)
+    if total_bars:
+        report(total_bars, int(timestamps[-1]))
 
     total_return_usd = state.equity_usd - initial_equity_usd
     win_rate = wins / num_trades if num_trades > 0 else 0.0

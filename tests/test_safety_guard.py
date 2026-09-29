@@ -99,3 +99,14 @@ def test_lockout_resets_across_multiple_day_boundaries_in_sequence():
 
         assert state.locked_out is False, f"guard stayed locked at day {day}"
         assert size > 0.0, f"guard produced no trade at day {day}"
+
+
+def test_a_trade_needs_a_predicted_return_above_the_minimum_edge():
+    guard = SafetyGuard(max_position_fraction=0.1, daily_loss_limit_fraction=0.5, full_size_return=0.002, min_edge=0.001)
+    state = GuardState(equity_usd=10_000.0, daily_loss_usd=0.0, current_day=0, locked_out=False)
+
+    below, _ = guard.size_position(state, predicted_return=0.001, timestamp=0)  # equal to the edge is not above it
+    above, _ = guard.size_position(state, predicted_return=0.0015, timestamp=0)
+
+    assert below == 0.0
+    assert above > 0.0
