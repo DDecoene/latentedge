@@ -1,5 +1,16 @@
 # latentedge — an ML pattern-recognition trading project
 
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)
+![Apple Silicon](https://img.shields.io/badge/MLX-Apple%20Silicon-lightgrey.svg)
+[![Paper](https://img.shields.io/badge/paper-PDF-b31b1b.svg)](docs/paper/paper.pdf)
+
+**A model trained on Uniswap v3 swaps finds a faint direction signal and no
+tradable edge.** This repo has the full pipeline (ingest, train, sweep,
+walk-forward study) and the paper reporting the negative result.
+
+[Read the paper (PDF)](docs/paper/paper.pdf) · [Result](#result) · [Getting started](#getting-started)
+
 ## What this is
 
 A research project looking for a trading edge on Uniswap using a model
@@ -26,6 +37,10 @@ cost of trading it, and every trading rule loses money on both the validation
 and the test window. An earlier model trained on net return looked much
 better (0.35 correlation with its label), but that was cost prediction, not
 direction.
+
+![Out-of-sample correlation by label horizon](docs/paper/figures/direction_signal.png)
+
+![Gross move against round-trip cost for the most confident bars](docs/paper/figures/signal_vs_cost.png)
 
 The paper is available as a PDF: [`docs/paper/paper.pdf`](docs/paper/paper.pdf).
 The LaTeX source is [`docs/paper/paper.tex`](docs/paper/paper.tex), and the sweep and study records it cites are in
