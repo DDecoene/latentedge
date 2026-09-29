@@ -56,8 +56,18 @@ Then train a model on whatever's been ingested so far:
 uv run latentedge train --swaps data/swaps.parquet
 ```
 
-`latentedge backtest` exists as a CLI entry but is not implemented yet — it
-exits non-zero rather than silently pretending to run a backtest.
+Then backtest it:
+
+```bash
+uv run latentedge backtest --swaps data/swaps.parquet --model data/model.safetensors
+```
+
+The backtest replays only the model's untouched test window (its start is
+recorded when the model is trained, so newer ingested data can only extend
+the window forward), applies the safety guard, and writes total return, max
+drawdown, win rate, trade count and a daily Sharpe to
+`<model>.backtest.json`. Models trained before the window start was
+recorded must be retrained.
 
 ## Decided so far
 

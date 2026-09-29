@@ -56,3 +56,12 @@ def test_assemble_training_data_returns_expected_columns():
         assert column in assembled.columns
     assert not assembled[FEATURE_COLUMNS].isna().any().any()
     assert not assembled["net_return"].isna().any()
+
+
+def test_assemble_training_data_keeps_swap_indices_for_replay():
+    swaps = _random_walk_swaps(n_minutes=3000, seed=1)
+    bars = build_bars(swaps, interval_seconds=60)
+    assembled = assemble_training_data(bars, swaps, return_windows=[5, 15, 30], volatility_window=15, tp_sl_fraction=0.01)
+
+    assert (assembled["entry_swap_idx"] >= 0).all()
+    assert (assembled["exit_swap_idx"] >= assembled["entry_swap_idx"]).all()

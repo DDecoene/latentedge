@@ -5,7 +5,7 @@ past the terminal scrolling away.
 
 import json
 from pathlib import Path
-from typing import TypedDict
+from typing import NotRequired, TypedDict
 
 import mlx.core as mx
 import numpy as np
@@ -27,6 +27,7 @@ class TrainingMetrics(TypedDict):
     final_loss: float
     loss_history: list[float]
     splits: dict[str, SplitMetrics]
+    test_start: NotRequired[int]
 
 
 def evaluate_predictions(predictions: np.ndarray, targets: np.ndarray, baseline_prediction: float) -> SplitMetrics:
@@ -65,12 +66,15 @@ def evaluate_model(model: NetReturnRegressor, assembled: AssembledTrainingData) 
 def build_training_metrics(
     model: NetReturnRegressor, assembled: AssembledTrainingData, losses: list[float]
 ) -> TrainingMetrics:
-    return {
+    metrics: TrainingMetrics = {
         "epochs": len(losses),
         "final_loss": losses[-1],
         "loss_history": losses,
         "splits": evaluate_model(model, assembled),
     }
+    if assembled.test_start is not None:
+        metrics["test_start"] = assembled.test_start
+    return metrics
 
 
 def save_training_metrics(metrics: TrainingMetrics, path: Path) -> None:

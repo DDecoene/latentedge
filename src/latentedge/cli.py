@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import time
@@ -11,9 +12,10 @@ import pandas as pd
 from dotenv import load_dotenv
 
 from latentedge import config
+from latentedge.backtest import build_backtest_inputs, daily_sharpe, run_backtest
 from latentedge.bars import build_bars
 from latentedge.features import compute_feature_stats, save_feature_stats, standardize_features, standardize_value
-from latentedge.metrics import build_training_metrics, save_training_metrics
+from latentedge.metrics import build_training_metrics, load_training_metrics, save_training_metrics
 from latentedge.ingest.chunked import (
     DEFAULT_CHUNK_SIZE,
     DEFAULT_CONCURRENCY_COOLDOWN_SECONDS,
@@ -36,6 +38,8 @@ from latentedge.ingest.rpc_logs import (
 )
 from latentedge.model import NetReturnRegressor, save
 from latentedge.model import train as train_model
+from latentedge.safety_guard import SafetyGuard
+from latentedge.signal_client import SignalClient
 from latentedge.split import chronological_split
 from latentedge.store import read_swaps
 from latentedge.training_data import FEATURE_COLUMNS, AssembledTrainingData, SplitArrays, assemble_training_data
@@ -320,15 +324,12 @@ def _require_continuous_data(swaps_path: Path) -> None:
         )
 
 
-def _assemble_train_data(
-    swaps_path: Path, on_progress: Callable[[str, int, int], None] | None = None
-) -> AssembledTrainingData:
-    """on_progress(stage, done, total) is called between and within the
-    slow stages; a caller may raise from it to abort the assembly."""
-    def report(stage: str, done: int = 0, total: int = 0) -> None:
-        if on_progress is not None:
-            on_progress(stage, done, total)
-
+def _prepare_labeled_bars(
+    swaps_path: Path, report: Callable[..., None]
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Ingest-coverage check, bars, features and labels: everything both
+    training and backtesting need before the data is split. Returns the
+    labeled bars and the raw swaps their swap indices refer to."""
     report("checking ingest coverage")
     _require_continuous_data(swaps_path)
     report("reading swaps")
@@ -346,6 +347,19 @@ def _assemble_train_data(
         bar_df, swap_df, return_windows=[5, 15, 30], volatility_window=15, tp_sl_fraction=tp_sl_fraction,
         on_label_progress=lambda done, total: report("labeling bars", done, total),
     )
+    return assembled, swap_df
+
+
+def _assemble_train_data(
+    swaps_path: Path, on_progress: Callable[[str, int, int], None] | None = None
+) -> AssembledTrainingData:
+    """on_progress(stage, done, total) is called between and within the
+    slow stages; a caller may raise from it to abort the assembly."""
+    def report(stage: str, done: int = 0, total: int = 0) -> None:
+        if on_progress is not None:
+            on_progress(stage, done, total)
+
+    assembled, _ = _prepare_labeled_bars(swaps_path, report)
     report("splitting and standardizing")
     train_split, validate_split, test_split = chronological_split(assembled, train_fraction=0.7, validate_fraction=0.15)
 
@@ -374,6 +388,7 @@ def _assemble_train_data(
         test=to_arrays(test_split),
         input_dim=len(FEATURE_COLUMNS),
         stats=stats,
+        test_start=int(test_split["bar_start"].iloc[0]),
     )
 
 
@@ -439,8 +454,91 @@ def train(swaps: Path, out: Path, epochs: int) -> None:
     "--model", type=click.Path(path_type=Path), default=Path("data/model.safetensors"), envvar="LATENTEDGE_BACKTEST_MODEL",
     help="Falls back to the LATENTEDGE_BACKTEST_MODEL env var (or a .env file).",
 )
-def backtest(swaps: Path, model: Path) -> None:
-    # Intentional stub (see the implementation plan): assembling the real
-    # entry/exit swap arrays run_backtest needs is its own piece of glue
-    # work. A non-zero exit avoids this reading as a successful backtest.
-    raise click.ClickException("backtest command not implemented yet — see backtest.run_backtest for the underlying logic")
+@click.option(
+    "--initial-equity", type=float, default=10_000.0, envvar="LATENTEDGE_BACKTEST_INITIAL_EQUITY",
+    help="Starting equity in USD. Falls back to the LATENTEDGE_BACKTEST_INITIAL_EQUITY env var (or a .env file).",
+)
+@click.option(
+    "--max-position-fraction", type=float, default=0.10, envvar="LATENTEDGE_BACKTEST_MAX_POSITION_FRACTION",
+    help="Largest single position as a fraction of equity. Falls back to LATENTEDGE_BACKTEST_MAX_POSITION_FRACTION.",
+)
+@click.option(
+    "--daily-loss-limit-fraction", type=float, default=0.02, envvar="LATENTEDGE_BACKTEST_DAILY_LOSS_LIMIT_FRACTION",
+    help="Realized daily loss, as a fraction of equity, that locks trading out for the day. "
+    "Falls back to LATENTEDGE_BACKTEST_DAILY_LOSS_LIMIT_FRACTION.",
+)
+@click.option(
+    "--full-size-return", type=float, default=0.002, envvar="LATENTEDGE_BACKTEST_FULL_SIZE_RETURN",
+    help="Predicted net return at which a position sizes at the full maximum. "
+    "Falls back to LATENTEDGE_BACKTEST_FULL_SIZE_RETURN.",
+)
+def backtest(
+    swaps: Path,
+    model: Path,
+    initial_equity: float,
+    max_position_fraction: float,
+    daily_loss_limit_fraction: float,
+    full_size_return: float,
+) -> None:
+    """Replays the model's decisions over its untouched test window only.
+
+    The window's start is the one recorded when the model was trained, so
+    data ingested since (which would move a fresh split's boundary into
+    the model's own training data) can only extend the window forward.
+    """
+    metrics_path = Path(str(model) + ".metrics.json")
+    if not metrics_path.exists():
+        raise click.ClickException(f"{metrics_path} not found — train the model first.")
+    test_start = load_training_metrics(metrics_path).get("test_start")
+    if test_start is None:
+        raise click.ClickException(
+            f"{metrics_path} has no recorded test window (trained before this was tracked), so an out-of-sample "
+            "backtest can't be guaranteed — retrain the model."
+        )
+
+    assembled, swap_df = _prepare_labeled_bars(swaps, lambda *_: None)
+    window = assembled[assembled["bar_start"] >= test_start]
+    if window.empty:
+        raise click.ClickException(f"no labeled bars at or after the model's test window start ({test_start}).")
+
+    inputs = build_backtest_inputs(window, swap_df, FEATURE_COLUMNS)
+    client = SignalClient(model, input_dim=len(FEATURE_COLUMNS), feature_columns=FEATURE_COLUMNS)
+    guard = SafetyGuard(
+        max_position_fraction=max_position_fraction,
+        daily_loss_limit_fraction=daily_loss_limit_fraction,
+        full_size_return=full_size_return,
+    )
+    result = run_backtest(
+        features=inputs.features,
+        entry_prices=inputs.entry_prices,
+        exit_prices=inputs.exit_prices,
+        entry_swaps=inputs.entry_swaps,
+        exit_swaps=inputs.exit_swaps,
+        signal_client=client,
+        guard=guard,
+        initial_equity_usd=initial_equity,
+        timestamps=inputs.timestamps,
+    )
+
+    summary = {
+        "test_start": test_start,
+        "bars": len(window),
+        "initial_equity_usd": initial_equity,
+        "max_position_fraction": max_position_fraction,
+        "daily_loss_limit_fraction": daily_loss_limit_fraction,
+        "full_size_return": full_size_return,
+        "total_return_usd": result.total_return_usd,
+        "total_return_fraction": result.total_return_usd / initial_equity,
+        "max_drawdown_usd": result.max_drawdown_usd,
+        "win_rate": result.win_rate,
+        "num_trades": result.num_trades,
+        "sharpe": daily_sharpe(np.array(result.equity_curve), inputs.timestamps),
+    }
+    Path(str(model) + ".backtest.json").write_text(json.dumps(summary, indent=2))
+
+    click.echo(
+        f"backtest over {summary['bars']:,} test bars: total return ${summary['total_return_usd']:,.2f} "
+        f"({summary['total_return_fraction']:.2%}), max drawdown ${summary['max_drawdown_usd']:,.2f}, "
+        f"win rate {summary['win_rate']:.1%} over {summary['num_trades']:,} trades, sharpe {summary['sharpe']:.2f}"
+    )
+    click.echo(f"summary saved to {model}.backtest.json")

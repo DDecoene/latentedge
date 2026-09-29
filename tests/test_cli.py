@@ -19,15 +19,6 @@ def test_cli_exposes_expected_subcommands():
     assert "backtest" in result.output
 
 
-def test_backtest_stub_exits_non_zero_not_silently_succeed():
-    # Regression test: the backtest subcommand is an intentional stub
-    # (real wiring is separate follow-up work), but it must not exit 0 —
-    # that would read as a successful backtest to anyone running it.
-    runner = CliRunner()
-    result = runner.invoke(cli, ["backtest"])
-    assert result.exit_code != 0
-
-
 def test_ingest_rpc_url_falls_back_to_env_var_when_flag_omitted(monkeypatch: pytest.MonkeyPatch):
     # Real-world need: passing a provider API key as a bare CLI argument
     # leaves it in shell history; an env var (from a .env file or a

@@ -1,12 +1,75 @@
-from typing import Any
+from typing import Any, NamedTuple
 
 import numpy as np
+import pandas as pd
 from pydantic import BaseModel
 
 from latentedge import config
 from latentedge.executor import simulate_fill
+from latentedge.labeling import sort_swaps
 from latentedge.safety_guard import GuardState, SafetyGuard, record_trade_result, roll_to_day
 from latentedge.signal_client import SignalClient
+from latentedge.uniswap_math import sqrt_price_x96_to_weth_usdc_price
+
+
+class BacktestInputs(NamedTuple):
+    features: np.ndarray
+    entry_prices: np.ndarray
+    exit_prices: np.ndarray
+    entry_swaps: list[dict[str, Any]]
+    exit_swaps: list[dict[str, Any]]
+    timestamps: np.ndarray
+
+
+def _swap_dict(swaps: pd.DataFrame, idx: int) -> dict[str, Any]:
+    row = swaps.iloc[idx]
+    return {
+        "liquidity": int(row["liquidity"]),
+        "sqrt_price_x96": int(row["sqrt_price_x96"]),
+        "base_fee_wei": int(row["base_fee_wei"]),
+    }
+
+
+def build_backtest_inputs(rows: pd.DataFrame, swaps: pd.DataFrame, feature_columns: list[str]) -> BacktestInputs:
+    """Turns assembled (labeled) bars into the arrays run_backtest replays.
+
+    Fills come from the swap row positions the label itself recorded
+    (entry_swap_idx / exit_swap_idx), looked up in the canonical swap
+    ordering, so the backtest trades exactly the fills the label was
+    computed from — never a second, possibly different, fill search.
+    Features stay raw: the signal client standardizes them itself.
+    """
+    rows = rows.sort_values("bar_start", kind="stable")
+    ordered = sort_swaps(swaps)
+    prices = ordered["sqrt_price_x96"].map(lambda v: sqrt_price_x96_to_weth_usdc_price(int(v))).to_numpy(dtype="float64")
+
+    entry_idx = rows["entry_swap_idx"].to_numpy(dtype="int64")
+    exit_idx = rows["exit_swap_idx"].to_numpy(dtype="int64")
+
+    return BacktestInputs(
+        features=rows[feature_columns].to_numpy(dtype="float64"),
+        entry_prices=prices[entry_idx],
+        exit_prices=prices[exit_idx],
+        entry_swaps=[_swap_dict(ordered, int(i)) for i in entry_idx],
+        exit_swaps=[_swap_dict(ordered, int(i)) for i in exit_idx],
+        timestamps=rows["bar_start"].to_numpy(),
+    )
+
+
+def daily_sharpe(equity_curve: np.ndarray, timestamps: np.ndarray) -> float:
+    """Annualized Sharpe-like ratio (risk-free rate 0) of end-of-day equity
+    returns. The equity curve has one point per bar, so it is first
+    collapsed to the last value of each calendar day."""
+    days = timestamps // 86_400
+    last_of_day = np.flatnonzero(np.append(days[1:] != days[:-1], True))
+    daily_equity = equity_curve[last_of_day]
+    if len(daily_equity) < 3:
+        return 0.0
+    returns = daily_equity[1:] / daily_equity[:-1] - 1.0
+    std = returns.std(ddof=1)
+    if not np.isfinite(std) or std == 0:
+        return 0.0
+    return float(returns.mean() / std * np.sqrt(365))
 
 
 class BacktestResult(BaseModel):

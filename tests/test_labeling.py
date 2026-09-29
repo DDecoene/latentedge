@@ -75,3 +75,31 @@ def test_label_bars_reports_progress_and_can_be_cancelled():
 
     with pytest.raises(Stop):
         label_bars(bars, swaps, tp_sl_fraction=0.01, on_progress=cancel)
+
+
+def test_labeled_bar_reports_the_swap_rows_it_entered_and_exited_on():
+    swaps = pd.DataFrame([_swap(0, 3000.0), _swap(30, 3001.0), _swap(60, 3100.0)])
+    bars = pd.DataFrame([{"bar_start": 0, "price_usdc_per_weth": 3000.0, "swap_count": 3, "volume_usdc": 1000.0, "has_gap": False}])
+    result = label_bars(bars, swaps, tp_sl_fraction=0.01)
+    # entry is the first swap at/after the bar; the 1% barrier is first crossed by the third swap
+    assert result.iloc[0]["entry_swap_idx"] == 0
+    assert result.iloc[0]["exit_swap_idx"] == 2
+
+
+def test_excluded_bar_has_no_swap_indices():
+    swaps = pd.DataFrame([_swap(2000, 3000.0)])
+    bars = pd.DataFrame([{"bar_start": 0, "price_usdc_per_weth": 3000.0, "swap_count": 0, "volume_usdc": 0.0, "has_gap": True}])
+    result = label_bars(bars, swaps, tp_sl_fraction=0.01)
+    assert result.iloc[0]["entry_swap_idx"] == -1
+    assert result.iloc[0]["exit_swap_idx"] == -1
+
+
+def test_sort_swaps_is_stable_for_swaps_sharing_a_timestamp():
+    from latentedge.labeling import sort_swaps
+
+    swaps = pd.DataFrame(
+        {"timestamp": [5, 1, 5, 1, 5], "block_number": [2, 1, 2, 1, 2], "log_index": [9, 4, 3, 2, 1], "marker": list("abcde")}
+    )
+    ordered = sort_swaps(swaps)
+    # ties broken by (block_number, log_index) when present — never arbitrary
+    assert ordered["marker"].tolist() == ["d", "b", "e", "c", "a"]

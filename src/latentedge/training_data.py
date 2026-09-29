@@ -31,6 +31,10 @@ class AssembledTrainingData(NamedTuple):
     test: SplitArrays
     input_dim: int
     stats: dict[str, tuple[float, float]]
+    # bar_start of the first test-split bar: where the untouched test
+    # window begins. Recorded with the model so a later backtest replays
+    # only bars the model never trained or validated on.
+    test_start: int | None = None
 
 
 def assemble_training_data(
@@ -55,6 +59,8 @@ def assemble_training_data(
     combined["net_return"] = labeled["net_return"]
     combined["excluded"] = labeled["excluded"]
     combined["reason"] = labeled["reason"]
+    combined["entry_swap_idx"] = labeled["entry_swap_idx"]
+    combined["exit_swap_idx"] = labeled["exit_swap_idx"]
 
     # Pair each label with the *previous* bar's features — see
     # shift_features_for_labeling's docstring for why bar t's own

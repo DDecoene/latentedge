@@ -31,13 +31,24 @@ def _net_return(entry_price: float, exit_price: float, entry_swap: dict, exit_sw
     return net_pnl / notional
 
 
+def sort_swaps(swaps: pd.DataFrame) -> pd.DataFrame:
+    """The one canonical swap ordering. Swaps in the same block share a
+    timestamp, so ties are broken by on-chain position (block, log index)
+    when available and otherwise by arrival order (stable sort) — the
+    label's stored swap indices and the backtest's replay both index into
+    this ordering, so it must be deterministic.
+    """
+    keys = ["timestamp"] + [c for c in ("block_number", "log_index") if c in swaps.columns]
+    return swaps.sort_values(keys, kind="stable").reset_index(drop=True)
+
+
 def label_bars(
     bars: pd.DataFrame,
     swaps: pd.DataFrame,
     tp_sl_fraction: float,
     on_progress: Callable[[int, int], None] | None = None,
 ) -> pd.DataFrame:
-    swaps = swaps.sort_values("timestamp").reset_index(drop=True)
+    swaps = sort_swaps(swaps)
     timestamps = swaps["timestamp"].to_numpy()
     prices = swaps["sqrt_price_x96"].apply(sqrt_price_x96_to_weth_usdc_price).to_numpy(dtype="float64")
     liquidity = swaps["liquidity"].tolist()
@@ -50,6 +61,8 @@ def label_bars(
     net_returns: list[float] = []
     excluded: list[bool] = []
     reasons: list[str | None] = []
+    entry_indices: list[int] = []
+    exit_indices: list[int] = []
 
     history_end = timestamps[-1] if len(timestamps) else -1
     bar_starts = bars["bar_start"].tolist()
@@ -68,6 +81,8 @@ def label_bars(
             net_returns.append(float("nan"))
             excluded.append(True)
             reasons.append("no_entry_fill")
+            entry_indices.append(-1)
+            exit_indices.append(-1)
             continue
 
         entry_price = prices[entry_idx]
@@ -89,6 +104,8 @@ def label_bars(
             net_returns.append(float("nan"))
             excluded.append(True)
             reasons.append("incomplete_horizon")
+            entry_indices.append(-1)
+            exit_indices.append(-1)
             continue
 
         if exit_idx is None:
@@ -97,6 +114,8 @@ def label_bars(
         net_returns.append(_net_return(entry_price, prices[exit_idx], swap_at(entry_idx), swap_at(exit_idx)))
         excluded.append(False)
         reasons.append(None)
+        entry_indices.append(entry_idx)
+        exit_indices.append(exit_idx)
 
     if on_progress is not None:
         on_progress(total, total)
@@ -105,4 +124,8 @@ def label_bars(
     result["net_return"] = net_returns
     result["excluded"] = excluded
     result["reason"] = reasons
+    # Row positions in the time-sorted swaps, so a backtest replays the
+    # exact fills the label was computed from. -1 marks an excluded bar.
+    result["entry_swap_idx"] = entry_indices
+    result["exit_swap_idx"] = exit_indices
     return result
