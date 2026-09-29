@@ -208,7 +208,7 @@ class IngestScreen(Screen[None]):
         progress_panel.border_title = "Progress — requested range"
 
         self._log(
-            f"starting: blocks {self.from_block}-{self.to_block}, chunk_size={self.chunk_size}, "
+            f"starting: blocks {self.from_block:,}-{self.to_block:,}, chunk_size={self.chunk_size}, "
             f"max_workers={self.max_workers}, rate={'fixed ' + str(self.fixed_rps) if self.fixed_rps is not None else 'auto, max_rps=' + str(self.max_rps)}, concurrency_cooldown_seconds={self.concurrency_cooldown_seconds} "
             f"— full log at {self.log_path}"
         )
@@ -293,7 +293,7 @@ class IngestScreen(Screen[None]):
             completed=completed, total=total, unit_label=f"block {chunk_end:,}",
             rate_per_sec=rate, rate_unit="blocks/sec",
         )
-        self._log(f"blocks {chunk_start}-{chunk_end}: {count} swaps")
+        self._log(f"blocks {chunk_start:,}-{chunk_end:,}: {count:,} swaps")
         self._refresh_disk_stats()
 
     def _handle_retry(
@@ -302,7 +302,7 @@ class IngestScreen(Screen[None]):
     ) -> None:
         self.retry_count += 1
         label = f"retry {attempt}/{max_retries}" if max_retries is not None else f"rate limited, retry {attempt} (retrying until it clears)"
-        self._log(f"blocks {chunk_start}-{chunk_end}: {label} ({error_message}) — waiting {sleep_seconds:.1f}s")
+        self._log(f"blocks {chunk_start:,}-{chunk_end:,}: {label} ({error_message}) — waiting {sleep_seconds:.1f}s")
         self._refresh_disk_stats()
 
     def _handle_queue_status(self, buffered_count: int, blocking_chunk_start: int | None) -> None:
@@ -325,9 +325,9 @@ class IngestScreen(Screen[None]):
         if status == "idle":
             detail = "[dim]○ idle[/dim]"
         elif status == "fetching":
-            detail = f"[green]● blocks {chunk_start}-{chunk_end} — fetching[/green]"
+            detail = f"[green]● blocks {chunk_start:,}-{chunk_end:,} — fetching[/green]"
         else:
-            detail = f"[yellow]● blocks {chunk_start}-{chunk_end} — {status}[/yellow]"
+            detail = f"[yellow]● blocks {chunk_start:,}-{chunk_end:,} — {status}[/yellow]"
         self.query_one("#ingest-threads", ThreadPanel).update_worker(slot, detail)
 
     def _refresh_disk_stats(self) -> None:
@@ -380,7 +380,7 @@ class IngestScreen(Screen[None]):
     def _handle_complete(self, total: int) -> None:
         self.is_complete = True
         self.total_written = total
-        self._log(f"complete: wrote {total} swaps, {self.retry_count} retries total")
+        self._log(f"complete: wrote {total:,} swaps, {self.retry_count} retries total")
         self._refresh_disk_stats()
         range_total = max(self.to_block - self.from_block + 1, 0)
         self.query_one("#ingest-progress", ProgressPanel).update_progress(
@@ -391,13 +391,13 @@ class IngestScreen(Screen[None]):
         if self.train_after_ingest:
             self._log("train_after_ingest is on — starting training now")
             self.query_one("#ingest-action-bar", Static).update(
-                f"Ingestion complete — wrote {total} swaps to {self.out_path}. Starting training now."
+                f"Ingestion complete — wrote {total:,} swaps to {self.out_path}. Starting training now."
             )
             self._push_train_screen()
             return
 
         self.query_one("#ingest-action-bar", Static).update(
-            f"Ingestion complete — wrote {total} swaps to {self.out_path}. "
+            f"Ingestion complete — wrote {total:,} swaps to {self.out_path}. "
             "Press [b]T[/b] to train now, or [b]Q[/b] to exit."
         )
 
@@ -433,7 +433,7 @@ class IngestScreen(Screen[None]):
         return True
 
     def _handle_stopped(self, total_written: int) -> None:
-        self._log(f"terminated: stopped by user, {total_written} swaps written this run before stopping")
+        self._log(f"terminated: stopped by user, {total_written:,} swaps written this run before stopping")
         self.app.exit()
 
     def _push_train_screen(self) -> None:
