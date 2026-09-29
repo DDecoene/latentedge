@@ -47,11 +47,13 @@ from latentedge.model import train as train_model
 from latentedge.safety_guard import SafetyGuard
 from latentedge.signal_client import SignalClient
 from latentedge.split import chronological_split
+from latentedge import study as studying
 from latentedge import sweep as sweeping
 from latentedge.store import read_swaps
 from latentedge.training_data import FEATURE_COLUMNS, FEATURE_GROUPS, AssembledTrainingData, SplitArrays, assemble_training_data
 from latentedge.tui.app import LatentEdgeApp
 from latentedge.tui.backtest_screen import BacktestScreen, describe_summary
+from latentedge.tui.study_screen import StudyScreen
 from latentedge.tui.sweep_screen import SweepScreen
 from latentedge.tui.ingest_screen import IngestScreen
 from latentedge.tui.train_screen import TrainScreen
@@ -965,3 +967,99 @@ def sweep(
 
     result = _compute_sweep(swaps, model, params, grid, out_dir, sweeping.SweepObserver())
     click.echo(sweeping.describe_sweep(result))
+
+
+def _study_config_from_env() -> studying.StudyConfig:
+    """The study's settings from LATENTEDGE_STUDY_* env vars (defaults if
+    unset): horizons in minutes, training seeds, number of walk-forward test
+    folds, the share of history they cover, epochs, and the resampling
+    counts of the intervals and the permutation test. The network size is
+    LATENTEDGE_TRAIN_HIDDEN, as for training."""
+    def raw(name: str, default: str) -> str:
+        return os.environ.get(f"LATENTEDGE_STUDY_{name}", default)
+
+    def number(name: str, default: str, cast: Callable[[str], float]) -> float:
+        try:
+            return cast(raw(name, default))
+        except ValueError:
+            raise click.UsageError(f"LATENTEDGE_STUDY_{name} must be a number, got {raw(name, default)!r}.") from None
+
+    horizons = [int(h) for h in _parse_float_list("LATENTEDGE_STUDY_HORIZONS_MINUTES", raw("HORIZONS_MINUTES", "30,120,240"))]
+    seeds = _parse_int_list("LATENTEDGE_STUDY_SEEDS", raw("SEEDS", "0,1,2,3,4"))
+    top_fractions = _parse_float_list("LATENTEDGE_STUDY_TOP_FRACTIONS", raw("TOP_FRACTIONS", "0.01,0.05,0.10,0.25"))
+    folds = int(number("FOLDS", "5", int))
+    test_share = number("TEST_SHARE", "0.5", float)
+    if not seeds:
+        raise click.UsageError("LATENTEDGE_STUDY_SEEDS must list at least one seed.")
+    if min(horizons) < 1 or folds < 1 or not 0 < test_share < 1 or not all(0 < f < 1 for f in top_fractions):
+        raise click.UsageError(
+            "LATENTEDGE_STUDY_* needs horizons >= 1 minute, at least one fold, a test share strictly between 0 and 1 "
+            "and top fractions strictly between 0 and 1."
+        )
+    return studying.StudyConfig(
+        horizons_minutes=horizons, seeds=seeds, folds=folds, test_share=test_share, validate_fraction=0.15,
+        epochs=int(number("EPOCHS", "500", int)), hidden=_hidden_sizes_from_env(),
+        n_boot=int(number("BOOTSTRAPS", "1000", int)), n_perm=int(number("PERMUTATIONS", "1000", int)),
+        top_fractions=top_fractions,
+    )
+
+
+def _compute_study(swaps: Path, cfg: studying.StudyConfig, out_dir: Path, observer: studying.StudyObserver) -> dict:
+    """Labels the bars once per horizon (the band widens with the horizon, see
+    study.horizon_barrier_stds), runs every seed and walk-forward fold on
+    them, saves the lot under out_dir and returns {"path", "rows", "summaries"}."""
+    excluded = _excluded_features_from_env()
+    feature_columns = [name for name in FEATURE_COLUMNS if name not in excluded]
+    rows: list[dict] = []
+    summaries: list[dict] = []
+    for horizon in cfg.horizons_minutes:
+        settings = LabelSettings(horizon_seconds=horizon * 60, barrier_stds=studying.horizon_barrier_stds(horizon))
+        bars, _ = _prepare_labeled_bars(swaps, observer, settings)
+        try:
+            horizon_rows, summary = studying.run_horizon(bars, feature_columns, horizon, cfg, observer)
+        except ValueError as exc:
+            raise click.ClickException(str(exc)) from None
+        rows.extend(horizon_rows)
+        summaries.append(summary)
+
+    meta = {
+        "swaps": str(swaps),
+        "ingested_block_ranges": read_progress(swaps),
+        "config": asdict(cfg),
+        "bar_interval_seconds": config.BAR_INTERVAL_SECONDS,
+        "feature_columns": feature_columns,
+        "target": "gross",
+    }
+    path = studying.write_study(out_dir, meta, rows, summaries, sweeping.git_state())
+    return {"path": str(path), "rows": rows, "summaries": summaries}
+
+
+@cli.command()
+@click.option(
+    "--swaps", type=click.Path(path_type=Path), default=Path("data/swaps.parquet"), envvar="LATENTEDGE_STUDY_SWAPS",
+    help="Falls back to the LATENTEDGE_STUDY_SWAPS env var (or a .env file).",
+)
+@click.option(
+    "--out-dir", type=click.Path(path_type=Path), default=Path("data/studies"), envvar="LATENTEDGE_STUDY_OUT_DIR",
+    help="Where each study is saved (one timestamped .json and .csv per run, never overwritten). "
+    "Falls back to the LATENTEDGE_STUDY_OUT_DIR env var (or a .env file).",
+)
+def study(swaps: Path, out_dir: Path) -> None:
+    """Robustness study of the direction signal: for each label horizon, several
+    seeds are trained on expanding walk-forward folds, each judged on bars it
+    never saw, and the pooled out-of-sample correlation is reported with a
+    block-bootstrap interval and a permutation p-value. Settings come from the
+    LATENTEDGE_STUDY_* env vars."""
+    cfg = _study_config_from_env()
+    if sys.stdout.isatty():
+        screen = StudyScreen(study_fn=lambda observer: _compute_study(swaps, cfg, out_dir, observer))
+        LatentEdgeApp(start_screen=screen).run()
+        if screen.error is not None:
+            click.echo(f"study failed: {screen.error}", err=True)
+            raise SystemExit(1)
+        return
+
+    result = _compute_study(swaps, cfg, out_dir, studying.StudyObserver())
+    click.echo(f"{len(result['rows'])} runs saved to {result['path']}")
+    for summary in result["summaries"]:
+        click.echo(studying.describe_summary(summary))

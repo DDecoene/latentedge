@@ -206,7 +206,7 @@ def select_on_validate(rows: list[dict[str, Any]]) -> tuple[dict[str, Any], dict
     return (best, test) if test is not None else None
 
 
-def _git_state() -> str | None:
+def git_state() -> str | None:
     try:
         commit = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
         dirty = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True, check=True).stdout.strip()
@@ -230,7 +230,7 @@ def write_sweep(out_dir: Path, meta: dict[str, Any], rows: list[dict[str, Any]],
     while json_path.exists():
         counter += 1
         json_path = out_dir / f"{stamp}-{counter}.json"
-    document = {"created_at": now().isoformat(), "git": _git_state(), **meta, "scenarios": rows}
+    document = {"created_at": now().isoformat(), "git": git_state(), **meta, "scenarios": rows}
     json_path.write_text(json.dumps(document, indent=2))
     pd.DataFrame(rows).to_csv(json_path.with_suffix(".csv"), index=False)
     return json_path
