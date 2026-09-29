@@ -170,6 +170,10 @@ class IngestScreen(Screen[None]):
         # threads calling call_from_thread against an event loop that no
         # longer exists, which hangs them (and the process) forever.
         self._cancel_event = threading.Event()
+        # Set by the T key while ingest is still running: the same
+        # cooperative stop as ctrl+q, but once it has flushed, hand off
+        # to training instead of exiting.
+        self._train_after_stop = False
 
     def _log(self, message: str) -> None:
         self.query_one("#ingest-log", LogPanel).log_line(message)
@@ -221,6 +225,9 @@ class IngestScreen(Screen[None]):
             rate_per_sec=0.0, rate_unit="blocks/sec",
         )
         self._refresh_disk_stats()
+        self.query_one("#ingest-action-bar", Static).update(
+            "Press [b]T[/b] to stop ingesting and train on what's ingested so far, or [b]ctrl+q[/b] to stop and exit."
+        )
         self.set_interval(STATS_REFRESH_INTERVAL_SECONDS, self._refresh_disk_stats)
         self._rate_plot_completed = self._completed
         self._rate_deltas: list[int] = []
@@ -490,6 +497,13 @@ class IngestScreen(Screen[None]):
 
     def _handle_stopped(self, total_written: int) -> None:
         self._log(f"terminated: stopped by user, {total_written:,} swaps written this run before stopping")
+        if self._train_after_stop:
+            self._log("progress flushed — starting training on what's ingested")
+            self.query_one("#ingest-action-bar", Static).update(
+                f"Ingestion stopped — {total_written:,} swaps written this run. Starting training on what's ingested."
+            )
+            self._push_train_screen()
+            return
         self.app.exit()
 
     def _push_train_screen(self) -> None:
@@ -521,9 +535,21 @@ class IngestScreen(Screen[None]):
         self._refresh_disk_stats()
 
     def action_train_now(self) -> None:
-        if not self.is_complete:
+        if self.is_complete:
+            self._push_train_screen()
             return
-        self._push_train_screen()
+        # Mid-run: stop cooperatively (in-flight requests finish, completed
+        # chunks flush), then _handle_stopped starts training. Ignored once
+        # a stop is already underway (a repeated press, or ctrl+q first)
+        # or after a failure — there is nothing left to stop.
+        if self.error is not None or self._cancel_event.is_set():
+            return
+        self._train_after_stop = True
+        self._cancel_event.set()
+        self._log("stopping: user requested training with what's ingested — waiting for in-flight requests to finish and flushing progress")
+        self.query_one("#ingest-action-bar", Static).update(
+            "Stopping ingest, then training — waiting for in-flight requests to finish and flushing progress..."
+        )
 
     def action_exit_now(self) -> None:
         if not (self.is_complete or self.error is not None):

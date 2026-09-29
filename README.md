@@ -47,7 +47,10 @@ uv run latentedge ingest --days 1
 
 Ingest is resumable and safe to re-run — it tracks which blocks it already
 has and only ever fetches new ones, so running it again (or with a larger
-`--days`) never re-downloads existing data. `--from-block`/`--to-block` are
+`--days`) never re-downloads existing data. Blocks are fetched newest
+first, so whatever has been ingested at any moment is one continuous stretch
+ending at the newest block: press `T` in the ingest dashboard at any time to
+stop cleanly and train on what's there. `--from-block`/`--to-block` are
 available for a specific range instead of a most-recent-N-days window.
 
 Then train a model on whatever's been ingested so far:

@@ -838,19 +838,85 @@ async def test_ingest_screen_pauses_for_prompt_when_train_after_ingest_is_off(tm
 
 
 @pytest.mark.asyncio
-async def test_ingest_screen_train_key_ignored_before_completion(tmp_path: Path):
-    # A fetch gated on an Event, so completion is deterministically held
-    # back until the test explicitly releases it — a fixed time.sleep
-    # raced against the pilot's own event-loop-idle wait and was flaky.
+async def test_ingest_screen_train_key_mid_run_stops_ingest_and_trains_on_what_was_ingested(tmp_path: Path):
+    def slow_fetch(pool_address, from_block, to_block, client, rpc_url, **kwargs):
+        time.sleep(0.03)
+        return [_record(to_block)]
+
+    out_path = tmp_path / "swaps.parquet"
+    model_out_path = tmp_path / "model.safetensors"
+    screen = IngestScreen(
+        pool_address="0xpool", from_block=0, to_block=999, out_path=out_path,
+        client_factory=lambda: httpx.Client(), rpc_url="http://fake",
+        chunk_size=10, max_workers=1, flush_every_n_chunks=1,
+        max_retries=1, retry_backoff_seconds=0.001, fetch_fn=slow_fetch,
+        train_assemble_fn=_placeholder_assemble, model_out_path=model_out_path,
+    )
+    app = LatentEdgeApp(start_screen=screen)
+
+    async with app.run_test() as pilot:
+        await pilot.pause(0.1)  # let a few chunks complete first
+        assert not screen.is_complete  # 1000 blocks at 0.03s/chunk won't finish yet
+        await pilot.press("t")
+        for _ in range(200):
+            await pilot.pause(0.01)
+            if isinstance(app.screen, TrainScreen):
+                break
+        active_screen = app.screen
+
+    assert isinstance(active_screen, TrainScreen)
+    assert active_screen.swaps_path == out_path
+    assert active_screen.out_path == model_out_path
+    assert not screen.is_complete  # ingest was stopped, not finished
+    log_text = screen.log_path.read_text()
+    assert "stopping: user requested training with what's ingested" in log_text
+    # Everything that completed before the stop is on disk, as one stretch
+    # anchored at the newest block — trainable without a hole.
+    (start, end), = read_progress(out_path)
+    assert end == 999
+    assert start < 999
+    assert len(read_swaps(out_path)) >= 1
+
+
+@pytest.mark.asyncio
+async def test_ingest_screen_pressing_train_twice_mid_run_pushes_only_one_train_screen(tmp_path: Path):
+    def slow_fetch(pool_address, from_block, to_block, client, rpc_url, **kwargs):
+        time.sleep(0.03)
+        return [_record(to_block)]
+
+    screen = IngestScreen(
+        pool_address="0xpool", from_block=0, to_block=999, out_path=tmp_path / "swaps.parquet",
+        client_factory=lambda: httpx.Client(), rpc_url="http://fake",
+        chunk_size=10, max_workers=1, flush_every_n_chunks=1,
+        max_retries=1, retry_backoff_seconds=0.001, fetch_fn=slow_fetch,
+        train_assemble_fn=_placeholder_assemble, model_out_path=tmp_path / "model.safetensors",
+    )
+    app = LatentEdgeApp(start_screen=screen)
+
+    async with app.run_test() as pilot:
+        await pilot.pause(0.1)
+        await pilot.press("t")
+        await pilot.press("t")
+        for _ in range(200):
+            await pilot.pause(0.01)
+            if isinstance(app.screen, TrainScreen):
+                break
+        await pilot.pause(0.1)
+        train_screens = [s for s in app.screen_stack if isinstance(s, TrainScreen)]
+
+    assert len(train_screens) == 1
+
+
+@pytest.mark.asyncio
+async def test_ingest_screen_tells_the_user_they_can_stop_and_train_while_running(tmp_path: Path):
     release_fetch = threading.Event()
 
     def gated_fetch(pool_address, from_block, to_block, client, rpc_url, **kwargs):
         release_fetch.wait()
-        return [_record(from_block)]
+        return [_record(to_block)]
 
-    out_path = tmp_path / "swaps.parquet"
     screen = IngestScreen(
-        pool_address="0xpool", from_block=0, to_block=9, out_path=out_path,
+        pool_address="0xpool", from_block=0, to_block=9, out_path=tmp_path / "swaps.parquet",
         client_factory=lambda: httpx.Client(), rpc_url="http://fake",
         chunk_size=10, max_workers=1, flush_every_n_chunks=1,
         max_retries=1, retry_backoff_seconds=0.001, fetch_fn=gated_fetch,
@@ -861,14 +927,11 @@ async def test_ingest_screen_train_key_ignored_before_completion(tmp_path: Path)
     try:
         async with app.run_test() as pilot:
             await pilot.pause()
-            assert not screen.is_complete
-            await pilot.press("t")
-            await pilot.pause()
-            active_screen = app.screen
+            bar_text = str(screen.query_one("#ingest-action-bar").render())
     finally:
         release_fetch.set()
 
-    assert not isinstance(active_screen, TrainScreen)
+    assert "T" in bar_text and "train" in bar_text.lower()
 
 
 @pytest.mark.asyncio
