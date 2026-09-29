@@ -4,7 +4,14 @@ import httpx
 import pytest
 
 from latentedge import config
-from latentedge.ingest.rpc_logs import RateLimitError, RpcLogsError, describe_error, fetch_swaps, get_latest_block
+from latentedge.ingest.rpc_logs import (
+    RateLimitError,
+    RpcLogsError,
+    describe_error,
+    fetch_swaps,
+    get_block_at_or_after_timestamp,
+    get_latest_block,
+)
 from latentedge.ingest.rpc_logs import _batch_fetch_blocks, _rpc_call
 
 RPC_URL = "https://ethereum.publicnode.com"
@@ -157,6 +164,45 @@ def test_batch_fetch_blocks_raises_rate_limit_error_on_http_429():
     with _mock_client(handler) as client:
         with pytest.raises(RateLimitError):
             _batch_fetch_blocks([1, 2, 3], client, RPC_URL)
+
+
+def _linear_timestamp_handler(request: httpx.Request) -> httpx.Response:
+    import json as _json
+
+    body = _json.loads(request.content)
+    return httpx.Response(
+        200,
+        json=[
+            {"jsonrpc": "2.0", "id": entry["id"], "result": {"timestamp": hex(entry["id"] * 12), "baseFeePerGas": "0x1"}}
+            for entry in body
+        ],
+    )
+
+
+def test_get_block_at_or_after_timestamp_finds_the_boundary_block():
+    # Synthetic chain: block N has timestamp N*12. Block 416 -> 4992,
+    # block 417 -> 5004 — target 5000 falls strictly between them, so
+    # the earliest block at-or-after it is 417.
+    with _mock_client(_linear_timestamp_handler) as client:
+        result = get_block_at_or_after_timestamp(client, RPC_URL, target_timestamp=5000, floor_block=0, head_block=1000)
+
+    assert result == 417
+
+
+def test_get_block_at_or_after_timestamp_clamps_to_floor_block_when_target_predates_it():
+    with _mock_client(_linear_timestamp_handler) as client:
+        result = get_block_at_or_after_timestamp(client, RPC_URL, target_timestamp=0, floor_block=100, head_block=1000)
+
+    assert result == 100
+
+
+def test_get_block_at_or_after_timestamp_clamps_to_head_block_when_target_is_in_the_future():
+    with _mock_client(_linear_timestamp_handler) as client:
+        result = get_block_at_or_after_timestamp(
+            client, RPC_URL, target_timestamp=999_999_999, floor_block=0, head_block=1000
+        )
+
+    assert result == 1000
 
 
 def test_batch_fetch_blocks_raises_rate_limit_error_on_embedded_429_code():

@@ -73,75 +73,6 @@ async def test_ingest_screen_reaches_complete_state(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_ingest_screen_chains_through_remaining_ranges_inside_the_tui(tmp_path: Path):
-    # Regression test: a backfill must run entirely inside the TUI
-    # dashboard, not as plain click.echo lines ahead of it — the CLI
-    # hands a backfill gap plus the requested range to a single
-    # IngestScreen via remaining_ranges, and the screen itself chains
-    # from one to the next by switching to a fresh IngestScreen on
-    # completion, never dropping back to plain terminal output.
-    def slow_fetch(pool_address, from_block, to_block, client, rpc_url, **kwargs):
-        time.sleep(0.05)
-        return [_record(from_block)]
-
-    out_path = tmp_path / "swaps.parquet"
-    screen = IngestScreen(
-        pool_address="0xpool", from_block=0, to_block=9, out_path=out_path,
-        client_factory=lambda: httpx.Client(), rpc_url="http://fake",
-        chunk_size=10, max_workers=1, flush_every_n_chunks=1,
-        max_retries=1, retry_backoff_seconds=0.001, fetch_fn=slow_fetch,
-        train_assemble_fn=_placeholder_assemble,
-        remaining_ranges=[(100, 109)],
-    )
-    app = LatentEdgeApp(start_screen=screen)
-
-    async with app.run_test() as pilot:
-        # Wait for the first (backfill) screen to actually mount its
-        # widgets — its one slow chunk (50ms) hasn't finished yet, so
-        # this settles well before it could chain away to the next range.
-        for _ in range(50):
-            await pilot.pause(0.005)
-            try:
-                app.screen.query_one("#ingest-action-bar")
-                break
-            except NoMatches:
-                continue
-        assert not screen.is_complete  # still mid-flight — otherwise this assertion race is silently passing on luck
-        backfill_action_bar_text = str(app.screen.query_one("#ingest-action-bar").content)
-        backfill_border_title = app.screen.query_one("#ingest-progress", ProgressPanel).border_title
-
-        for _ in range(50):
-            await pilot.pause(0.01)
-            active_screen = app.screen
-            if isinstance(active_screen, IngestScreen) and active_screen.is_complete and not active_screen.remaining_ranges:
-                break
-        final_screen = app.screen
-
-    assert isinstance(final_screen, IngestScreen)
-    # The first leg (a backfill leg, since something was queued after
-    # it) never shows the T/Q completion prompt — it auto-continues.
-    assert screen.is_backfill_leg
-    assert screen.remaining_ranges == [(100, 109)]
-    # A backfill leg must stay visibly distinct on screen for its whole
-    # run (border + action bar), not just as a log line that scrolls
-    # away — the user reported not being able to tell from the TUI that
-    # a backfill was even happening.
-    assert "backfilling" in backfill_action_bar_text.lower()
-    assert "backfilling" in backfill_border_title.lower()
-    # The final leg is the originally requested range, run for real.
-    assert final_screen.from_block == 100
-    assert final_screen.to_block == 109
-    assert not final_screen.is_backfill_leg
-    assert final_screen.is_complete
-    assert read_progress(out_path) == [(0, 9), (100, 109)]
-    assert len(read_swaps(out_path)) == 2
-
-    log_text = screen.log_path.read_text()
-    assert "backfilling previously-skipped history" in log_text
-    assert "continuing: 0 range(s) still queued after this one" in log_text
-
-
-@pytest.mark.asyncio
 async def test_ingest_screen_ctrl_q_stops_cleanly_and_exits_instead_of_hanging(tmp_path: Path):
     # Regression test: ctrl+q used to call app.exit() immediately while
     # the background ingest thread's worker pool was still alive. Those
@@ -409,7 +340,7 @@ async def test_ingest_screen_all_panels_are_visible_within_the_viewport(tmp_path
 
     # The summary panels are compact (a handful of lines), not full-screen.
     assert regions["ingest-progress"].height <= 5
-    assert regions["ingest-stats"].height <= 9
+    assert regions["ingest-stats"].height <= 12
     assert regions["ingest-threads"].height <= 5
 
 
@@ -447,6 +378,41 @@ async def test_ingest_screen_shows_retry_detail_in_log_and_stalled_stat(tmp_path
     assert "retry 1/3" in log_text
     assert "simulated rate limit" in log_text
     assert "Stalled" in stats_text
+
+
+@pytest.mark.asyncio
+async def test_ingest_screen_shows_file_range_and_remaining_block_counts_at_start(tmp_path: Path):
+    # "Blocks in file" counts only blocks inside the requested range —
+    # write_progress here covers 10 blocks entirely outside
+    # [from_block, to_block], so they must not count.
+    out_path = tmp_path / "swaps.parquet"
+    write_progress(out_path, [(0, 9)])
+
+    release_fetch = threading.Event()
+
+    def gated_fetch(pool_address, from_block, to_block, client, rpc_url, **kwargs):
+        release_fetch.wait()
+        return [_record(from_block)]
+
+    screen = IngestScreen(
+        pool_address="0xpool", from_block=100, to_block=129, out_path=out_path,
+        client_factory=lambda: httpx.Client(), rpc_url="http://fake",
+        chunk_size=10, max_workers=1, flush_every_n_chunks=1,
+        max_retries=1, retry_backoff_seconds=0.001, fetch_fn=gated_fetch,
+        train_assemble_fn=_placeholder_assemble,
+    )
+    app = LatentEdgeApp(start_screen=screen)
+
+    try:
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            stats_text = str(app.screen.query_one("#ingest-stats-body").content)
+    finally:
+        release_fetch.set()
+
+    assert "Blocks in file: 0" in stats_text
+    assert "Blocks in range: 30" in stats_text
+    assert "Remaining in range: 30" in stats_text
 
 
 @pytest.mark.asyncio
@@ -903,3 +869,84 @@ async def test_ingest_screen_train_key_ignored_before_completion(tmp_path: Path)
         release_fetch.set()
 
     assert not isinstance(active_screen, TrainScreen)
+
+
+@pytest.mark.asyncio
+async def test_ingest_screen_remaining_in_range_counts_down_as_blocks_download(tmp_path: Path):
+    out_path = tmp_path / "swaps.parquet"
+    release_fetch = threading.Event()
+
+    def gated_fetch(pool_address, from_block, to_block, client, rpc_url, **kwargs):
+        release_fetch.wait()
+        return [_record(from_block)]
+
+    screen = IngestScreen(
+        pool_address="0xpool", from_block=100, to_block=129, out_path=out_path,
+        client_factory=lambda: httpx.Client(), rpc_url="http://fake",
+        chunk_size=10, max_workers=1, flush_every_n_chunks=1,
+        max_retries=1, retry_backoff_seconds=0.001,
+        fetch_fn=gated_fetch,
+        train_assemble_fn=_placeholder_assemble,
+    )
+    app = LatentEdgeApp(start_screen=screen)
+
+    try:
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            screen._handle_progress(100, 109, 1)
+            stats_text = str(app.screen.query_one("#ingest-stats-body").content)
+    finally:
+        release_fetch.set()
+
+    assert "Remaining in range: 20" in stats_text
+
+
+@pytest.mark.asyncio
+async def test_ingest_screen_stats_count_only_blocks_of_the_range_already_in_file(tmp_path: Path):
+    out_path = tmp_path / "swaps.parquet"
+    write_progress(out_path, [(0, 9), (100, 109)])
+    release_fetch = threading.Event()
+
+    def gated_fetch(pool_address, from_block, to_block, client, rpc_url, **kwargs):
+        release_fetch.wait()
+        return [_record(from_block)]
+
+    screen = IngestScreen(
+        pool_address="0xpool", from_block=100, to_block=129, out_path=out_path,
+        client_factory=lambda: httpx.Client(), rpc_url="http://fake",
+        chunk_size=10, max_workers=1, flush_every_n_chunks=1,
+        max_retries=1, retry_backoff_seconds=0.001, fetch_fn=gated_fetch,
+        train_assemble_fn=_placeholder_assemble,
+    )
+    app = LatentEdgeApp(start_screen=screen)
+    try:
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            stats_text = str(app.screen.query_one("#ingest-stats-body").content)
+    finally:
+        release_fetch.set()
+
+    assert "Blocks in range: 30" in stats_text
+    assert "Blocks in file: 10" in stats_text
+    assert "Remaining in range: 20" in stats_text
+
+
+@pytest.mark.asyncio
+async def test_ingest_screen_shows_a_fixed_rate_label(tmp_path: Path):
+    out_path = tmp_path / "swaps.parquet"
+    screen = IngestScreen(
+        pool_address="0xpool", from_block=0, to_block=9, out_path=out_path,
+        client_factory=lambda: httpx.Client(), rpc_url="http://fake",
+        chunk_size=10, max_workers=4, fixed_rps=8.6, flush_every_n_chunks=1,
+        max_retries=1, retry_backoff_seconds=0.001, fetch_fn=_fake_fetch,
+        train_assemble_fn=_placeholder_assemble,
+    )
+    app = LatentEdgeApp(start_screen=screen)
+
+    async with app.run_test() as pilot:
+        screen._refresh_disk_stats()
+        await pilot.pause()
+        stats_text = str(app.screen.query_one("#ingest-stats-body").content)
+
+    assert "8.6 req/s (fixed)" in stats_text
+    assert "8.6/8.6" not in stats_text

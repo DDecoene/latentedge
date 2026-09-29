@@ -358,3 +358,29 @@ def test_limiter_acquire_wakes_promptly_on_cancel_event_instead_of_waiting_for_t
         assert raised.is_set()
     finally:
         thread.join(timeout=1.0)
+
+
+def test_fixed_limiter_holds_its_rate_through_throttles_and_successes():
+    changes: list[float] = []
+    ceilings: list[float] = []
+    limiter = RateLimiter(
+        ceiling=8.6, fixed=True, successes_before_increase=1, cooldown_seconds=0,
+        on_change=changes.append, on_ceiling_change=ceilings.append,
+    )
+    for _ in range(200):
+        limiter.release("success")
+    for _ in range(5):
+        limiter.release("rate_limited")
+    assert limiter.rate == 8.6
+    assert limiter.ceiling == 8.6
+    assert changes == []
+    assert ceilings == []
+
+
+def test_fixed_limiter_still_cools_down_after_a_rate_limit():
+    limiter = RateLimiter(ceiling=8.6, fixed=True, cooldown_seconds=0.3)
+    limiter.acquire()
+    limiter.release("rate_limited")
+    start = time.monotonic()
+    limiter.acquire()
+    assert time.monotonic() - start >= 0.25

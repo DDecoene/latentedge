@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 from click.testing import CliRunner
 
+from latentedge import config
 from latentedge.cli import DEFAULT_RPC_URL, cli
 from latentedge.ingest.progress import write_progress
 from latentedge.training_data import AssembledTrainingData, SplitArrays
@@ -287,12 +288,22 @@ def test_train_launches_dashboard_when_stdout_is_a_tty(monkeypatch: pytest.Monke
     assert launched["called"]
 
 
-def test_ingest_without_block_range_derives_it_from_days_and_chain_head(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
-    # A head well above config.POOL_CREATION_BLOCK (12_376_729) so the
-    # naive window stays realistic — a head this low would sit entirely
-    # before the pool existed and trigger the floor clamp instead of
-    # this test's plain day-arithmetic path.
+def test_ingest_without_block_range_derives_from_block_via_on_chain_timestamp_lookup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
     monkeypatch.setattr("latentedge.cli.get_latest_block", lambda client, rpc_url: 20_000_000)
+    monkeypatch.setattr("latentedge.cli.time.time", lambda: 1_700_000_000.0)
+
+    captured_anchor_args: dict[str, int] = {}
+
+    def fake_get_block_at_or_after_timestamp(client, rpc_url, target_timestamp, floor_block, head_block):
+        captured_anchor_args["target_timestamp"] = target_timestamp
+        captured_anchor_args["floor_block"] = floor_block
+        captured_anchor_args["head_block"] = head_block
+        return 19_000_000
+
+    monkeypatch.setattr("latentedge.cli.get_block_at_or_after_timestamp", fake_get_block_at_or_after_timestamp)
+
     captured: dict[str, int] = {}
 
     def fake_ingest_range(pool_address, from_block, to_block, out, client, rpc_url, **kwargs):
@@ -309,13 +320,27 @@ def test_ingest_without_block_range_derives_it_from_days_and_chain_head(monkeypa
     )
 
     assert result.exit_code == 0, result.output
-    # 1 day of 12s blocks, minus the safety buffer behind the head.
+    # from_block comes straight from the on-chain lookup, anchored to
+    # exactly 1 day (in seconds) before the mocked "now".
+    assert captured_anchor_args["target_timestamp"] == int(1_700_000_000.0 - 86400)
+    assert captured_anchor_args["floor_block"] == config.POOL_CREATION_BLOCK
+    assert captured_anchor_args["head_block"] == 20_000_000
+    assert captured["from_block"] == 19_000_000
     assert captured["to_block"] == 20_000_000 - 5
-    assert captured["from_block"] == 20_000_000 - 5 - 7200 + 1
 
 
 def test_ingest_days_falls_back_to_env_var_when_flag_omitted(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setattr("latentedge.cli.get_latest_block", lambda client, rpc_url: 20_000_000)
+    monkeypatch.setattr("latentedge.cli.time.time", lambda: 1_700_000_000.0)
+
+    captured_anchor_args: dict[str, int] = {}
+
+    def fake_get_block_at_or_after_timestamp(client, rpc_url, target_timestamp, floor_block, head_block):
+        captured_anchor_args["target_timestamp"] = target_timestamp
+        return 19_000_000
+
+    monkeypatch.setattr("latentedge.cli.get_block_at_or_after_timestamp", fake_get_block_at_or_after_timestamp)
+
     captured: dict[str, int] = {}
 
     def fake_ingest_range(pool_address, from_block, to_block, out, client, rpc_url, **kwargs):
@@ -333,8 +358,9 @@ def test_ingest_days_falls_back_to_env_var_when_flag_omitted(monkeypatch: pytest
     )
 
     assert result.exit_code == 0, result.output
+    assert captured_anchor_args["target_timestamp"] == int(1_700_000_000.0 - 2 * 86400)
     assert captured["to_block"] == 20_000_000 - 5
-    assert captured["from_block"] == 20_000_000 - 5 - 14400 + 1
+    assert captured["from_block"] == 19_000_000
 
 
 def test_ingest_explicit_block_range_takes_priority_over_days(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
@@ -362,62 +388,26 @@ def test_ingest_explicit_block_range_takes_priority_over_days(monkeypatch: pytes
     assert captured["to_block"] == 20
 
 
-def test_ingest_backfills_previously_skipped_gaps_before_the_requested_range(
+def test_ingest_reports_file_range_and_remaining_block_counts_in_plain_mode(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ):
-    # Regression test for a real incident: an earlier run jumped straight
-    # to an explicit --from-block/--to-block that left a large stretch of
-    # history between two already-ingested ranges never fetched. Nothing
-    # else in the codebase ever goes back to look for a gap like this, so
-    # it must be closed automatically, before the range this invocation
-    # actually asked for, and the user must be told it happened.
+    # Only blocks inside the requested range count as already in file —
+    # the 10 blocks here sit entirely outside it.
     out_path = tmp_path / "swaps.parquet"
-    write_progress(out_path, [(0, 99), (500, 599)])  # a skipped gap at 100-499
+    write_progress(out_path, [(0, 9), (100, 104)])
 
-    calls: list[tuple[int, int]] = []
-
-    def fake_ingest_range(pool_address, from_block, to_block, out, client, rpc_url, **kwargs):
-        calls.append((from_block, to_block))
-        return 0
-
-    monkeypatch.setattr("latentedge.cli.ingest_range", fake_ingest_range)
+    monkeypatch.setattr("latentedge.cli.ingest_range", lambda *args, **kwargs: 0)
 
     runner = CliRunner()
     result = runner.invoke(
         cli,
-        ["ingest", "--from-block", "700", "--to-block", "800", "--out", str(out_path)],
+        ["ingest", "--from-block", "100", "--to-block", "129", "--out", str(out_path)],
     )
 
     assert result.exit_code == 0, result.output
-    # The gap is backfilled first, in order, before the requested range.
-    assert calls == [(100, 499), (700, 800)]
-    assert "previously-skipped" in result.output
-    assert "100-499" in result.output
-
-
-def test_ingest_skips_backfill_entirely_when_progress_has_no_internal_gaps(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
-):
-    out_path = tmp_path / "swaps.parquet"
-    write_progress(out_path, [(0, 99)])  # a single interval — nothing to backfill
-
-    calls: list[tuple[int, int]] = []
-
-    def fake_ingest_range(pool_address, from_block, to_block, out, client, rpc_url, **kwargs):
-        calls.append((from_block, to_block))
-        return 0
-
-    monkeypatch.setattr("latentedge.cli.ingest_range", fake_ingest_range)
-
-    runner = CliRunner()
-    result = runner.invoke(
-        cli,
-        ["ingest", "--from-block", "200", "--to-block", "300", "--out", str(out_path)],
-    )
-
-    assert result.exit_code == 0, result.output
-    assert calls == [(200, 300)]
-    assert "previously-skipped" not in result.output
+    assert "30 blocks in requested range" in result.output
+    assert "5 already in file" in result.output
+    assert "25 remaining to download" in result.output
 
 
 def test_ingest_rejects_only_one_of_from_block_to_block(tmp_path: Path):
@@ -474,6 +464,10 @@ def test_ingest_retries_chain_head_lookup_before_giving_up(monkeypatch: pytest.M
         return 20_000_000
 
     monkeypatch.setattr("latentedge.cli.get_latest_block", flaky_then_succeeds)
+    monkeypatch.setattr(
+        "latentedge.cli.get_block_at_or_after_timestamp",
+        lambda client, rpc_url, target_timestamp, floor_block, head_block: floor_block,
+    )
     monkeypatch.setattr("latentedge.cli.ingest_range", lambda *args, **kwargs: 0)
 
     runner = CliRunner()
@@ -509,20 +503,25 @@ def test_ingest_shows_plain_language_error_when_plain_mode_ingest_fails_to_conne
     assert "internet connection" in result.output
 
 
-def test_ingest_days_window_walks_back_past_already_ingested_blocks(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
-    # A chain head high enough to stay well above the pool's real
-    # deployment block (config.POOL_CREATION_BLOCK) so this test
-    # exercises the backward walk itself, not the floor clamp.
+def test_ingest_days_window_stays_anchored_even_when_fully_already_ingested(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    # The --days window is now a fixed, on-chain-verified anchor, not an
+    # estimate that walks back to find new work — so a window that's
+    # already fully ingested must still be requested as-is (reporting 0
+    # new records, via ingest_range's own dedup), never silently shifted
+    # to some earlier window instead.
+    from latentedge.ingest.progress import write_progress
+
     monkeypatch.setattr("latentedge.cli.get_latest_block", lambda client, rpc_url: 13_000_000)
+    monkeypatch.setattr(
+        "latentedge.cli.get_block_at_or_after_timestamp",
+        lambda client, rpc_url, target_timestamp, floor_block, head_block: 12_990_000,
+    )
 
     out_path = tmp_path / "swaps.parquet"
     naive_to = 13_000_000 - 5
-    blocks_in_range = 7200  # 1 day at 12s/block
-    naive_from = naive_to - blocks_in_range + 1
-
-    from latentedge.ingest.progress import write_progress
-
-    write_progress(out_path, [(naive_from, naive_to)])  # the whole naive window is already ingested
+    write_progress(out_path, [(12_990_000, naive_to)])  # the whole anchored window is already ingested
 
     captured: dict[str, int] = {}
 
@@ -540,43 +539,8 @@ def test_ingest_days_window_walks_back_past_already_ingested_blocks(monkeypatch:
     )
 
     assert result.exit_code == 0, result.output
+    assert captured["from_block"] == 12_990_000
     assert captured["to_block"] == naive_to
-    # The whole naive window was already covered, so the request must
-    # walk back to an earlier, equally-sized uncovered window instead of
-    # silently doing nothing.
-    assert captured["from_block"] == naive_from - blocks_in_range
-
-
-def test_ingest_days_window_reports_zero_when_entire_pool_history_already_ingested(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
-    # The floor-reaching case: progress already covers everything back
-    # to the pool's deployment block, so there's nothing left anywhere
-    # in the pool's history to walk back to. This must be a normal "0
-    # new records" outcome, not an error.
-    from latentedge import config
-    from latentedge.ingest.progress import write_progress
-
-    monkeypatch.setattr("latentedge.cli.get_latest_block", lambda client, rpc_url: 13_000_000)
-
-    out_path = tmp_path / "swaps.parquet"
-    naive_to = 13_000_000 - 5
-    write_progress(out_path, [(config.POOL_CREATION_BLOCK, naive_to)])
-
-    captured: dict[str, int] = {}
-
-    def fake_ingest_range(pool_address, from_block, to_block, out, client, rpc_url, **kwargs):
-        captured["from_block"] = from_block
-        return 0
-
-    monkeypatch.setattr("latentedge.cli.ingest_range", fake_ingest_range)
-
-    runner = CliRunner()
-    result = runner.invoke(
-        cli,
-        ["ingest", "--days", "1", "--out", str(out_path)],
-    )
-
-    assert result.exit_code == 0, result.output
-    assert captured["from_block"] == config.POOL_CREATION_BLOCK  # walked all the way to the floor, no further
     assert "wrote 0 new swap records" in result.output
 
 
@@ -617,3 +581,84 @@ def test_ingest_max_rps_defaults_when_env_var_omitted(monkeypatch: pytest.Monkey
     runner.invoke(cli, ["ingest", "--from-block", "1", "--to-block", "2"])
 
     assert captured["max_rps"] == DEFAULT_MAX_RPS
+
+
+def test_train_refuses_data_with_gaps_in_block_coverage(tmp_path: Path):
+    swaps = tmp_path / "swaps.parquet"
+    write_progress(swaps, [(0, 99), (500, 599)])
+
+    result = CliRunner().invoke(cli, ["train", "--swaps", str(swaps), "--out", str(tmp_path / "m.safetensors")])
+
+    assert result.exit_code != 0
+    assert "not continuous" in result.output
+    assert "100-499" in result.output
+
+
+def test_train_refuses_data_with_no_progress_record(tmp_path: Path):
+    result = CliRunner().invoke(
+        cli, ["train", "--swaps", str(tmp_path / "swaps.parquet"), "--out", str(tmp_path / "m.safetensors")],
+    )
+
+    assert result.exit_code != 0
+    assert "no ingest progress record" in result.output
+
+
+def test_continuity_check_passes_for_a_single_contiguous_interval(tmp_path: Path):
+    from latentedge.cli import _require_continuous_data
+
+    swaps = tmp_path / "swaps.parquet"
+    write_progress(swaps, [(0, 99), (100, 199)])
+
+    _require_continuous_data(swaps)  # must not raise
+
+
+def _capture_ingest_range(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
+    captured: dict[str, object] = {}
+
+    def fake_ingest_range(pool_address, from_block, to_block, out, client, rpc_url, **kwargs):
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.setattr("latentedge.cli.ingest_range", fake_ingest_range)
+    return captured
+
+
+def test_ingest_auto_throttle_off_passes_the_fixed_rps(monkeypatch: pytest.MonkeyPatch):
+    captured = _capture_ingest_range(monkeypatch)
+    result = CliRunner().invoke(
+        cli, ["ingest", "--from-block", "1", "--to-block", "2"],
+        env={"LATENTEDGE_INGEST_AUTO_THROTTLE": "false", "LATENTEDGE_INGEST_FIXED_RPS": "8.6"},
+    )
+    assert result.exit_code == 0, result.output
+    assert captured["fixed_rps"] == 8.6
+
+
+def test_ingest_auto_throttle_on_by_default_passes_no_fixed_rps(monkeypatch: pytest.MonkeyPatch):
+    captured = _capture_ingest_range(monkeypatch)
+    result = CliRunner().invoke(
+        cli, ["ingest", "--from-block", "1", "--to-block", "2"],
+        env={"LATENTEDGE_INGEST_FIXED_RPS": "8.6"},
+    )
+    assert result.exit_code == 0, result.output
+    assert captured["fixed_rps"] is None
+
+
+@pytest.mark.parametrize("fixed", [None, "0", "-3", "abc"])
+def test_ingest_auto_throttle_off_requires_a_valid_fixed_rps(monkeypatch: pytest.MonkeyPatch, fixed: str | None):
+    _capture_ingest_range(monkeypatch)
+    env = {"LATENTEDGE_INGEST_AUTO_THROTTLE": "false"}
+    if fixed is not None:
+        env["LATENTEDGE_INGEST_FIXED_RPS"] = fixed
+    result = CliRunner().invoke(cli, ["ingest", "--from-block", "1", "--to-block", "2"], env=env)
+    assert result.exit_code != 0
+    assert "LATENTEDGE_INGEST_FIXED_RPS" in result.output
+
+
+def test_ingest_rejects_an_unrecognized_auto_throttle_value(monkeypatch: pytest.MonkeyPatch):
+    _capture_ingest_range(monkeypatch)
+    result = CliRunner().invoke(
+        cli, ["ingest", "--from-block", "1", "--to-block", "2"],
+        env={"LATENTEDGE_INGEST_AUTO_THROTTLE": "maybe"},
+    )
+    assert result.exit_code != 0
+    assert "LATENTEDGE_INGEST_AUTO_THROTTLE" in result.output

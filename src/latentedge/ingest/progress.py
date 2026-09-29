@@ -128,62 +128,11 @@ def uncovered_gaps(intervals: list[Interval], from_block: int, to_block: int) ->
 
 
 def internal_gaps(intervals: list[Interval]) -> list[Interval]:
-    """Gaps strictly between already-ingested intervals — history that
-    some prior run skipped over (e.g. one that jumped straight to an
-    explicit --from-block/--to-block without ever checking what came
-    before it, rather than resuming from the existing watermark). Empty
-    when there's at most one interval, since there's nothing for a gap
-    to sit between.
+    """Gaps strictly between already-ingested intervals. Empty when
+    there's at most one interval, since there's nothing for a gap to sit
+    between.
     """
     if len(intervals) < 2:
         return []
     ordered = sorted(intervals)
     return uncovered_gaps(ordered, ordered[0][0], ordered[-1][1])
-
-
-def extend_window_for_new_blocks(
-    intervals: list[Interval],
-    naive_from: int,
-    naive_to: int,
-    desired_new_blocks: int,
-    floor_block: int,
-) -> int:
-    """The smallest from_block <= naive_from (never below floor_block)
-    such that [from_block, naive_to] contains at least
-    desired_new_blocks blocks not already covered by `intervals` — or
-    floor_block if even the full [floor_block, naive_to] range doesn't
-    have that many.
-    """
-    naive_from = max(naive_from, floor_block)
-
-    # Never let the naive near-head window sit disconnected from the
-    # most recently ingested block — otherwise a window that already
-    # contains enough new blocks on its own (e.g. a quick --days 1 run
-    # after a much longer gap since the last run) would return
-    # immediately without ever touching older coverage, permanently
-    # stranding everything in between as a gap nothing else ever goes
-    # back to look for. Pulling naive_from back to touch it means the
-    # gap becomes part of what this window needs to cover, so the
-    # ordinary walk-back logic below closes it like any other shortfall.
-    if intervals:
-        latest_covered_end = max(end for _, end in intervals)
-        if latest_covered_end + 1 < naive_from:
-            naive_from = max(latest_covered_end + 1, floor_block)
-
-    new_in_naive = sum(end - start + 1 for start, end in uncovered_gaps(intervals, naive_from, naive_to))
-    remaining_needed = desired_new_blocks - new_in_naive
-    if remaining_needed <= 0:
-        return naive_from
-    if naive_from <= floor_block:
-        return floor_block
-
-    gaps_below = uncovered_gaps(intervals, floor_block, naive_from - 1)
-    from_block = floor_block
-    for start, end in reversed(gaps_below):
-        gap_size = end - start + 1
-        if gap_size >= remaining_needed:
-            from_block = end - remaining_needed + 1
-            remaining_needed = 0
-            break
-        remaining_needed -= gap_size
-    return from_block

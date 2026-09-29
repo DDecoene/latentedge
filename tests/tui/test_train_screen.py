@@ -10,7 +10,7 @@ from latentedge.tui.app import LatentEdgeApp
 from latentedge.tui.train_screen import TrainScreen
 
 
-def _fake_assemble(swaps_path: Path) -> AssembledTrainingData:
+def _fake_assemble(swaps_path: Path, on_progress=None) -> AssembledTrainingData:
     def split(seed: int, n: int) -> SplitArrays:
         rng = np.random.RandomState(seed)
         return SplitArrays(x=rng.randn(n, 3).astype("float32"), y=rng.randn(n).astype("float32"))
@@ -220,3 +220,61 @@ async def test_train_screen_q_ignored_before_completion(tmp_path: Path):
         release_train.set()
 
     assert still_running
+
+
+@pytest.mark.asyncio
+async def test_train_screen_ctrl_q_cancels_a_running_assembly_and_exits(tmp_path: Path):
+    started = threading.Event()
+    unwound = threading.Event()
+
+    def slow_assemble(swaps_path: Path, on_progress=None) -> AssembledTrainingData:
+        started.set()
+        try:
+            for i in range(10_000):
+                on_progress("labeling bars", i, 10_000)
+                threading.Event().wait(0.005)
+            return _fake_assemble(swaps_path)
+        finally:
+            unwound.set()
+
+    screen = TrainScreen(
+        swaps_path=tmp_path / "swaps.parquet", out_path=tmp_path / "model.safetensors",
+        epochs=5, assemble_fn=slow_assemble, train_fn=_fake_train,
+    )
+    app = LatentEdgeApp(start_screen=screen)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert started.wait(5)
+        await pilot.press("ctrl+q")
+        for _ in range(100):
+            await pilot.pause(0.05)
+            if not app.is_running:
+                break
+        assert not app.is_running
+        # the worker must have unwound cooperatively before the app exited,
+        # not been orphaned mid-computation
+        assert unwound.is_set()
+    assert not (tmp_path / "model.safetensors").exists()
+
+
+@pytest.mark.asyncio
+async def test_train_screen_shows_assembly_progress(tmp_path: Path):
+    release = threading.Event()
+
+    def gated_assemble(swaps_path: Path, on_progress=None) -> AssembledTrainingData:
+        on_progress("labeling bars", 50, 100)
+        release.wait(5)
+        return _fake_assemble(swaps_path)
+
+    screen = TrainScreen(
+        swaps_path=tmp_path / "swaps.parquet", out_path=tmp_path / "model.safetensors",
+        epochs=2, assemble_fn=gated_assemble, train_fn=_fake_train,
+    )
+    app = LatentEdgeApp(start_screen=screen)
+    try:
+        async with app.run_test() as pilot:
+            await pilot.pause(0.3)
+            text = str(screen.query_one("#train-progress-detail").render())
+    finally:
+        release.set()
+    assert "labeling bars" in text

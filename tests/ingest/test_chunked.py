@@ -939,3 +939,28 @@ def test_ingest_range_cancel_event_stops_cleanly_and_flushes_completed_chunks(tm
     assert written >= 3
     progress = read_progress(out_path)
     assert progress and progress[0][0] == 0
+
+
+def test_ingest_range_fixed_rps_pins_the_rate_and_ignores_persisted_state(tmp_path: Path):
+    out_path = tmp_path / "swaps.parquet"
+    write_rate_limit(out_path, 1.0)
+    write_rate_ceiling(out_path, 20.0)
+    seen: list[tuple[float, float]] = []
+
+    def one_rate_limit_then_fine(pool_address, from_block, to_block, client, rpc_url, rate_limiter=None, **kwargs):
+        seen.append((rate_limiter.rate, rate_limiter.ceiling))
+        rate_limiter.release("success")
+        return [_record(from_block, 0)]
+
+    rate_changes: list[float] = []
+    with httpx.Client() as client:
+        ingest_range(
+            pool_address="0xpool", from_block=0, to_block=19, out_path=out_path,
+            client=client, rpc_url="http://fake", chunk_size=10, max_workers=1,
+            fixed_rps=50.0, fetch_fn=one_rate_limit_then_fine, on_rate_change=rate_changes.append,
+        )
+
+    assert seen == [(50.0, 50.0), (50.0, 50.0)]
+    assert rate_changes == []
+    # A fixed run must not overwrite the auto-throttle's learned state.
+    assert read_rate_limit(out_path) == 1.0

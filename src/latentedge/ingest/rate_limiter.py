@@ -99,15 +99,23 @@ class RateLimiter:
         start_rate: float | None = None,
         on_change: Callable[[float], None] | None = None,
         on_ceiling_change: Callable[[float], None] | None = None,
+        fixed: bool = False,
     ) -> None:
-        self._ceiling = max(DEFAULT_MIN_RPS, ceiling)
+        # fixed pins the rate at `ceiling` for good: throttles and
+        # successes never move it (a rate limit still triggers the
+        # shared cooldown pause), for a user who knows their provider's
+        # real limit and doesn't want it probed or second-guessed.
+        self._fixed = fixed
+        self._ceiling = ceiling if fixed else max(DEFAULT_MIN_RPS, ceiling)
         self._base_successes_before_increase = successes_before_increase
         self._successes_before_increase: float = successes_before_increase
         self._ceiling_raise_successes = successes_before_increase * CEILING_RAISE_SUCCESS_MULTIPLIER
         self._cooldown_seconds = cooldown_seconds
         self._on_change = on_change
         self._on_ceiling_change = on_ceiling_change
-        self._rate = max(DEFAULT_MIN_RPS, min(start_rate, self._ceiling)) if start_rate else self._ceiling
+        self._rate = (
+            max(DEFAULT_MIN_RPS, min(start_rate, self._ceiling)) if start_rate and not fixed else self._ceiling
+        )
         # The rate right before its most recent proven climb — the last
         # value known to have survived a full success streak, so a real
         # throttle can fall back to it instead of halving blindly.
@@ -167,7 +175,10 @@ class RateLimiter:
         new_rate: float | None = None
         new_ceiling: float | None = None
         with self._cond:
-            if outcome == "rate_limited":
+            if self._fixed:
+                if outcome == "rate_limited":
+                    self._cooldown_until = time.monotonic() + self._cooldown_seconds
+            elif outcome == "rate_limited":
                 now = time.monotonic()
                 # Every request already in flight when a provider starts
                 # 429ing reports its own "rate_limited" outcome — without

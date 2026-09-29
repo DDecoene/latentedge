@@ -1,5 +1,6 @@
 """The train command's progress screen."""
 
+import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -19,7 +20,11 @@ from latentedge.tui.widgets import LogPanel, ProgressPanel
 
 DEFAULT_MODEL_OUT_PATH = Path("data/model.safetensors")
 
-TrainAssembleFn = Callable[[Path], AssembledTrainingData]
+TrainAssembleFn = Callable[[Path, Callable[[str, int, int], None]], AssembledTrainingData]
+
+
+class TrainingCancelled(Exception):
+    """Raised from a progress callback on the worker thread to unwind it after ctrl+q."""
 
 
 class TrainScreen(Screen[None]):
@@ -52,6 +57,10 @@ class TrainScreen(Screen[None]):
         self.error: str | None = None
         self._losses: list[float] = []
         self._rate_start_time: float | None = None
+        # Set by request_stop() (ctrl+q); checked from the worker's
+        # progress/epoch callbacks so the thread unwinds itself instead
+        # of being orphaned mid-computation by an immediate app.exit().
+        self._cancel_event = threading.Event()
 
     def compose(self) -> ComposeResult:
         yield ProgressPanel(id="train-progress")
@@ -61,17 +70,24 @@ class TrainScreen(Screen[None]):
 
     def on_mount(self) -> None:
         self.query_one("#train-progress", ProgressPanel).update_progress(
-            completed=0, total=self.epochs, unit_label="assembling training data...",
+            completed=0, total=self.epochs, unit_label="preparing data...",
             rate_per_sec=0.0, rate_unit="epochs/sec",
         )
         self.run_worker(self._run_train, thread=True, exclusive=True)
 
     def _run_train(self) -> None:
         def on_epoch(epoch: int, total_epochs: int, loss: float) -> None:
+            if self._cancel_event.is_set():
+                raise TrainingCancelled
             self.app.call_from_thread(self._handle_epoch, epoch, total_epochs, loss)
 
+        def on_assemble_progress(stage: str, done: int, total: int) -> None:
+            if self._cancel_event.is_set():
+                raise TrainingCancelled
+            self.app.call_from_thread(self._handle_assemble_progress, stage, done, total)
+
         try:
-            assembled = self.assemble_fn(self.swaps_path)
+            assembled = self.assemble_fn(self.swaps_path, on_assemble_progress)
             model = NetReturnRegressor(input_dim=assembled.input_dim)
             # net_return's raw scale is too flat a loss surface for Adam
             # to make real progress in a practical epoch count — train on
@@ -91,10 +107,20 @@ class TrainScreen(Screen[None]):
             save_feature_stats(assembled.stats, Path(str(self.out_path) + ".stats.json"))
             metrics = build_training_metrics(model, assembled, losses)
             save_training_metrics(metrics, Path(str(self.out_path) + ".metrics.json"))
+        except TrainingCancelled:
+            self.app.call_from_thread(self.app.exit)
+            return
         except Exception as exc:
             self.app.call_from_thread(self._handle_error, str(exc))
             return
         self.app.call_from_thread(self._handle_complete, losses[-1], metrics["splits"]["validate"]["correlation"])
+
+    def _handle_assemble_progress(self, stage: str, done: int, total: int) -> None:
+        self.query_one("#train-progress", ProgressPanel).update_progress(
+            completed=done, total=total, unit_label=stage, rate_per_sec=0.0, rate_unit="epochs/sec",
+        )
+        if total == 0:
+            self.query_one("#train-log", LogPanel).log_line(f"preparing data: {stage}")
 
     def _handle_epoch(self, epoch: int, total_epochs: int, loss: float) -> None:
         self._losses.append(loss)
@@ -134,6 +160,16 @@ class TrainScreen(Screen[None]):
         self.error = message
         self.query_one("#train-log", LogPanel).log_line(f"ERROR: {message}")
         self.query_one("#train-action-bar", Static).update(f"Training failed: {message}. Press [b]Q[/b] to exit.")
+
+    def request_stop(self) -> bool:
+        """Called by the app on ctrl+q: ask the worker to unwind, then it
+        exits the app. False once there's nothing left to stop."""
+        if self.is_complete or self.error is not None:
+            return False
+        if not self._cancel_event.is_set():
+            self._cancel_event.set()
+            self.query_one("#train-action-bar", Static).update("Stopping — finishing the current step...")
+        return True
 
     def action_exit_now(self) -> None:
         if not (self.is_complete or self.error is not None):

@@ -179,6 +179,7 @@ def ingest_range(
     retry_backoff_seconds: float = DEFAULT_RETRY_BACKOFF_SECONDS,
     max_workers: int = DEFAULT_MAX_WORKERS,
     max_rps: float = DEFAULT_MAX_RPS,
+    fixed_rps: float | None = None,
     flush_every_n_chunks: int = DEFAULT_FLUSH_EVERY_N_CHUNKS,
     concurrency_cooldown_seconds: float = DEFAULT_CONCURRENCY_COOLDOWN_SECONDS,
     max_rate_limit_backoff_seconds: float = DEFAULT_MAX_RATE_LIMIT_BACKOFF_SECONDS,
@@ -248,12 +249,18 @@ def ingest_range(
         pending_intervals = []
         chunks_since_flush = 0
 
-    persisted_rate = read_rate_limit(out_path)
-    persisted_ceiling = read_rate_ceiling(out_path)
+    # A fixed rate bypasses auto-throttling entirely: the learned rate
+    # and ceiling from any prior auto run are neither read nor (below)
+    # overwritten, so switching modes back and forth never corrupts
+    # either one.
+    persisted_rate = None if fixed_rps is not None else read_rate_limit(out_path)
+    persisted_ceiling = None if fixed_rps is not None else read_rate_ceiling(out_path)
     # A self-raised ceiling from a prior run is real, measured headroom —
     # never resume below the config default even if it's somehow higher
     # (e.g. LATENTEDGE_INGEST_MAX_RPS was raised since that run).
     ceiling = max(persisted_ceiling, max_rps) if persisted_ceiling is not None else max_rps
+    if fixed_rps is not None:
+        ceiling = fixed_rps
     # A floor, not a fixed resume point — see RateLimiter's docstring and
     # AdaptiveConcurrencyLimiter's history for why: never resume below
     # half the ceiling regardless of how low a prior run bottomed out.
@@ -264,6 +271,7 @@ def ingest_range(
         start_rate=start_rate,
         on_change=on_rate_change,
         on_ceiling_change=on_ceiling_change,
+        fixed=fixed_rps is not None,
     )
     # A resumed run can start below its ceiling (the floor-clamped
     # persisted rate above), or with a ceiling already raised past
@@ -272,7 +280,7 @@ def ingest_range(
     # misreporting the rate, its direction of change, and the ceiling.
     if on_rate_change is not None and rate_limiter.rate != ceiling:
         on_rate_change(rate_limiter.rate)
-    if on_ceiling_change is not None and rate_limiter.ceiling != max_rps:
+    if on_ceiling_change is not None and fixed_rps is None and rate_limiter.ceiling != max_rps:
         on_ceiling_change(rate_limiter.ceiling)
 
     worker_slots: dict[int, int] = {}
@@ -377,8 +385,9 @@ def ingest_range(
             # or was cut short — whatever rate/ceiling the limiter
             # actually settled at is the useful starting point for a
             # resume, not just the happy-path ending level.
-            write_rate_limit(out_path, rate_limiter.rate)
-            write_rate_ceiling(out_path, rate_limiter.ceiling)
+            if fixed_rps is None:
+                write_rate_limit(out_path, rate_limiter.rate)
+                write_rate_ceiling(out_path, rate_limiter.ceiling)
 
     if cancelled:
         raise IngestCancelled(total_written)

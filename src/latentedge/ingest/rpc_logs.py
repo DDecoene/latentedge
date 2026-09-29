@@ -160,6 +160,33 @@ def _batch_fetch_blocks(
     return result
 
 
+def get_block_at_or_after_timestamp(
+    client: httpx.Client,
+    rpc_url: str,
+    target_timestamp: int,
+    floor_block: int,
+    head_block: int,
+    rate_limiter: "RateLimiter | None" = None,
+    cancel_event: threading.Event | None = None,
+) -> int:
+    """Binary search [floor_block, head_block] for the earliest block
+    whose timestamp is >= target_timestamp — an exact, verifiable
+    anchor for a "--days" window, instead of estimating from a constant
+    average block time that drifts from the chain's real block times.
+    Clamps to floor_block or head_block when target_timestamp falls
+    outside the range those bounds actually cover.
+    """
+    lo, hi = floor_block, head_block
+    while lo < hi:
+        mid = (lo + hi) // 2
+        timestamp, _ = _batch_fetch_blocks([mid], client, rpc_url, rate_limiter=rate_limiter, cancel_event=cancel_event)[mid]
+        if timestamp >= target_timestamp:
+            hi = mid
+        else:
+            lo = mid + 1
+    return lo
+
+
 def _decode_int(hex_str: str, bits: int, signed: bool) -> int:
     value = int(hex_str, 16)
     if signed and value >= (1 << (bits - 1)):

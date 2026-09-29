@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import click
@@ -25,8 +26,14 @@ from latentedge.ingest.chunked import (
     RATE_LIMIT_BACKOFF_MULTIPLIER,
     ingest_range,
 )
-from latentedge.ingest.progress import extend_window_for_new_blocks, internal_gaps, read_progress
-from latentedge.ingest.rpc_logs import RateLimitError, RpcLogsError, describe_error, get_latest_block
+from latentedge.ingest.progress import internal_gaps, read_progress, uncovered_gaps
+from latentedge.ingest.rpc_logs import (
+    RateLimitError,
+    RpcLogsError,
+    describe_error,
+    get_block_at_or_after_timestamp,
+    get_latest_block,
+)
 from latentedge.model import NetReturnRegressor, save
 from latentedge.model import train as train_model
 from latentedge.split import chronological_split
@@ -175,56 +182,46 @@ def ingest(
         raise click.UsageError("--from-block and --to-block must be given together, or both omitted to use --days instead.")
 
     max_rps = float(os.environ.get("LATENTEDGE_INGEST_MAX_RPS", DEFAULT_MAX_RPS))
+    fixed_rps = _resolve_fixed_rps()
 
     if from_block is None:
+        target_timestamp = int(time.time() - days * 86400)
         with httpx.Client(timeout=30.0) as client:
             try:
                 head = _get_latest_block_with_retries(client, rpc_url, max_retries, retry_backoff_seconds)
+                # An exact, on-chain-verified anchor for the window's
+                # start — never an estimate from a constant average
+                # block time, which drifts from the chain's real block
+                # times and would make "--days N" mean a slightly
+                # different span every time. Missing blocks inside
+                # [from_block, to_block] (including any already-known
+                # internal gap) are queued and filled below exactly as
+                # for an explicit --from-block/--to-block range.
+                from_block = get_block_at_or_after_timestamp(
+                    client, rpc_url, target_timestamp, config.POOL_CREATION_BLOCK, head,
+                )
             except (httpx.HTTPError, RpcLogsError) as exc:
                 raise click.ClickException(describe_error(rpc_url, exc)) from None
-        naive_to = head - config.HEAD_BLOCK_SAFETY_BUFFER
-        blocks_in_range = max(int(days * 86400 / config.AVG_BLOCK_SECONDS), 1)
-        naive_from = naive_to - blocks_in_range + 1
-        # If the naive most-recent-N-days window is already (partly or
-        # fully) ingested, walk further back toward the pool's
-        # deployment block until a day's worth of genuinely new blocks
-        # is found — never re-request what's already on disk.
-        from_block = extend_window_for_new_blocks(
-            read_progress(out), naive_from, naive_to, blocks_in_range, config.POOL_CREATION_BLOCK,
-        )
-        to_block = naive_to
+        to_block = head - config.HEAD_BLOCK_SAFETY_BUFFER
     assert to_block is not None  # guaranteed by the from_block/to_block XOR check above
 
     out.parent.mkdir(parents=True, exist_ok=True)
 
-    # Backfill anything a prior run skipped over (e.g. one that jumped
-    # straight to an explicit --from-block/--to-block without checking
-    # what came before) before touching the range this invocation was
-    # actually asked for. Left alone, gaps like this only ever get wider
-    # — nothing else in the codebase ever goes back to look for them —
-    # so every run closes them first rather than compounding the debt.
-    gaps = internal_gaps(read_progress(out))
+    progress_intervals = read_progress(out)
 
     if sys.stdout.isatty():
-        # The TUI is the only UI in a TTY session — a backfill must run
-        # as leading IngestScreen instances the dashboard chains through
-        # itself (see IngestScreen.remaining_ranges), never as plain
-        # click.echo lines ahead of it. Mixing the two means real work
-        # (and its only Ctrl+C-safe cancellation path) happens outside
-        # the TUI the user is looking at.
-        first_from, first_to = (gaps[0] if gaps else (from_block, to_block))
-        remaining_ranges = [*gaps[1:], (from_block, to_block)] if gaps else []
+        # The TUI is the only UI in a TTY session — all work happens
+        # inside it, never as plain click.echo lines around it.
         screen = IngestScreen(
-            pool_address=config.POOL_ADDRESS, from_block=first_from, to_block=first_to,
+            pool_address=config.POOL_ADDRESS, from_block=from_block, to_block=to_block,
             out_path=out, client_factory=lambda: httpx.Client(timeout=30.0), rpc_url=rpc_url,
-            chunk_size=chunk_size, max_workers=max_workers, max_rps=max_rps,
+            chunk_size=chunk_size, max_workers=max_workers, max_rps=max_rps, fixed_rps=fixed_rps,
             flush_every_n_chunks=flush_every_n_chunks, max_retries=max_retries,
             retry_backoff_seconds=retry_backoff_seconds,
             concurrency_cooldown_seconds=concurrency_cooldown_seconds,
             max_rate_limit_backoff_seconds=max_rate_limit_backoff_seconds, ingest_fn=ingest_range,
             train_assemble_fn=_assemble_train_data,
             model_out_path=train_out, train_epochs=train_epochs, train_after_ingest=train_after_ingest,
-            remaining_ranges=remaining_ranges,
         )
         LatentEdgeApp(start_screen=screen).run()
         if screen.error is not None:
@@ -232,35 +229,22 @@ def ingest(
             raise SystemExit(1)
         return
 
-    if gaps:
-        gap_block_total = sum(end - start + 1 for start, end in gaps)
-        click.echo(
-            f"{out} has {len(gaps)} previously-skipped block range(s) "
-            f"({gap_block_total} blocks total) — backfilling before the requested range:"
-        )
-        for gap_start, gap_end in gaps:
-            click.echo(f"  {gap_start}-{gap_end} ({gap_end - gap_start + 1} blocks)")
+    range_total = max(to_block - from_block + 1, 0)
+    range_remaining = sum(end - start + 1 for start, end in uncovered_gaps(progress_intervals, from_block, to_block))
+    click.echo(
+        f"{out}: {range_total} blocks in requested range, {range_total - range_remaining} already in file, "
+        f"{range_remaining} remaining to download"
+    )
 
     def report(chunk_start: int, chunk_end: int, count: int) -> None:
         click.echo(f"  blocks {chunk_start}-{chunk_end}: {count} swaps")
 
     with httpx.Client(timeout=30.0) as client:
         try:
-            for gap_start, gap_end in gaps:
-                ingest_range(
-                    config.POOL_ADDRESS, gap_start, gap_end, out, client, rpc_url,
-                    chunk_size=chunk_size, max_retries=max_retries, retry_backoff_seconds=retry_backoff_seconds,
-                    max_workers=max_workers, max_rps=max_rps, flush_every_n_chunks=flush_every_n_chunks,
-                    concurrency_cooldown_seconds=concurrency_cooldown_seconds,
-                    max_rate_limit_backoff_seconds=max_rate_limit_backoff_seconds,
-                    on_progress=report,
-                )
-            if gaps:
-                click.echo(f"backfill complete — {sum(e - s + 1 for s, e in gaps)} previously-skipped blocks recovered")
             total = ingest_range(
                 config.POOL_ADDRESS, from_block, to_block, out, client, rpc_url,
                 chunk_size=chunk_size, max_retries=max_retries, retry_backoff_seconds=retry_backoff_seconds,
-                max_workers=max_workers, max_rps=max_rps, flush_every_n_chunks=flush_every_n_chunks,
+                max_workers=max_workers, max_rps=max_rps, fixed_rps=fixed_rps, flush_every_n_chunks=flush_every_n_chunks,
                 concurrency_cooldown_seconds=concurrency_cooldown_seconds,
                 max_rate_limit_backoff_seconds=max_rate_limit_backoff_seconds,
                 on_progress=report,
@@ -273,8 +257,65 @@ def ingest(
         _run_train_direct(out, train_out, train_epochs)
 
 
-def _assemble_train_data(swaps_path: Path) -> AssembledTrainingData:
+def _resolve_fixed_rps() -> float | None:
+    """None when auto-throttling is on (the default); otherwise the
+    fixed req/s from LATENTEDGE_INGEST_FIXED_RPS, which is required in
+    that mode — a fixed mode with no fixed value would silently be
+    something else."""
+    raw_mode = os.environ.get("LATENTEDGE_INGEST_AUTO_THROTTLE", "true").strip().lower()
+    if raw_mode in ("1", "true", "yes", "on"):
+        return None
+    if raw_mode not in ("0", "false", "no", "off"):
+        raise click.UsageError(
+            f"LATENTEDGE_INGEST_AUTO_THROTTLE must be true or false, got {raw_mode!r}."
+        )
+    raw_rps = os.environ.get("LATENTEDGE_INGEST_FIXED_RPS", "").strip()
+    try:
+        fixed_rps = float(raw_rps)
+    except ValueError:
+        fixed_rps = 0.0
+    if fixed_rps <= 0:
+        raise click.UsageError(
+            "LATENTEDGE_INGEST_AUTO_THROTTLE is off, so LATENTEDGE_INGEST_FIXED_RPS must be set to a "
+            f"positive number of requests/sec (got {raw_rps!r})."
+        )
+    return fixed_rps
+
+
+def _require_continuous_data(swaps_path: Path) -> None:
+    """Refuses to train on a file whose ingested block coverage has
+    holes — bars, rolling features and forward returns computed across a
+    gap silently span time that was never observed.
+    """
+    intervals = read_progress(swaps_path)
+    if not intervals:
+        raise click.ClickException(
+            f"{swaps_path} has no ingest progress record, so its block coverage can't be verified as continuous — re-run ingest."
+        )
+    gaps = internal_gaps(intervals)
+    if gaps:
+        shown = ", ".join(f"{start}-{end} ({end - start + 1} blocks)" for start, end in gaps[:5])
+        more = f" (+{len(gaps) - 5} more)" if len(gaps) > 5 else ""
+        raise click.ClickException(
+            f"{swaps_path} is not continuous: missing block range(s) {shown}{more}. "
+            "Ingest a range that spans them, or remove the older data on the far side of the gap."
+        )
+
+
+def _assemble_train_data(
+    swaps_path: Path, on_progress: Callable[[str, int, int], None] | None = None
+) -> AssembledTrainingData:
+    """on_progress(stage, done, total) is called between and within the
+    slow stages; a caller may raise from it to abort the assembly."""
+    def report(stage: str, done: int = 0, total: int = 0) -> None:
+        if on_progress is not None:
+            on_progress(stage, done, total)
+
+    report("checking ingest coverage")
+    _require_continuous_data(swaps_path)
+    report("reading swaps")
     swap_df = read_swaps(swaps_path)
+    report("building bars")
     bar_df = build_bars(swap_df, config.BAR_INTERVAL_SECONDS)
 
     # Take-profit/stop-loss band sized from the pool's own realized
@@ -284,8 +325,10 @@ def _assemble_train_data(swaps_path: Path) -> AssembledTrainingData:
     tp_sl_fraction = max(bar_return_std * 2, 0.001) if pd.notna(bar_return_std) else 0.01
 
     assembled = assemble_training_data(
-        bar_df, swap_df, return_windows=[5, 15, 30], volatility_window=15, tp_sl_fraction=tp_sl_fraction
+        bar_df, swap_df, return_windows=[5, 15, 30], volatility_window=15, tp_sl_fraction=tp_sl_fraction,
+        on_label_progress=lambda done, total: report("labeling bars", done, total),
     )
+    report("splitting and standardizing")
     train_split, validate_split, test_split = chronological_split(assembled, train_fraction=0.7, validate_fraction=0.15)
 
     # Standardize using train-split statistics only — computing stats
