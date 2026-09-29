@@ -32,6 +32,16 @@ STATS_REFRESH_INTERVAL_SECONDS = 1.0
 # "stalled" — only flag it once enough time has passed that a healthy
 # run would normally have made progress.
 STALL_THRESHOLD_SECONDS = 5.0
+BLOCKS_PER_DAY = 7_200  # 12-second blocks
+
+
+def _format_blocks(blocks: int) -> str:
+    """Thousands-separated block count, with the equivalent days once it is
+    big enough for that to be meaningful."""
+    text = f"{blocks:,}"
+    if blocks >= BLOCKS_PER_DAY // 2:
+        text += f" (~{blocks / BLOCKS_PER_DAY:.0f} days)"
+    return text
 
 
 class IngestScreen(Screen[None]):
@@ -176,7 +186,7 @@ class IngestScreen(Screen[None]):
             end - start + 1 for start, end in uncovered_gaps(intervals, self.from_block, self.to_block)
         )
         self._completed = max(total - uncovered, 0)
-        unit_label = f"resuming ({self._completed} blocks already ingested)" if self._completed > 0 else "starting..."
+        unit_label = f"resuming ({self._completed:,} blocks already ingested)" if self._completed > 0 else "starting..."
 
         # A fixed startup snapshot, distinct from the live progress bar:
         # "in file" counts everything ever ingested (any range, not just
@@ -280,7 +290,7 @@ class IngestScreen(Screen[None]):
             rate = blocks_fetched / elapsed if elapsed > 0 else 0.0
 
         self.query_one("#ingest-progress", ProgressPanel).update_progress(
-            completed=completed, total=total, unit_label=f"block {chunk_end}",
+            completed=completed, total=total, unit_label=f"block {chunk_end:,}",
             rate_per_sec=rate, rate_unit="blocks/sec",
         )
         self._log(f"blocks {chunk_start}-{chunk_end}: {count} swaps")
@@ -326,7 +336,7 @@ class IngestScreen(Screen[None]):
         stalled_seconds = self.time_fn() - self._last_progress_time
         stalled = f"[red]{stalled_seconds:.0f}s[/red]" if stalled_seconds >= STALL_THRESHOLD_SECONDS else "[dim]no[/dim]"
         buffered = (
-            f"[yellow]{self._buffered_count} (waiting on block {self._blocking_chunk_start})[/yellow]"
+            f"[yellow]{self._buffered_count} (waiting on block {self._blocking_chunk_start:,})[/yellow]"
             if self._buffered_count > 0
             else "0"
         )
@@ -340,9 +350,9 @@ class IngestScreen(Screen[None]):
                 else f"{self._rate_limit:.1f}/{self._rate_ceiling:.1f} req/s"
             )
         self.query_one("#ingest-stats", StatsPanel).update_stats([
-            ("Blocks in range", str(self._range_total_blocks)),
-            ("Blocks in file", str(self._range_in_file)),
-            ("Remaining in range", str(max(self._range_total_blocks - self._range_in_file, 0))),
+            ("Blocks in range", _format_blocks(self._range_total_blocks)),
+            ("Blocks in file", _format_blocks(self._range_in_file)),
+            ("Remaining in range", _format_blocks(max(self._range_total_blocks - self._range_in_file, 0))),
             ("File size", f"{file_size / 1_048_576:.1f} MB"),
             ("Est. final size", self._format_estimated_final_size(file_size)),
             ("Free disk", f"{free_bytes / 1_073_741_824:.1f} GB"),
