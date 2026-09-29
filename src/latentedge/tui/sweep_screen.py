@@ -11,6 +11,7 @@ from textual.screen import Screen
 from textual.widgets import DataTable, Static
 
 from latentedge.sweep import SweepObserver, describe_rule, describe_sweep
+from latentedge.tui.backtest_screen import BacktestFn, BacktestScreen
 from latentedge.tui.widgets import LogPanel, ProgressPanel
 
 # Takes the observer to report to; returns {"path", "scenarios", "selection"}.
@@ -33,6 +34,7 @@ def _cells(row: dict[str, Any]) -> tuple[str, ...]:
 
 class SweepScreen(Screen[None]):
     BINDINGS = [
+        Binding("b", "backtest_now", "Backtest now", show=False),
         Binding("q", "exit_now", "Exit", show=False),
     ]
     CSS = """
@@ -40,9 +42,13 @@ class SweepScreen(Screen[None]):
     #sweep-log { height: 8; }
     """
 
-    def __init__(self, sweep_fn: SweepFn) -> None:
+    def __init__(
+        self, sweep_fn: SweepFn, backtest_fn: BacktestFn | None = None, backtest_after_sweep: bool = False
+    ) -> None:
         super().__init__()
         self.sweep_fn = sweep_fn
+        self.backtest_fn = backtest_fn
+        self.backtest_after_sweep = backtest_after_sweep
         self.is_complete = False
         self.result: dict | None = None
         self.error: str | None = None
@@ -112,7 +118,22 @@ class SweepScreen(Screen[None]):
             rate_per_sec=0.0, rate_unit="scenarios/sec",
         )
         self.query_one("#sweep-log", LogPanel).log_line(f"sweep complete — {text}")
-        self.query_one("#sweep-action-bar", Static).update(f"Sweep complete — {text}. Press [b]Q[/b] to exit.")
+        summary = f"Sweep complete — {text}."
+        if self.backtest_fn is not None and self.backtest_after_sweep:
+            self.query_one("#sweep-log", LogPanel).log_line("backtest_after_train is on — starting backtest now")
+            self.query_one("#sweep-action-bar", Static).update(f"{summary} Starting backtest now.")
+            self._push_backtest_screen()
+            return
+        prompt = "Press [b]B[/b] to backtest now, or [b]Q[/b] to exit." if self.backtest_fn is not None else "Press [b]Q[/b] to exit."
+        self.query_one("#sweep-action-bar", Static).update(f"{summary} {prompt}")
+
+    def _push_backtest_screen(self) -> None:
+        assert self.backtest_fn is not None
+        self.app.push_screen(BacktestScreen(backtest_fn=self.backtest_fn))
+
+    def action_backtest_now(self) -> None:
+        if self.is_complete and self.backtest_fn is not None:
+            self._push_backtest_screen()
 
     def _handle_error(self, message: str) -> None:
         self.error = message

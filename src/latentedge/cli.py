@@ -16,7 +16,10 @@ from latentedge import config
 from latentedge.backtest import BacktestObserver, build_backtest_inputs, daily_sharpe, run_backtest
 from latentedge.bars import build_bars
 from latentedge.features import compute_feature_stats, save_feature_stats, standardize_features, standardize_value
-from latentedge.metrics import build_training_metrics, load_training_metrics, save_training_metrics
+from latentedge.labeling import LabelSettings
+from latentedge.metrics import (
+    TrainingMetrics, build_training_metrics, load_training_metrics, prediction_correlations, save_training_metrics,
+)
 from latentedge.ingest.chunked import (
     DEFAULT_CHUNK_SIZE,
     DEFAULT_CONCURRENCY_COOLDOWN_SECONDS,
@@ -176,6 +179,10 @@ def _startup_call_with_retries(
     "--backtest-after-train/--no-backtest-after-train", default=False, envvar="LATENTEDGE_BACKTEST_AFTER_TRAIN",
     help="Start the backtest immediately once training finishes, instead of pausing for a [B]/[Q] prompt (TTY) or just exiting (non-TTY). Applies to the training that follows an ingest too (--train-after-ingest or [T]). Uses the LATENTEDGE_BACKTEST_* env vars for its settings. Falls back to the LATENTEDGE_BACKTEST_AFTER_TRAIN env var (or a .env file).",
 )
+@click.option(
+    "--sweep-after-train/--no-sweep-after-train", default=True, envvar="LATENTEDGE_SWEEP_AFTER_TRAIN",
+    help="Run the scenario sweep immediately once training finishes (on by default; the sweep is the pipeline's result), before any chained backtest. Uses the LATENTEDGE_SWEEP_* env vars for its settings. Falls back to the LATENTEDGE_SWEEP_AFTER_TRAIN env var (or a .env file).",
+)
 def ingest(
     from_block: int | None,
     to_block: int | None,
@@ -193,6 +200,7 @@ def ingest(
     train_out: Path,
     train_epochs: int,
     backtest_after_train: bool,
+    sweep_after_train: bool,
 ) -> None:
     # A large range (e.g. a year of history) needs chunking to respect
     # provider limits, concurrency to finish in a reasonable time, and
@@ -202,6 +210,10 @@ def ingest(
     # each block's timestamp, no separate backfill pass.
     if (from_block is None) != (to_block is None):
         raise click.UsageError("--from-block and --to-block must be given together, or both omitted to use --days instead.")
+
+    # A bad training setting should fail now, not after hours of ingesting.
+    _label_settings_from_env()
+    _excluded_features_from_env()
 
     max_rps = float(os.environ.get("LATENTEDGE_INGEST_MAX_RPS", DEFAULT_MAX_RPS))
     fixed_rps = _resolve_fixed_rps()
@@ -253,6 +265,7 @@ def ingest(
             train_assemble_fn=_assemble_train_data,
             model_out_path=train_out, train_epochs=train_epochs, train_after_ingest=train_after_ingest,
             backtest_fn=_chained_backtest_fn(out, train_out), backtest_after_train=backtest_after_train,
+            sweep_fn=_chained_sweep_fn(out, train_out), sweep_after_train=sweep_after_train,
             env_path=Path.cwd() / ".env",
         )
         LatentEdgeApp(start_screen=screen).run()
@@ -287,6 +300,8 @@ def ingest(
 
     if train_after_ingest:
         _run_train_direct(out, train_out, train_epochs)
+        if sweep_after_train:
+            _run_sweep_direct(out, train_out)
         if backtest_after_train:
             _run_backtest_direct(out, train_out, BacktestParams.from_env())
 
@@ -336,8 +351,53 @@ def _require_continuous_data(swaps_path: Path) -> None:
         )
 
 
+def _label_settings_from_env() -> LabelSettings:
+    """LATENTEDGE_LABEL_HORIZON_MINUTES (how long a labeled trade may run)
+    and LATENTEDGE_LABEL_BARRIER_STDS (take-profit/stop-loss band, in
+    standard deviations of the 1-bar return). Only training reads these:
+    a backtest or sweep relabels with what the model was trained under."""
+    default = LabelSettings()
+    try:
+        minutes = float(os.environ.get("LATENTEDGE_LABEL_HORIZON_MINUTES", default.horizon_seconds / 60))
+        stds = float(os.environ.get("LATENTEDGE_LABEL_BARRIER_STDS", default.barrier_stds))
+    except ValueError as exc:
+        raise click.UsageError(f"invalid LATENTEDGE_LABEL_* value: {exc}") from None
+    if minutes * 60 < config.BAR_INTERVAL_SECONDS or stds <= 0:
+        raise click.UsageError(
+            "LATENTEDGE_LABEL_HORIZON_MINUTES must cover at least one bar and LATENTEDGE_LABEL_BARRIER_STDS must be positive."
+        )
+    return LabelSettings(horizon_seconds=round(minutes * 60), barrier_stds=stds)
+
+
+def _excluded_features_from_env() -> list[str]:
+    """LATENTEDGE_TRAIN_EXCLUDE_FEATURES: comma-separated feature names to
+    leave out of training, e.g. base_fee_gwei,volatility to test whether
+    the model predicts trading cost rather than direction."""
+    excluded = [name.strip() for name in os.environ.get("LATENTEDGE_TRAIN_EXCLUDE_FEATURES", "").split(",") if name.strip()]
+    unknown = [name for name in excluded if name not in FEATURE_COLUMNS]
+    if unknown:
+        raise click.UsageError(
+            f"LATENTEDGE_TRAIN_EXCLUDE_FEATURES names unknown feature(s) {unknown}; choose from {FEATURE_COLUMNS}."
+        )
+    if len(excluded) >= len(FEATURE_COLUMNS):
+        raise click.UsageError("LATENTEDGE_TRAIN_EXCLUDE_FEATURES leaves no features to train on.")
+    return excluded
+
+
+def _model_setup(metrics: TrainingMetrics) -> tuple[list[str], LabelSettings]:
+    """The feature columns and label settings a model was trained with (the
+    original seven features and 30-minute labels for a model whose metrics
+    predate recording them)."""
+    default = LabelSettings()
+    settings = LabelSettings(
+        horizon_seconds=metrics.get("label_horizon_seconds", default.horizon_seconds),
+        barrier_stds=metrics.get("label_barrier_stds", default.barrier_stds),
+    )
+    return metrics.get("feature_columns", list(FEATURE_COLUMNS)), settings
+
+
 def _prepare_labeled_bars(
-    swaps_path: Path, report: Callable[..., None]
+    swaps_path: Path, report: Callable[..., None], settings: LabelSettings
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Ingest-coverage check, bars, features and labels: everything both
     training and backtesting need before the data is split. Returns the
@@ -351,13 +411,16 @@ def _prepare_labeled_bars(
 
     # Take-profit/stop-loss band sized from the pool's own realized
     # volatility (spec 3.3), not a fixed guess — a symmetric band at
-    # 2x the trailing 1-bar return std-dev.
+    # settings.barrier_stds x the 1-bar return std-dev. The band has to
+    # widen with the horizon: a fixed narrow band is hit within minutes and
+    # a longer horizon would change nothing.
     bar_return_std = bar_df["price_usdc_per_weth"].pct_change().std()
-    tp_sl_fraction = max(bar_return_std * 2, 0.001) if pd.notna(bar_return_std) else 0.01
+    tp_sl_fraction = max(bar_return_std * settings.barrier_stds, 0.001) if pd.notna(bar_return_std) else 0.01
 
     assembled = assemble_training_data(
         bar_df, swap_df, return_windows=[5, 15, 30], volatility_window=15, tp_sl_fraction=tp_sl_fraction,
         on_label_progress=lambda done, total: report("labeling bars", done, total),
+        horizon_seconds=settings.horizon_seconds,
     )
     return assembled, swap_df
 
@@ -371,7 +434,11 @@ def _assemble_train_data(
         if on_progress is not None:
             on_progress(stage, done, total)
 
-    assembled, _ = _prepare_labeled_bars(swaps_path, report)
+    settings = _label_settings_from_env()
+    excluded = _excluded_features_from_env()
+    feature_columns = [name for name in FEATURE_COLUMNS if name not in excluded]
+
+    assembled, _ = _prepare_labeled_bars(swaps_path, report, settings)
     report("splitting and standardizing")
     train_split, validate_split, test_split = chronological_split(assembled, train_fraction=0.7, validate_fraction=0.15)
 
@@ -386,21 +453,23 @@ def _assemble_train_data(
     # FEATURE_COLUMNS get standardized into x), so callers that want a
     # standardized training target must apply these net_return stats
     # themselves via features.standardize_value/unstandardize_value.
-    stats = compute_feature_stats(train_split, [*FEATURE_COLUMNS, "net_return"])
+    stats = compute_feature_stats(train_split, [*feature_columns, "net_return"])
 
     def to_arrays(split: pd.DataFrame) -> SplitArrays:
-        standardized = standardize_features(split, FEATURE_COLUMNS, stats)
-        x = standardized[FEATURE_COLUMNS].to_numpy(dtype="float32")
+        standardized = standardize_features(split, feature_columns, stats)
+        x = standardized[feature_columns].to_numpy(dtype="float32")
         y = standardized["net_return"].to_numpy(dtype="float32")
-        return SplitArrays(x=x, y=y)
+        return SplitArrays(x=x, y=y, gross=split["gross_return"].to_numpy(dtype="float64"))
 
     return AssembledTrainingData(
         train=to_arrays(train_split),
         validate=to_arrays(validate_split),
         test=to_arrays(test_split),
-        input_dim=len(FEATURE_COLUMNS),
+        input_dim=len(feature_columns),
         stats=stats,
         test_start=int(test_split["bar_start"].iloc[0]),
+        feature_columns=tuple(feature_columns),
+        label_settings=settings,
     )
 
 
@@ -445,13 +514,20 @@ def _run_train_direct(swaps: Path, out: Path, epochs: int) -> None:
     "--epochs", type=int, default=100, envvar="LATENTEDGE_TRAIN_EPOCHS",
     help="Falls back to the LATENTEDGE_TRAIN_EPOCHS env var (or a .env file).",
 )
-def train(swaps: Path, out: Path, epochs: int, backtest_after_train: bool) -> None:
+@click.option(
+    "--sweep-after-train/--no-sweep-after-train", default=True, envvar="LATENTEDGE_SWEEP_AFTER_TRAIN",
+    help="Run the scenario sweep immediately once training finishes (on by default; the sweep is the pipeline's result), before any chained backtest. Uses the LATENTEDGE_SWEEP_* env vars for its settings. Falls back to the LATENTEDGE_SWEEP_AFTER_TRAIN env var (or a .env file).",
+)
+def train(swaps: Path, out: Path, epochs: int, backtest_after_train: bool, sweep_after_train: bool) -> None:
+    _label_settings_from_env()
+    _excluded_features_from_env()
     if sys.stdout.isatty():
         out.parent.mkdir(parents=True, exist_ok=True)
         screen = TrainScreen(
             swaps_path=swaps, out_path=out, epochs=epochs,
             assemble_fn=_assemble_train_data,
             backtest_fn=_chained_backtest_fn(swaps, out), backtest_after_train=backtest_after_train,
+            sweep_fn=_chained_sweep_fn(swaps, out), sweep_after_train=sweep_after_train,
         )
         LatentEdgeApp(start_screen=screen).run()
         if screen.error is not None:
@@ -460,6 +536,8 @@ def train(swaps: Path, out: Path, epochs: int, backtest_after_train: bool) -> No
         return
 
     _run_train_direct(swaps, out, epochs)
+    if sweep_after_train:
+        _run_sweep_direct(swaps, out)
     if backtest_after_train:
         _run_backtest_direct(swaps, out, BacktestParams.from_env())
 
@@ -568,14 +646,15 @@ def _compute_backtest(
             "backtest can't be guaranteed — retrain the model."
         )
 
-    assembled, swap_df = _prepare_labeled_bars(swaps, observer)
+    feature_columns, settings = _model_setup(load_training_metrics(metrics_path))
+    assembled, swap_df = _prepare_labeled_bars(swaps, observer, settings)
     window = assembled[assembled["bar_start"] >= test_start]
     if window.empty:
         raise click.ClickException(f"no labeled bars at or after the model's test window start ({test_start}).")
 
     observer("replaying test window")
-    inputs = build_backtest_inputs(window, swap_df, FEATURE_COLUMNS)
-    client = SignalClient(model, input_dim=len(FEATURE_COLUMNS), feature_columns=FEATURE_COLUMNS)
+    inputs = build_backtest_inputs(window, swap_df, feature_columns)
+    client = SignalClient(model, input_dim=len(feature_columns), feature_columns=feature_columns)
     guard = SafetyGuard(
         max_position_fraction=params.max_position_fraction,
         daily_loss_limit_fraction=params.daily_loss_limit_fraction,
@@ -592,6 +671,7 @@ def _compute_backtest(
         initial_equity_usd=params.initial_equity,
         timestamps=inputs.timestamps,
         observer=observer,
+        horizon_seconds=settings.horizon_seconds,
     )
 
     summary = {
@@ -623,6 +703,7 @@ def _run_backtest_direct(swaps: Path, model: Path, params: BacktestParams) -> No
 DEFAULT_SWEEP_MIN_EDGES = "0,0.0013"
 DEFAULT_SWEEP_FULL_SIZE_RETURNS = "0.002"
 DEFAULT_SWEEP_TOP_FRACTIONS = "0.01,0.05,0.10,0.25,0.50,1.0"
+DEFAULT_SWEEP_SHUFFLE_SEEDS = "0,1,2"
 
 
 def _parse_float_list(name: str, raw: str) -> list[float]:
@@ -635,11 +716,55 @@ def _parse_float_list(name: str, raw: str) -> list[float]:
     return values
 
 
+def _parse_int_list(name: str, raw: str) -> list[int]:
+    """Comma-separated integers; an empty value is an empty list."""
+    try:
+        return [int(part) for part in raw.split(",") if part.strip()]
+    except ValueError:
+        raise click.UsageError(f"{name} must be a comma-separated list of integers, got {raw!r}.") from None
+
+
 @dataclass(frozen=True)
 class SweepGrid:
     min_edges: list[float]
     full_size_returns: list[float]
     top_fractions: list[float]
+    shuffle_seeds: list[int]
+
+    @classmethod
+    def from_env(cls) -> "SweepGrid":
+        """The grid from the LATENTEDGE_SWEEP_* env vars (their defaults if unset)."""
+        def raw(name: str, default: str) -> str:
+            return os.environ.get(name, default)
+
+        return cls(
+            _parse_float_list("LATENTEDGE_SWEEP_MIN_EDGES", raw("LATENTEDGE_SWEEP_MIN_EDGES", DEFAULT_SWEEP_MIN_EDGES)),
+            _parse_float_list(
+                "LATENTEDGE_SWEEP_FULL_SIZE_RETURNS",
+                raw("LATENTEDGE_SWEEP_FULL_SIZE_RETURNS", DEFAULT_SWEEP_FULL_SIZE_RETURNS),
+            ),
+            _parse_float_list(
+                "LATENTEDGE_SWEEP_TOP_FRACTIONS", raw("LATENTEDGE_SWEEP_TOP_FRACTIONS", DEFAULT_SWEEP_TOP_FRACTIONS)
+            ),
+            _parse_int_list(
+                "LATENTEDGE_SWEEP_SHUFFLE_SEEDS", raw("LATENTEDGE_SWEEP_SHUFFLE_SEEDS", DEFAULT_SWEEP_SHUFFLE_SEEDS)
+            ),
+        )
+
+
+def _chained_sweep_fn(swaps: Path, model: Path) -> Callable[[sweeping.SweepObserver], dict]:
+    """The sweep a TrainScreen chains into, configured from env vars
+    (resolved now, so a bad value fails before the TUI starts)."""
+    params = BacktestParams.from_env()
+    grid = SweepGrid.from_env()
+    out_dir = Path(os.environ.get("LATENTEDGE_SWEEP_OUT_DIR", "data/sweeps"))
+    return lambda observer: _compute_sweep(swaps, model, params, grid, out_dir, observer)
+
+
+def _run_sweep_direct(swaps: Path, model: Path) -> None:
+    """Sweeps without the TUI — the non-tty chained (--sweep-after-train) runs."""
+    result = _chained_sweep_fn(swaps, model)(sweeping.SweepObserver())
+    click.echo(sweeping.describe_sweep(result))
 
 
 def _compute_sweep(
@@ -660,18 +785,30 @@ def _compute_sweep(
         )
     validate_bars = int(metrics["splits"]["validate"]["n"])
 
-    assembled, swap_df = _prepare_labeled_bars(swaps, observer)
+    feature_columns, settings = _model_setup(metrics)
+    assembled, swap_df = _prepare_labeled_bars(swaps, observer, settings)
     windows = sweeping.split_windows(assembled, test_start, validate_bars)
     for name, window in windows.items():
         if window.empty:
             raise click.ClickException(f"the {name} window has no labeled bars.")
 
     observer("computing model predictions")
-    client = SignalClient(model, input_dim=len(FEATURE_COLUMNS), feature_columns=FEATURE_COLUMNS)
-    inputs = {name: build_backtest_inputs(window, swap_df, FEATURE_COLUMNS) for name, window in windows.items()}
+    client = SignalClient(model, input_dim=len(feature_columns), feature_columns=feature_columns)
+    inputs = {name: build_backtest_inputs(window, swap_df, feature_columns) for name, window in windows.items()}
     model_predictions = {name: client.predict_batch(inputs[name].features) for name in windows}
+    # Works for any model, old or new: does it predict direction (gross) or
+    # what trading costs, on the same windows the rules are replayed on.
+    diagnostics = {
+        name: prediction_correlations(
+            model_predictions[name], windows[name]["net_return"].to_numpy(dtype="float64"),
+            windows[name]["gross_return"].to_numpy(dtype="float64"),
+        )
+        for name in windows
+    }
 
-    scenarios = sweeping.build_scenarios(grid.min_edges, grid.full_size_returns, grid.top_fractions)
+    scenarios = sweeping.build_scenarios(
+        grid.min_edges, grid.full_size_returns, grid.top_fractions, grid.shuffle_seeds
+    )
     rows: list[dict] = []
     for index, scenario in enumerate(scenarios):
         observer(
@@ -684,7 +821,7 @@ def _compute_sweep(
         )
         row = sweeping.run_scenario(
             scenario, inputs[scenario.window], predictions, params.max_position_fraction,
-            params.daily_loss_limit_fraction, params.initial_equity,
+            params.daily_loss_limit_fraction, params.initial_equity, settings.horizon_seconds,
         )
         rows.append(row)
         observer.on_scenario(row)
@@ -702,8 +839,12 @@ def _compute_sweep(
         "min_edges": grid.min_edges,
         "full_size_returns": grid.full_size_returns,
         "top_fractions": grid.top_fractions,
+        "shuffle_seeds": grid.shuffle_seeds,
         "bar_interval_seconds": config.BAR_INTERVAL_SECONDS,
-        "label_horizon_seconds": config.LABEL_HORIZON_SECONDS,
+        "label_horizon_seconds": settings.horizon_seconds,
+        "label_barrier_stds": settings.barrier_stds,
+        "feature_columns": feature_columns,
+        "prediction_diagnostics": diagnostics,
         "training_metrics": metrics,
     }
     path = sweeping.write_sweep(out_dir, meta, rows)
@@ -739,8 +880,15 @@ def _compute_sweep(
     help="Comma-separated predicted returns at which a position sizes at the full maximum. "
     "Falls back to LATENTEDGE_SWEEP_FULL_SIZE_RETURNS.",
 )
+@click.option(
+    "--shuffle-seeds", default=DEFAULT_SWEEP_SHUFFLE_SEEDS, envvar="LATENTEDGE_SWEEP_SHUFFLE_SEEDS",
+    help="Comma-separated seeds; each adds the rank rules run on the model's predictions shuffled among the "
+    "bars — the control a real signal must beat. Empty turns the control off. "
+    "Falls back to LATENTEDGE_SWEEP_SHUFFLE_SEEDS.",
+)
 def sweep(
-    swaps: Path, model: Path, out_dir: Path, min_edges: str, full_size_returns: str, top_fractions: str
+    swaps: Path, model: Path, out_dir: Path, min_edges: str, full_size_returns: str, top_fractions: str,
+    shuffle_seeds: str,
 ) -> None:
     """Replays the model under a grid of trading rules on the validation and
     test windows, next to an always-trade and an oracle reference, and
@@ -749,7 +897,7 @@ def sweep(
     params = BacktestParams.from_env()
     grid = SweepGrid(
         _parse_float_list("--min-edges", min_edges), _parse_float_list("--full-size-returns", full_size_returns),
-        _parse_float_list("--top-fractions", top_fractions),
+        _parse_float_list("--top-fractions", top_fractions), _parse_int_list("--shuffle-seeds", shuffle_seeds),
     )
     if sys.stdout.isatty():
         screen = SweepScreen(sweep_fn=lambda observer: _compute_sweep(swaps, model, params, grid, out_dir, observer))

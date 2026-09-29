@@ -103,3 +103,29 @@ def test_sort_swaps_is_stable_for_swaps_sharing_a_timestamp():
     ordered = sort_swaps(swaps)
     # ties broken by (block_number, log_index) when present — never arbitrary
     assert ordered["marker"].tolist() == ["d", "b", "e", "c", "a"]
+
+
+def test_gross_return_is_the_price_move_before_any_cost():
+    swaps = pd.DataFrame([_swap(0, 3000.0), _swap(60, 3100.0)])
+    bars = pd.DataFrame([{"bar_start": 0, "price_usdc_per_weth": 3000.0, "swap_count": 1, "volume_usdc": 1000.0, "has_gap": False}])
+    result = label_bars(bars, swaps, tp_sl_fraction=0.01)
+
+    assert result.iloc[0]["gross_return"] == pytest.approx(100.0 / 3000.0)
+    assert result.iloc[0]["net_return"] < result.iloc[0]["gross_return"]
+
+
+def test_excluded_bar_has_no_gross_return():
+    swaps = pd.DataFrame([_swap(2000, 3000.0)])
+    bars = pd.DataFrame([{"bar_start": 0, "price_usdc_per_weth": 3000.0, "swap_count": 0, "volume_usdc": 0.0, "has_gap": True}])
+    assert pd.isna(label_bars(bars, swaps, tp_sl_fraction=0.01).iloc[0]["gross_return"])
+
+
+def test_a_longer_horizon_keeps_a_bar_open_until_a_later_barrier_is_hit():
+    swaps = pd.DataFrame([_swap(0, 3000.0), _swap(600, 3001.0), _swap(3000, 3100.0), _swap(20000, 3100.0)])
+    bars = pd.DataFrame([{"bar_start": 0, "price_usdc_per_weth": 3000.0, "swap_count": 1, "volume_usdc": 1000.0, "has_gap": False}])
+
+    short = label_bars(bars, swaps, tp_sl_fraction=0.01)
+    long = label_bars(bars, swaps, tp_sl_fraction=0.01, horizon_seconds=4 * 3600)
+
+    assert short.iloc[0]["exit_swap_idx"] == 1  # 30 minutes: no barrier, exits at the last swap in the window
+    assert long.iloc[0]["exit_swap_idx"] == 2  # 4 hours: the 3.3% move at t=3000 is inside the horizon

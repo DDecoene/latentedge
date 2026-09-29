@@ -17,6 +17,7 @@ from latentedge.model import NetReturnRegressor, save
 from latentedge.model import train as default_train
 from latentedge.training_data import AssembledTrainingData
 from latentedge.tui.backtest_screen import BacktestFn, BacktestScreen
+from latentedge.tui.sweep_screen import SweepFn, SweepScreen
 from latentedge.tui.widgets import LogPanel, ProgressPanel
 
 DEFAULT_MODEL_OUT_PATH = Path("data/model.safetensors")
@@ -30,6 +31,7 @@ class TrainingCancelled(Exception):
 
 class TrainScreen(Screen[None]):
     BINDINGS = [
+        Binding("s", "sweep_now", "Sweep now", show=False),
         Binding("b", "backtest_now", "Backtest now", show=False),
         Binding("q", "exit_now", "Exit", show=False),
     ]
@@ -43,6 +45,8 @@ class TrainScreen(Screen[None]):
         learning_rate: float = 0.001,
         backtest_fn: BacktestFn | None = None,
         backtest_after_train: bool = False,
+        sweep_fn: SweepFn | None = None,
+        sweep_after_train: bool = False,
         train_fn: Callable[..., list[float]] = default_train,
         time_fn: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -54,6 +58,8 @@ class TrainScreen(Screen[None]):
         self.assemble_fn = assemble_fn
         self.backtest_fn = backtest_fn
         self.backtest_after_train = backtest_after_train
+        self.sweep_fn = sweep_fn
+        self.sweep_after_train = sweep_after_train
         self.train_fn = train_fn
         self.time_fn = time_fn
 
@@ -161,13 +167,34 @@ class TrainScreen(Screen[None]):
             f"Training complete — final loss {final_loss:.6f}, val corr {validate_correlation:.4f}, "
             f"saved to {self.out_path}."
         )
+        if self.sweep_fn is not None and self.sweep_after_train:
+            self.query_one("#train-log", LogPanel).log_line("sweep_after_train is on — starting sweep now")
+            self.query_one("#train-action-bar", Static).update(f"{summary} Starting sweep now.")
+            self._push_sweep_screen()
+            return
         if self.backtest_fn is not None and self.backtest_after_train:
             self.query_one("#train-log", LogPanel).log_line("backtest_after_train is on — starting backtest now")
             self.query_one("#train-action-bar", Static).update(f"{summary} Starting backtest now.")
             self._push_backtest_screen()
             return
-        prompt = "Press [b]B[/b] to backtest now, or [b]Q[/b] to exit." if self.backtest_fn is not None else "Press [b]Q[/b] to exit."
+        options = [
+            label for available, label in (
+                (self.sweep_fn is not None, "[b]S[/b] to sweep"), (self.backtest_fn is not None, "[b]B[/b] to backtest"),
+            ) if available
+        ]
+        prompt = f"Press {', '.join(options)}, or [b]Q[/b] to exit." if options else "Press [b]Q[/b] to exit."
         self.query_one("#train-action-bar", Static).update(f"{summary} {prompt}")
+
+    def _push_sweep_screen(self) -> None:
+        assert self.sweep_fn is not None
+        # Once the sweep is on, the backtest follows it, not training.
+        self.app.push_screen(SweepScreen(
+            sweep_fn=self.sweep_fn, backtest_fn=self.backtest_fn, backtest_after_sweep=self.backtest_after_train,
+        ))
+
+    def action_sweep_now(self) -> None:
+        if self.is_complete and self.sweep_fn is not None:
+            self._push_sweep_screen()
 
     def _push_backtest_screen(self) -> None:
         assert self.backtest_fn is not None

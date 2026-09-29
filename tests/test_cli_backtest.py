@@ -3,10 +3,12 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
 from click.testing import CliRunner
 
 from latentedge.cli import cli
 from latentedge.ingest.progress import write_progress
+from latentedge.training_data import FEATURE_COLUMNS
 from latentedge.uniswap_math import price_to_sqrt_price_x96
 
 
@@ -132,3 +134,102 @@ def test_backtest_after_train_runs_the_backtest_once_training_finishes(tmp_path:
 def test_train_without_the_flag_does_not_backtest(tmp_path: Path):
     _, model = _train(tmp_path)
     assert not Path(str(model) + ".backtest.json").exists()
+
+
+def test_train_records_gross_correlation_and_the_default_setup(tmp_path: Path):
+    _, model = _train(tmp_path)
+    metrics = json.loads(Path(str(model) + ".metrics.json").read_text())
+
+    assert {"gross_correlation", "cost_correlation"} <= set(metrics["splits"]["test"])
+    assert metrics["label_horizon_seconds"] == 1800
+    assert len(metrics["feature_columns"]) == 7
+
+
+def test_excluded_features_are_left_out_of_training_and_the_backtest_follows_the_model(tmp_path: Path):
+    swaps = tmp_path / "swaps.parquet"
+    model = tmp_path / "model.safetensors"
+    _write_synthetic_swaps(swaps)
+    runner = CliRunner()
+
+    trained = runner.invoke(
+        cli, ["train", "--swaps", str(swaps), "--out", str(model), "--epochs", "5"],
+        env={"LATENTEDGE_TRAIN_EXCLUDE_FEATURES": "base_fee_gwei, volatility"},
+    )
+    assert trained.exit_code == 0, trained.output
+    metrics = json.loads(Path(str(model) + ".metrics.json").read_text())
+    assert metrics["feature_columns"] == ["return_5", "return_15", "return_30", "volume_usdc", "bars_since_swap"]
+
+    # no exclusion in the environment now: the backtest must still use the model's five features
+    replayed = runner.invoke(cli, ["backtest", "--swaps", str(swaps), "--model", str(model)])
+    assert replayed.exit_code == 0, replayed.output
+
+
+def test_unknown_or_total_feature_exclusion_is_refused_before_any_work(tmp_path: Path):
+    runner = CliRunner()
+    args = ["train", "--swaps", str(tmp_path / "s.parquet"), "--out", str(tmp_path / "m.safetensors")]
+
+    unknown = runner.invoke(cli, args, env={"LATENTEDGE_TRAIN_EXCLUDE_FEATURES": "gas"})
+    everything = runner.invoke(
+        cli, args, env={"LATENTEDGE_TRAIN_EXCLUDE_FEATURES": ",".join(FEATURE_COLUMNS)}
+    )
+
+    assert unknown.exit_code != 0 and "unknown feature" in unknown.output
+    assert everything.exit_code != 0 and "no features" in everything.output
+
+
+def test_a_longer_label_horizon_is_recorded_and_reused_by_the_backtest_and_sweep(tmp_path: Path):
+    swaps = tmp_path / "swaps.parquet"
+    model = tmp_path / "model.safetensors"
+    _write_synthetic_swaps(swaps, n_minutes=9000)
+    runner = CliRunner()
+
+    trained = runner.invoke(
+        cli, ["train", "--swaps", str(swaps), "--out", str(model), "--epochs", "5"],
+        env={"LATENTEDGE_LABEL_HORIZON_MINUTES": "120", "LATENTEDGE_LABEL_BARRIER_STDS": "5"},
+    )
+    assert trained.exit_code == 0, trained.output
+    metrics = json.loads(Path(str(model) + ".metrics.json").read_text())
+    assert metrics["label_horizon_seconds"] == 7200 and metrics["label_barrier_stds"] == 5.0
+
+    # the environment is back to defaults: the model's own recorded settings must win
+    replayed = runner.invoke(cli, ["backtest", "--swaps", str(swaps), "--model", str(model)])
+    assert replayed.exit_code == 0, replayed.output
+    assert json.loads(Path(str(model) + ".backtest.json").read_text())["bars"] == metrics["splits"]["test"]["n"]
+
+    swept = runner.invoke(
+        cli, ["sweep", "--swaps", str(swaps), "--model", str(model), "--out-dir", str(tmp_path / "sw"),
+              "--min-edges", "0", "--top-fractions", "0.5", "--shuffle-seeds", ""],
+    )
+    assert swept.exit_code == 0, swept.output
+    (saved,) = list((tmp_path / "sw").glob("*.json"))
+    assert json.loads(saved.read_text())["label_horizon_seconds"] == 7200
+
+
+@pytest.mark.parametrize("env", [
+    {"LATENTEDGE_LABEL_HORIZON_MINUTES": "0"},
+    {"LATENTEDGE_LABEL_HORIZON_MINUTES": "soon"},
+    {"LATENTEDGE_LABEL_BARRIER_STDS": "-1"},
+])
+def test_bad_label_settings_are_refused_before_any_work(tmp_path: Path, env: dict):
+    result = CliRunner().invoke(
+        cli, ["train", "--swaps", str(tmp_path / "s.parquet"), "--out", str(tmp_path / "m.safetensors")], env=env
+    )
+    assert result.exit_code != 0
+    assert "LATENTEDGE_LABEL" in result.output
+
+
+def test_train_can_chain_the_sweep_and_then_the_backtest(tmp_path: Path):
+    swaps = tmp_path / "swaps.parquet"
+    model = tmp_path / "model.safetensors"
+    _write_synthetic_swaps(swaps)
+
+    result = CliRunner().invoke(
+        cli, ["train", "--swaps", str(swaps), "--out", str(model), "--epochs", "5",
+              "--sweep-after-train", "--backtest-after-train"],
+        env={"LATENTEDGE_SWEEP_OUT_DIR": str(tmp_path / "sweeps"), "LATENTEDGE_SWEEP_SHUFFLE_SEEDS": "0"},
+    )
+
+    assert result.exit_code == 0, result.output
+    assert len(list((tmp_path / "sweeps").glob("*.json"))) == 1
+    assert Path(str(model) + ".backtest.json").exists()
+    assert result.output.index("scenarios saved") < result.output.index("backtest over")

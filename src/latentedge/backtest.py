@@ -155,6 +155,7 @@ def run_backtest(
     initial_equity_usd: float,
     timestamps: np.ndarray,
     observer: BacktestObserver | None = None,
+    horizon_seconds: int = config.LABEL_HORIZON_SECONDS,
 ) -> BacktestResult:
     """Backtest with realistic accounting: a position's P&L is realized at
     its actual exit time (entry + the label horizon), not the moment it
@@ -235,7 +236,7 @@ def run_backtest(
 
         if size_usd > 0:
             pnl = simulate_fill(size_usd, float(entry_prices[i]), float(exit_prices[i]), entry_swaps[i], exit_swaps[i])
-            exit_timestamp = entry_timestamp + config.LABEL_HORIZON_SECONDS
+            exit_timestamp = entry_timestamp + horizon_seconds
             open_positions.append(_OpenPosition(exit_timestamp=exit_timestamp, pnl_usd=pnl, size_usd=size_usd))
             committed_capital += size_usd
             num_trades += 1

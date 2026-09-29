@@ -25,6 +25,10 @@ from latentedge.safety_guard import SafetyGuard
 SIGNAL_MODEL = "model"
 SIGNAL_ALWAYS = "always"
 SIGNAL_ORACLE = "oracle"
+# The model's own predictions shuffled among the bars of the window: same
+# distribution, no information. A rank rule on these shows what luck alone
+# earns, which is what the model's rows must beat to count for anything.
+SIGNAL_SHUFFLED = "shuffled"
 
 WINDOW_VALIDATE = "validate"
 WINDOW_TEST = "test"
@@ -41,6 +45,8 @@ class Scenario:
     # A model that never predicts a positive return still ranks bars, and
     # this asks whether the ranking is worth anything. None = no rank rule.
     top_fraction: float | None = None
+    # SIGNAL_SHUFFLED only: which shuffle of the predictions.
+    seed: int | None = None
 
 
 @dataclass
@@ -69,10 +75,13 @@ class FixedPredictions:
 
 
 def build_scenarios(
-    min_edges: list[float], full_size_returns: list[float], top_fractions: list[float]
+    min_edges: list[float], full_size_returns: list[float], top_fractions: list[float],
+    shuffle_seeds: list[int] | None = None,
 ) -> list[Scenario]:
     """The model under each absolute rule (a minimum predicted return, at each
-    sizing) and each rank rule (its top share of bars), then the two reference
+    sizing) and each rank rule (its top share of bars), the same rank rules
+    on shuffled predictions (one run per seed, skipping the share-1.0 rule,
+    which trades every bar however they are ordered), then the two reference
     strategies at the first sizing, each on both windows (validate first: it
     is where a rule is chosen, the test window is only for reporting the
     choice)."""
@@ -82,6 +91,12 @@ def build_scenarios(
             scenarios.append(Scenario(window, SIGNAL_MODEL, min_edge, full_size))
         for fraction in top_fractions:
             scenarios.append(Scenario(window, SIGNAL_MODEL, 0.0, full_size_returns[0], top_fraction=fraction))
+        for seed in shuffle_seeds or []:
+            for fraction in top_fractions:
+                if fraction < 1.0:
+                    scenarios.append(
+                        Scenario(window, SIGNAL_SHUFFLED, 0.0, full_size_returns[0], top_fraction=fraction, seed=seed)
+                    )
         scenarios.append(Scenario(window, SIGNAL_ALWAYS, 0.0, full_size_returns[0]))
         scenarios.append(Scenario(window, SIGNAL_ORACLE, 0.0, full_size_returns[0]))
     return scenarios
@@ -100,6 +115,14 @@ def split_windows(assembled: pd.DataFrame, test_start: int, validate_bars: int) 
     }
 
 
+def _rank_rule(scenario: Scenario, predictions: np.ndarray, validate_predictions: np.ndarray) -> np.ndarray:
+    assert scenario.top_fraction is not None
+    if scenario.top_fraction >= 1.0:
+        return np.full(len(predictions), scenario.full_size_return, dtype="float64")
+    cutoff = float(np.quantile(validate_predictions, 1.0 - scenario.top_fraction))
+    return np.where(predictions > cutoff, scenario.full_size_return, 0.0)
+
+
 def predictions_for(
     scenario: Scenario, model_predictions: np.ndarray, validate_predictions: np.ndarray, window: pd.DataFrame
 ) -> np.ndarray:
@@ -110,11 +133,13 @@ def predictions_for(
     if scenario.signal == SIGNAL_MODEL:
         if scenario.top_fraction is None:
             return model_predictions
-        if scenario.top_fraction >= 1.0:
-            return np.full(len(model_predictions), scenario.full_size_return, dtype="float64")
-        cutoff = float(np.quantile(validate_predictions, 1.0 - scenario.top_fraction))
-        chosen = model_predictions > cutoff
-        return np.where(chosen, scenario.full_size_return, 0.0)
+        return _rank_rule(scenario, model_predictions, validate_predictions)
+    if scenario.signal == SIGNAL_SHUFFLED:
+        if scenario.top_fraction is None or scenario.seed is None:
+            raise ValueError("a shuffled scenario needs a top_fraction and a seed")
+        shuffled = np.random.default_rng(scenario.seed).permutation(model_predictions)
+        # Shuffling keeps the values, so the validation cutoff is unchanged.
+        return _rank_rule(scenario, shuffled, validate_predictions)
     if scenario.signal == SIGNAL_ALWAYS:
         return np.full(len(window), scenario.full_size_return, dtype="float64")
     if scenario.signal == SIGNAL_ORACLE:
@@ -129,6 +154,7 @@ def run_scenario(
     max_position_fraction: float,
     daily_loss_limit_fraction: float,
     initial_equity: float,
+    horizon_seconds: int,
 ) -> dict[str, Any]:
     guard = SafetyGuard(
         max_position_fraction=max_position_fraction,
@@ -146,6 +172,7 @@ def run_scenario(
         guard=guard,
         initial_equity_usd=initial_equity,
         timestamps=inputs.timestamps,
+        horizon_seconds=horizon_seconds,
     )
     return {
         **asdict(scenario),
@@ -211,7 +238,8 @@ def write_sweep(out_dir: Path, meta: dict[str, Any], rows: list[dict[str, Any]],
 
 def describe_rule(row: dict[str, Any]) -> str:
     if row.get("top_fraction") is not None:
-        return f"top {row['top_fraction']:.0%} of bars"
+        seed = f", shuffle {row['seed']}" if row.get("seed") is not None else ""
+        return f"top {row['top_fraction']:.0%} of bars{seed}"
     return f"min edge {row['min_edge']:.2%}, full size {row['full_size_return']:.2%}"
 
 

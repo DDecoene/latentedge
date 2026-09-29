@@ -114,6 +114,7 @@ def test_train_options_fall_back_to_env_vars(monkeypatch: pytest.MonkeyPatch, tm
             "LATENTEDGE_TRAIN_SWAPS": str(swaps_path),
             "LATENTEDGE_TRAIN_OUT": str(out_path),
             "LATENTEDGE_TRAIN_EPOCHS": "3",
+            "LATENTEDGE_SWEEP_AFTER_TRAIN": "false",  # training is faked here, so there is no model to sweep
         },
     )
 
@@ -154,6 +155,7 @@ def test_ingest_train_after_ingest_chains_training_in_non_tty_mode(monkeypatch: 
             "LATENTEDGE_TRAIN_AFTER_INGEST": "true",
             "LATENTEDGE_TRAIN_OUT": str(train_out_path),
             "LATENTEDGE_TRAIN_EPOCHS": "3",
+            "LATENTEDGE_SWEEP_AFTER_TRAIN": "false",  # training is faked here, so there is no model to sweep
         },
     )
 

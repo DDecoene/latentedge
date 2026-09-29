@@ -1,4 +1,5 @@
 from collections.abc import Callable
+from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
@@ -9,9 +10,23 @@ from latentedge.uniswap_math import sqrt_price_x96_to_weth_usdc_price
 
 PROGRESS_EVERY = 1000
 FEE_FRACTION = config.FEE_TIER_BPS / 10_000
+DEFAULT_BARRIER_STDS = 2.0
 
 
-def _net_return(entry_price: float, exit_price: float, entry_swap: dict, exit_swap: dict) -> float:
+@dataclass(frozen=True)
+class LabelSettings:
+    """How bars are labeled: how long a trade may run, and how wide the
+    take-profit/stop-loss band is in standard deviations of the pool's
+    1-bar return. Recorded with the model, since a backtest must relabel
+    with the settings the model was trained under."""
+
+    horizon_seconds: int = config.LABEL_HORIZON_SECONDS
+    barrier_stds: float = DEFAULT_BARRIER_STDS
+
+
+def _returns(entry_price: float, exit_price: float, entry_swap: dict, exit_swap: dict) -> tuple[float, float]:
+    """(gross, net) return of one round trip: gross is the price move alone,
+    net also pays the pool fees, slippage and gas."""
     notional = config.REFERENCE_NOTIONAL_USD
 
     raw_return = (exit_price - entry_price) / entry_price
@@ -28,7 +43,7 @@ def _net_return(entry_price: float, exit_price: float, entry_swap: dict, exit_sw
     gas_cost = entry_gas + exit_gas
 
     net_pnl = gross_pnl - fee_cost - slippage_cost - gas_cost
-    return net_pnl / notional
+    return raw_return, net_pnl / notional
 
 
 def sort_swaps(swaps: pd.DataFrame) -> pd.DataFrame:
@@ -47,6 +62,7 @@ def label_bars(
     swaps: pd.DataFrame,
     tp_sl_fraction: float,
     on_progress: Callable[[int, int], None] | None = None,
+    horizon_seconds: int = config.LABEL_HORIZON_SECONDS,
 ) -> pd.DataFrame:
     swaps = sort_swaps(swaps)
     timestamps = swaps["timestamp"].to_numpy()
@@ -59,6 +75,7 @@ def label_bars(
         return {"liquidity": liquidity[i], "sqrt_price_x96": sqrt_prices[i], "base_fee_wei": base_fees[i]}
 
     net_returns: list[float] = []
+    gross_returns: list[float] = []
     excluded: list[bool] = []
     reasons: list[str | None] = []
     entry_indices: list[int] = []
@@ -71,7 +88,7 @@ def label_bars(
     for n, t in enumerate(bar_starts):
         if on_progress is not None and n % PROGRESS_EVERY == 0:
             on_progress(n, total)
-        horizon_end = t + config.LABEL_HORIZON_SECONDS
+        horizon_end = t + horizon_seconds
 
         # The swaps are time-sorted, so each bar's entry and forward
         # window are located by binary search instead of rescanning the
@@ -79,6 +96,7 @@ def label_bars(
         entry_idx = int(np.searchsorted(timestamps, t, side="left"))
         if entry_idx >= len(timestamps) or timestamps[entry_idx] > horizon_end:
             net_returns.append(float("nan"))
+            gross_returns.append(float("nan"))
             excluded.append(True)
             reasons.append("no_entry_fill")
             entry_indices.append(-1)
@@ -102,6 +120,7 @@ def label_bars(
         # trusted without that data, so exclude rather than guess.
         if exit_idx is None and history_end < horizon_end:
             net_returns.append(float("nan"))
+            gross_returns.append(float("nan"))
             excluded.append(True)
             reasons.append("incomplete_horizon")
             entry_indices.append(-1)
@@ -111,7 +130,9 @@ def label_bars(
         if exit_idx is None:
             exit_idx = fwd_end - 1 if fwd_end > fwd_start else entry_idx
 
-        net_returns.append(_net_return(entry_price, prices[exit_idx], swap_at(entry_idx), swap_at(exit_idx)))
+        gross, net = _returns(entry_price, prices[exit_idx], swap_at(entry_idx), swap_at(exit_idx))
+        gross_returns.append(gross)
+        net_returns.append(net)
         excluded.append(False)
         reasons.append(None)
         entry_indices.append(entry_idx)
@@ -122,6 +143,9 @@ def label_bars(
 
     result = bars.copy()
     result["net_return"] = net_returns
+    # The same round trip before any cost: what a model that only knew the
+    # direction of the move could hope to predict.
+    result["gross_return"] = gross_returns
     result["excluded"] = excluded
     result["reason"] = reasons
     # Row positions in the time-sorted swaps, so a backtest replays the

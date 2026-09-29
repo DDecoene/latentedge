@@ -52,7 +52,7 @@ def test_assemble_training_data_returns_expected_columns():
     bars = build_bars(swaps, interval_seconds=60)
     assembled = assemble_training_data(bars, swaps, return_windows=[5, 15, 30], volatility_window=15, tp_sl_fraction=0.01)
 
-    for column in FEATURE_COLUMNS + ["net_return"]:
+    for column in FEATURE_COLUMNS + ["net_return", "gross_return"]:
         assert column in assembled.columns
     assert not assembled[FEATURE_COLUMNS].isna().any().any()
     assert not assembled["net_return"].isna().any()

@@ -10,7 +10,7 @@ from click.testing import CliRunner
 from latentedge.cli import cli
 from latentedge.sweep import (
     Scenario,
-    SIGNAL_ALWAYS, SIGNAL_MODEL, SIGNAL_ORACLE, WINDOW_TEST, WINDOW_VALIDATE,
+    SIGNAL_ALWAYS, SIGNAL_MODEL, SIGNAL_ORACLE, SIGNAL_SHUFFLED, WINDOW_TEST, WINDOW_VALIDATE,
     build_scenarios, predictions_for, select_on_validate, split_windows, write_sweep,
 )
 from tests.test_cli_backtest import _train
@@ -82,7 +82,8 @@ def test_sweep_command_replays_the_grid_and_saves_a_comparable_record(tmp_path: 
     result = CliRunner().invoke(
         cli,
         ["sweep", "--swaps", str(swaps), "--model", str(model), "--out-dir", str(out_dir),
-         "--min-edges", "0,0.002", "--full-size-returns", "0.002", "--top-fractions", "0.1,1.0"],
+         "--min-edges", "0,0.002", "--full-size-returns", "0.002", "--top-fractions", "0.1,1.0",
+         "--shuffle-seeds", ""],
     )
 
     assert result.exit_code == 0, result.output
@@ -128,3 +129,52 @@ def test_a_rank_rule_of_everything_trades_every_bar():
     signal = predictions_for(scenario, np.array([-0.5, -0.004]), validate, pd.DataFrame({"net_return": [0, 0]}))
 
     assert list(signal) == [0.002, 0.002]
+
+
+def test_shuffled_scenarios_repeat_the_rank_rules_for_each_seed_except_trade_everything():
+    scenarios = build_scenarios([0.0], [0.002], [0.1, 0.5, 1.0], shuffle_seeds=[0, 1])
+
+    for window in (WINDOW_VALIDATE, WINDOW_TEST):
+        shuffled = [s for s in scenarios if s.window == window and s.signal == SIGNAL_SHUFFLED]
+        assert sorted((s.seed, s.top_fraction) for s in shuffled) == [(0, 0.1), (0, 0.5), (1, 0.1), (1, 0.5)]
+    assert not [s for s in build_scenarios([0.0], [0.002], [0.1]) if s.signal == SIGNAL_SHUFFLED]
+
+
+def test_a_shuffled_rule_trades_the_same_number_of_bars_as_the_model_but_not_the_same_bars():
+    rng = np.random.default_rng(3)
+    validate = rng.normal(size=500)
+    test = rng.normal(size=400)
+    frame = pd.DataFrame({"net_return": test})
+    model = Scenario(WINDOW_TEST, SIGNAL_MODEL, 0.0, 0.002, top_fraction=0.2)
+    shuffled = Scenario(WINDOW_TEST, SIGNAL_SHUFFLED, 0.0, 0.002, top_fraction=0.2, seed=0)
+
+    real = predictions_for(model, test, validate, frame)
+    fake = predictions_for(shuffled, test, validate, frame)
+
+    assert (fake > 0).sum() == (real > 0).sum()
+    assert list(fake) != list(real)
+    # deterministic per seed, different across seeds
+    again = predictions_for(shuffled, test, validate, frame)
+    other = predictions_for(Scenario(WINDOW_TEST, SIGNAL_SHUFFLED, 0.0, 0.002, top_fraction=0.2, seed=1), test, validate, frame)
+    assert list(fake) == list(again) and list(fake) != list(other)
+
+
+def test_sweep_command_adds_shuffled_rows_and_prediction_diagnostics(tmp_path: Path):
+    swaps, model = _train(tmp_path)
+    out_dir = tmp_path / "sweeps"
+
+    result = CliRunner().invoke(
+        cli,
+        ["sweep", "--swaps", str(swaps), "--model", str(model), "--out-dir", str(out_dir),
+         "--min-edges", "0", "--top-fractions", "0.1,0.5,1.0", "--shuffle-seeds", "0,1"],
+    )
+
+    assert result.exit_code == 0, result.output
+    (saved,) = list(out_dir.glob("*.json"))
+    record = json.loads(saved.read_text())
+    shuffled = [r for r in record["scenarios"] if r["signal"] == SIGNAL_SHUFFLED]
+    assert len(shuffled) == 2 * 2 * 2  # 2 windows x 2 seeds x (0.1 and 0.5)
+    assert record["shuffle_seeds"] == [0, 1]
+    for window in (WINDOW_VALIDATE, WINDOW_TEST):
+        assert {"gross_correlation", "cost_correlation", "gross_std", "cost_std"} <= set(record["prediction_diagnostics"][window])
+    assert record["label_horizon_seconds"] == 1800

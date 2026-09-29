@@ -20,6 +20,11 @@ class SplitMetrics(TypedDict):
     mse: float
     baseline_mse: float
     correlation: float
+    # Only when the pre-cost return is known; see prediction_correlations.
+    gross_correlation: NotRequired[float]
+    cost_correlation: NotRequired[float]
+    gross_std: NotRequired[float]
+    cost_std: NotRequired[float]
 
 
 class TrainingMetrics(TypedDict):
@@ -28,9 +33,37 @@ class TrainingMetrics(TypedDict):
     loss_history: list[float]
     splits: dict[str, SplitMetrics]
     test_start: NotRequired[int]
+    feature_columns: NotRequired[list[str]]
+    label_horizon_seconds: NotRequired[int]
+    label_barrier_stds: NotRequired[float]
 
 
-def evaluate_predictions(predictions: np.ndarray, targets: np.ndarray, baseline_prediction: float) -> SplitMetrics:
+def _correlation(a: np.ndarray, b: np.ndarray) -> float:
+    if len(a) > 1 and np.std(a) > 0 and np.std(b) > 0:
+        return float(np.corrcoef(a, b)[0, 1])
+    return float("nan")
+
+
+def prediction_correlations(predictions: np.ndarray, net: np.ndarray, gross: np.ndarray) -> dict[str, float]:
+    """Does a model that predicts net return predict the direction of the
+    move, or only what trading costs? net = gross - cost, so correlate the
+    predictions with each part. A prediction that tracks the cost part
+    (cost_correlation clearly negative, gross_correlation near zero) has
+    learned gas and volatility, not price direction. The two spreads say
+    how much room each part has to explain the net correlation: a cost that
+    barely varies cannot account for much of it."""
+    cost = gross - net
+    return {
+        "gross_correlation": _correlation(predictions, gross),
+        "cost_correlation": _correlation(predictions, cost),
+        "gross_std": float(np.std(gross)),
+        "cost_std": float(np.std(cost)),
+    }
+
+
+def evaluate_predictions(
+    predictions: np.ndarray, targets: np.ndarray, baseline_prediction: float, gross: np.ndarray | None = None
+) -> SplitMetrics:
     """MSE against a trivial "always predict this constant" baseline, plus
     correlation — a model with MSE worse than the baseline, or near-zero
     correlation, hasn't learned a usable signal regardless of the raw
@@ -38,12 +71,13 @@ def evaluate_predictions(predictions: np.ndarray, targets: np.ndarray, baseline_
     mse = float(np.mean((predictions - targets) ** 2))
     baseline_mse = float(np.mean((targets - baseline_prediction) ** 2))
 
-    if len(targets) > 1 and np.std(predictions) > 0 and np.std(targets) > 0:
-        correlation = float(np.corrcoef(predictions, targets)[0, 1])
-    else:
-        correlation = float("nan")
-
-    return {"n": len(targets), "mse": mse, "baseline_mse": baseline_mse, "correlation": correlation}
+    result: SplitMetrics = {
+        "n": len(targets), "mse": mse, "baseline_mse": baseline_mse,
+        "correlation": _correlation(predictions, targets),
+    }
+    if gross is not None:
+        result.update(prediction_correlations(predictions, targets, gross))  # type: ignore[typeddict-item]
+    return result
 
 
 def evaluate_model(model: NetReturnRegressor, assembled: AssembledTrainingData) -> dict[str, SplitMetrics]:
@@ -57,7 +91,8 @@ def evaluate_model(model: NetReturnRegressor, assembled: AssembledTrainingData) 
     splits: dict[str, SplitArrays] = {"train": assembled.train, "validate": assembled.validate, "test": assembled.test}
     return {
         name: evaluate_predictions(
-            unstandardize_value(np.array(model(mx.array(split.x))), target_stats), split.y, baseline_prediction
+            unstandardize_value(np.array(model(mx.array(split.x))), target_stats), split.y, baseline_prediction,
+            gross=split.gross,
         )
         for name, split in splits.items()
     }
@@ -74,6 +109,9 @@ def build_training_metrics(
     }
     if assembled.test_start is not None:
         metrics["test_start"] = assembled.test_start
+    metrics["feature_columns"] = list(assembled.feature_columns)
+    metrics["label_horizon_seconds"] = assembled.label_settings.horizon_seconds
+    metrics["label_barrier_stds"] = assembled.label_settings.barrier_stds
     return metrics
 
 
