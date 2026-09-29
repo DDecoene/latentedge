@@ -13,6 +13,7 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.screen import Screen
 from textual.widgets import Static
+from textual_plotext import PlotextPlot
 
 from latentedge.ingest.chunked import (
     DEFAULT_CONCURRENCY_COOLDOWN_SECONDS,
@@ -30,6 +31,11 @@ from latentedge.tui.train_screen import DEFAULT_MODEL_OUT_PATH, TrainAssembleFn,
 from latentedge.tui.widgets import LogPanel, ProgressPanel, StatsPanel, ThreadPanel
 
 STATS_REFRESH_INTERVAL_SECONDS = 1.0
+# Throughput is sampled once a second and each plotted point averages the
+# last few samples: chunks land in bursts, so raw per-second deltas are
+# too jagged to read.
+RATE_HISTORY_SAMPLES = 300
+RATE_SMOOTHING_SAMPLES = 5
 # A run with nothing to report yet (no chunk has completed) isn't
 # "stalled" — only flag it once enough time has passed that a healthy
 # run would normally have made progress.
@@ -56,7 +62,8 @@ class IngestScreen(Screen[None]):
     CSS = """
     #ingest-top-row { height: auto; }
     #ingest-left-col { width: 1fr; height: auto; }
-    #ingest-threads { width: 1fr; }
+    #ingest-right-col { width: 1fr; height: auto; }
+    #ingest-rate-plot { height: 10; }
     """
 
     def __init__(
@@ -179,7 +186,9 @@ class IngestScreen(Screen[None]):
             with Vertical(id="ingest-left-col"):
                 yield ProgressPanel(id="ingest-progress")
                 yield StatsPanel(id="ingest-stats")
-            yield ThreadPanel(id="ingest-threads")
+            with Vertical(id="ingest-right-col"):
+                yield ThreadPanel(id="ingest-threads")
+                yield PlotextPlot(id="ingest-rate-plot")
         yield LogPanel(id="ingest-log")
         yield Static("", id="ingest-action-bar")
 
@@ -213,6 +222,15 @@ class IngestScreen(Screen[None]):
         )
         self._refresh_disk_stats()
         self.set_interval(STATS_REFRESH_INTERVAL_SECONDS, self._refresh_disk_stats)
+        self._rate_plot_completed = self._completed
+        self._rate_deltas: list[int] = []
+        self._rate_history: list[float] = []
+        # Whole-run extremes of the plotted (smoothed) rate, kept apart
+        # from the 5-minute window so they survive it scrolling past.
+        self._rate_min: float | None = None
+        self._rate_max: float | None = None
+        self.set_interval(STATS_REFRESH_INTERVAL_SECONDS, self._sample_rate)
+        self._draw_rate_plot()
 
         progress_panel.border_title = "Progress — requested range"
 
@@ -308,6 +326,31 @@ class IngestScreen(Screen[None]):
         )
         self._log(f"blocks {chunk_start:,}-{chunk_end:,}: {count:,} swaps")
         self._refresh_disk_stats()
+
+    def _sample_rate(self) -> None:
+        if self.is_complete or self._rate_start_time is None:
+            return
+        self._rate_deltas.append(self._completed - self._rate_plot_completed)
+        self._rate_plot_completed = self._completed
+        window = self._rate_deltas[-RATE_SMOOTHING_SAMPLES:]
+        smoothed = sum(window) / len(window) / STATS_REFRESH_INTERVAL_SECONDS
+        self._rate_history.append(smoothed)
+        self._rate_min = smoothed if self._rate_min is None else min(self._rate_min, smoothed)
+        self._rate_max = smoothed if self._rate_max is None else max(self._rate_max, smoothed)
+        del self._rate_history[:-RATE_HISTORY_SAMPLES]
+        del self._rate_deltas[:-RATE_SMOOTHING_SAMPLES]
+        self._draw_rate_plot()
+
+    def _draw_rate_plot(self) -> None:
+        plot = self.query_one("#ingest-rate-plot", PlotextPlot)
+        plot.plt.clear_data()
+        title = "Blocks/sec (last 5 min)"
+        if self._rate_min is not None and self._rate_max is not None:
+            title += f" — run min {self._rate_min:.1f} / max {self._rate_max:.1f}"
+        plot.plt.title(title)
+        if self._rate_history:
+            plot.plt.plot(list(range(-len(self._rate_history) + 1, 1)), self._rate_history)
+        plot.refresh()
 
     def _handle_retry(
         self, chunk_start: int, chunk_end: int, attempt: int, max_retries: int | None,

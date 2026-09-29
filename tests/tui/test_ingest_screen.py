@@ -1013,3 +1013,26 @@ async def test_arrow_keys_do_nothing_when_the_rate_is_auto_throttled(tmp_path: P
 
     assert limiter_rate == 5.0
     assert not env_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_throughput_plot_samples_blocks_per_second(tmp_path: Path):
+    release_fetch = threading.Event()
+    screen = _gated_screen(tmp_path, release_fetch)
+    app = LatentEdgeApp(start_screen=screen)
+
+    try:
+        async with app.run_test() as pilot:
+            screen._rate_start_time = 0.0
+            screen._completed += 10
+            screen._sample_rate()
+            screen._completed += 20
+            screen._sample_rate()
+            await pilot.pause()
+            history = list(screen._rate_history)
+            extremes = (screen._rate_min, screen._rate_max)
+    finally:
+        release_fetch.set()
+
+    assert history == [10.0, 15.0]  # second point averages the last two samples
+    assert extremes == (10.0, 15.0)
