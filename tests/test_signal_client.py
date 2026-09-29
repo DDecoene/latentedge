@@ -63,3 +63,20 @@ def test_predict_batch_standardizes_using_saved_stats_when_present(trained_model
 
     assert not np.isnan(standardized_prediction).any()
     assert not np.allclose(standardized_prediction, unstandardized_prediction)
+
+
+def test_predict_batch_returns_real_net_return_units_when_the_target_was_standardized(trained_model_path: Path):
+    # Regression test: the model trains on a standardized net_return, so its
+    # raw output is in standard deviations. The backtest and guard read the
+    # prediction as a real return (sign test, full_size_return sizing), so
+    # the client must map it back with the saved net_return stats. Feature
+    # stats are identity here so only the target scaling differs.
+    feature_columns = ["a", "b", "c"]
+    features = np.random.default_rng(3).normal(size=(10, 3)).astype(np.float32)
+    raw = SignalClient(trained_model_path, input_dim=3).predict_batch(features)
+
+    identity = {"a": (0.0, 1.0), "b": (0.0, 1.0), "c": (0.0, 1.0)}
+    save_feature_stats({**identity, "net_return": (-0.0013, 0.0019)}, Path(str(trained_model_path) + ".stats.json"))
+    client = SignalClient(trained_model_path, input_dim=3, feature_columns=feature_columns)
+
+    np.testing.assert_allclose(client.predict_batch(features), raw * 0.0019 - 0.0013, rtol=1e-5, atol=1e-8)
