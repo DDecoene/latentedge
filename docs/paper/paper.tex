@@ -6,6 +6,7 @@
 \usepackage[margin=2.5cm]{geometry}
 \usepackage{amsmath}
 \usepackage{booktabs}
+\usepackage{graphicx}
 \usepackage[hidelinks]{hyperref}
 
 \title{A Real but Untradable Signal in a Liquid On-Chain Market:\\
@@ -462,7 +463,7 @@ seeds (all folds pooled) and over the five folds (seeds averaged).}
 \label{tab:study}
 \end{table}
 
-At 30 minutes the correlation is $+0.034$ with an interval that excludes zero,
+Figure~\ref{fig:direction} plots these results. At 30 minutes the correlation is $+0.034$ with an interval that excludes zero,
 is positive in all five folds, and varies little across seeds (0.027 to 0.032).
 The single-window figures of the earlier runs, which looked like noise, fit
 this: with about 1,400 effective labels one window has a standard error near
@@ -473,6 +474,16 @@ survives a Bonferroni correction ($0.001\times 3<0.05$) and the 120-minute
 result ($0.047\times 3=0.14$) does not, so we treat only the 30-minute signal
 as established. The permutation test gives 0.001, its smallest attainable
 value, so the true $p$ may be lower.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.8\textwidth]{figures/direction_signal.png}
+\caption{Pooled out-of-sample correlation between prediction and pre-cost
+price move at each label horizon (blue, with the 95\% block-bootstrap
+interval) and the five single folds (grey). Same numbers as
+Table~\ref{tab:study}.}
+\label{fig:direction}
+\end{figure}
 
 \begin{table}[h]
 \centering
@@ -498,7 +509,7 @@ validation predictions. Per-trade means, without capital or position limits.}
 \label{tab:slices}
 \end{table}
 
-Table~\ref{tab:slices} shows why this does not trade. The gross move of the
+Table~\ref{tab:slices} and Figure~\ref{fig:cost} show why this does not trade. The gross move of the
 selected bars rises with selectivity (at 30 minutes $+0.001\%$ for the top
 quarter, $+0.005\%$ for the top 10\%, $+0.012\%$ for the top 1\%), which is
 what a real ranking signal looks like, but the largest gross move, $+0.012\%$,
@@ -509,6 +520,15 @@ high-fee moments, where moves are larger and costs larger too. The net return
 of every slice is negative with an interval that excludes zero, and the top 1\%
 is worse than trading every bar. At 240 minutes the correlation with cost
 rises to $+0.35$ and the top 1\% pays $0.281\%$.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.8\textwidth]{figures/signal_vs_cost.png}
+\caption{Mean gross move and mean round-trip cost of the bars the model is
+most confident about, at the 30-minute horizon, pooled over the five folds.
+Even the most selective slice earns about a twelfth of its cost.}
+\label{fig:cost}
+\end{figure}
 
 \subsection{Why a small correlation cannot be traded here}
 \label{sec:power}
