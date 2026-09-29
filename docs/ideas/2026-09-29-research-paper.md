@@ -351,7 +351,7 @@ Measured rate limit and ingest time (to be written up as a short subsection):
   provider throttles, and each 429 carries a wait time, so the time lost
   waiting costs more than the extra request rate gained. Net blocks per
   minute drops noticeably once 429s start.
-- At that rate, ingestion settles at roughly 30 blocks/min. Report how long
+- At that rate, ingestion settles at roughly 1,600 to 1,800 blocks/min (measured from the ingest log; the earlier "30 blocks/min" figure was wrong). Report how long
   the full history took (and takes for the 150-day window and any extension),
   since it sets the practical cost of adding more data. Fill in the measured
   wall-clock time from the progress file before drafting.

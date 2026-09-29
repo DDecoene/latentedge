@@ -1,0 +1,620 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{hyperref}
+
+\title{No Detectable Edge in a Liquid On-Chain Market:\\
+A Null Result for a Learned Short-Horizon Trading Signal\\
+on Uniswap v3 WETH/USDC}
+\author{Dennis Decoene}
+\date{September 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We ask whether a purpose-trained neural network can find a tradable
+short-horizon signal in the public swap history of the most liquid Uniswap~v3
+pool, WETH/USDC at the 0.05\% fee tier. We ingest about 200 days of swap
+events directly from an archive node, build one-minute bars, label each bar
+with the return of a 30-minute triple-barrier trade net of pool fees, slippage
+and gas, and evaluate on a chronological hold-out window. We find no
+tradable edge. Every trading rule loses money on both the validation and the
+test window, and the model's rankings are no better per trade than trading
+every bar. The result comes with a decomposition. A model trained on net
+return reached a test correlation of 0.35 with its label, but that correlation
+was cost prediction: the predictions correlated $-0.96$ with the cost part of
+the label and $+0.01$ with the price move. A model trained directly on the
+pre-cost price move finds a correlation of $+0.03$ to $+0.04$ on every split,
+which is inside sampling error. Adding order-flow features and a larger network
+leaves this unchanged. The same pipeline recovers planted signals in synthetic
+data (correlation 0.82 to 0.85) and finds nothing in a random walk, so the
+null result is not a failure of the machinery. A back-of-envelope calculation
+shows that a correlation near 0.3 would be needed to trade the best 1\% of
+predictions profitably, against 0.04 observed. We also report a failed earlier
+attempt with a general-purpose language model, and a unit error in the signal
+path that produced a spurious $-43\%$ backtest.
+\end{abstract}
+
+\section{Introduction}
+
+A common picture of machine-learning trading is that a model is given data,
+its weights adjust until a pattern emerges, and the pattern is then applied to
+unseen data to predict where the price goes next. This describes the mechanism
+correctly and leaves out three things. A model can only find a pattern that is
+in the data; adjusting weights cannot create one. A flexible model will fit
+noise in its training data, so only performance on data it has not seen
+separates a pattern from a fit. And a real pattern must still be large enough
+to pay for the cost of trading on it.
+
+This paper documents one complete attempt to find such a pattern and reports
+that there was none to find. The setting is favourable to a search: the data
+are public, complete and free of survivorship problems, since every swap is a
+log entry on chain, and the venue's cost structure (a fixed fee, gas, and a
+price-impact curve determined by the pool's liquidity) can be computed for
+each trade. The setting is unfavourable to finding an edge for the standard
+reason: the pool is heavily watched and arbitraged, and the inputs are visible
+to every participant.
+
+The contributions are modest and practical.
+\begin{enumerate}
+\item A leakage-controlled pipeline from raw swap logs to a cost-aware
+      backtest, with a planted-signal test showing it finds signals that
+      exist.
+\item A null result on about 200 days of WETH/USDC data across five
+      experiments, with the sweep records that support it.
+\item A diagnostic, splitting each label into its price move and its cost,
+      that shows a good-looking fit statistic under a net-return target was
+      cost prediction and carried no information about direction.
+\item An account of two failures along the way (Section~\ref{sec:prior} and
+      Section~\ref{sec:validity}) that are as instructive as the result.
+\end{enumerate}
+
+We claim ``no detectable signal'', not ``no information''. Section~\ref{sec:power}
+states how small a signal our sample could and could not distinguish from
+zero.
+
+\section{Background}
+
+\paragraph{Market efficiency.}
+The weak form of the efficient-market hypothesis~\cite{fama1970} says that
+prices already reflect the information in past prices, so patterns in past
+prices and volumes should not predict returns after costs. A null result here
+is what that hypothesis predicts. The value of the experiment is in showing
+where a plausible-looking signal came from, not in overturning it.
+
+\paragraph{Uniswap v3.}
+Uniswap~v3~\cite{adams2021} is a constant-product market maker with
+concentrated liquidity. Each swap emits an event carrying the post-trade
+$\sqrt{P}$ as a Q64.96 fixed-point number (\texttt{sqrtPriceX96}), the
+current tick, the liquidity active at the price, and the signed token amounts.
+The WETH/USDC 0.05\% pool charges 5 basis points per swap. A trader also pays
+gas and, on large trades, price impact that depends on the liquidity near the
+price. Liquidity providers face adverse selection against informed
+flow~\cite{milionis2022}, which is one reason to expect short-horizon price
+moves to be hard to predict from the pool's own history.
+
+\paragraph{Triple-barrier labels.}
+We follow the triple-barrier idea of L\'opez de Prado~\cite{lopezdeprado2018}:
+a label is the return of a trade entered at a bar and closed when the price
+first moves a set distance in either direction or when a time limit is reached.
+
+\section{Related work}
+
+\paragraph{Predictability from order flow and microstructure.}
+Order-flow imbalance explains a substantial share of short-horizon price
+changes in limit order books~\cite{cont2014}, and deep networks trained on
+order-book data find features that hold across instruments~\cite{sirignano2019}.
+Those results concern the best quotes of centralized venues at horizons of
+seconds. A concentrated-liquidity pool has no order book, its state is the
+last price and the liquidity at it, and we use one-minute bars and horizons of
+half an hour and longer, where costs are a larger share of the typical move.
+We test whether an analogous signal, built from signed swap flow, carries over.
+
+\paragraph{Machine learning for return prediction.}
+Gu, Kelly and Xiu~\cite{gu2020} show that neural networks improve forecasts of
+equity returns, with gains concentrated in interactions among many
+characteristics. Our inputs are far fewer and all derived from one pool's
+history, and the result is different: neither a larger network nor extra
+features moves the signal.
+
+\paragraph{Overfitting and evaluation.}
+A trading backtest that reports the best of many trials overstates skill~\cite{bailey2014,white2000}.
+Our protocol was not fixed in advance: the five runs in
+Section~\ref{sec:results} were chosen one after another in response to earlier
+results. We therefore report every run, none is dropped, and the robustness
+study (Section~\ref{sec:study}) uses a protocol set before it was run. We use
+chronological splits, a purge of one label length between train, validation and test, and
+resampling methods that respect overlapping labels
+(Section~\ref{sec:study}). For dependent data we use the moving-block
+bootstrap~\cite{kunsch1989}.
+
+\section{Data}
+\label{sec:data}
+
+\paragraph{Source.}
+All swaps come from \texttt{eth\_getLogs} calls for the pool's \texttt{Swap}
+event against an archive endpoint, decoded to price, tick, in-range liquidity,
+amounts, and the block's base fee. The dataset covers blocks 24,642,884 to
+26,084,902, about 200 days, on Ethereum mainnet.
+
+\paragraph{Ingestion.}
+The ingester records which block intervals have been fetched as a set of
+disjoint intervals, fills gaps, and never requests a block twice. Writes are
+atomic and resumable, and pending results are flushed to disk before an error
+is raised. Blocks are fetched from newest to oldest, so any interruption
+leaves one continuous stretch anchored at the newest block (or at data
+already on disk), and the partial dataset is immediately usable. Training
+refuses data with holes.
+
+\paragraph{Rate limiting.}
+The provider is a free-tier endpoint, and its request rate sets the ingest
+speed. Fixed concurrency slots were replaced by a proactive
+requests-per-second limiter that learns a safe rate, backs off to the last
+known-good rate after an HTTP 429, raises its ceiling again when things go
+well, and persists what it learned. Empirically about 6.2 requests per second
+was the best rate: at or below it there were no 429 responses, and above it
+each throttle carried a wait that cost more than the extra request rate
+gained.
+
+\paragraph{Measured ingest time.}
+The ingest log spans 25 to 29 September 2026 (four calendar days) and
+records 44 runs, most of them stopped by hand while the limiter was being
+tuned. Summed over runs, the active time was about 28.4 hours for roughly
+1.55 million blocks requested, a little more than the 1.44 million on disk
+because of restarts. Runs at a steady rate of about 6.5 requests per second
+in chunks of 10 blocks covered 1,600 to 1,800 blocks per minute, which puts
+a clean pass over the 200-day window at roughly 14 hours. The overall average
+was lower, about 900 blocks per minute, because of the slowest run, an
+overnight run on 28 September that averaged 340 blocks per minute over 15
+hours. It shows repeated waits of 10 to 45 minutes between chunks, when the
+provider was throttling. Wall-clock time to add history is therefore set by
+the provider's limits as much as by the request rate.
+
+\paragraph{Limitation of the collection method.}
+This is probably not the most efficient way to obtain the data. A provider
+with bulk export, a self-hosted node, or a public swap dataset would likely
+be faster. \texttt{eth\_getLogs} over an archive endpoint was the approach
+known to work for free, running a node was not possible with the available
+hardware and budget, and there was no time pressure, so a slow and safe ingest
+was acceptable. We report it as a constraint, not as a recommended method.
+
+\section{Method}
+\label{sec:method}
+
+\subsection{Bars and features}
+
+Swaps are aggregated into one-minute bars holding the last price, swap count,
+volume in USDC, signed volume (net buying of WETH), the largest single swap,
+and the last block base fee. Minutes with no swap carry the price and fee
+forward and are flagged as gaps.
+
+Seven price features are computed from past bars: returns over 5, 15 and 30
+minutes, the rolling standard deviation of one-minute returns, volume, the
+number of bars since the last swap, and the base fee in gwei. Four order-flow
+features were added after the first null: flow imbalance over 5, 15 and 30
+minutes (net signed volume over total volume, in $[-1,1]$) and the share of
+the last 15 minutes' volume taken by the largest single swap.
+
+All features are shifted back one bar before pairing with labels. A label at
+bar $t$ enters at the first swap at or after the bar's start, which can
+precede the bar's own close, so an unshifted feature would leak up to one bar
+of post-entry price action into the input. Features are standardized with
+statistics from the training split only.
+
+\subsection{Labels and costs}
+
+For each bar the label is the round-trip return of a long trade with a
+reference notional of \$1,000, entered at the first swap at or after the bar
+start. The trade exits when the price first moves by a band of two standard
+deviations of the pool's one-minute return, or after 30 minutes. Bars whose
+horizon extends beyond the ingested data are excluded rather than guessed.
+
+Two returns are stored for every bar. The \emph{gross} return is the price
+move alone. The \emph{net} return subtracts (a) the pool fee on both legs,
+$2\times 0.05\%$; (b) slippage on each leg, estimated as
+$\text{notional}/(2D)$ with $D$ the virtual quote-token depth
+$L\sqrt{P}$ implied by the in-range liquidity, a concentrated-liquidity
+approximation and not exact tick-crossing math; and (c) gas, taken as 150,000
+gas at the block base fee on each leg. The cost part of a label is
+$\text{net}-\text{gross}$. Round-trip cost averages about 0.13\% of notional.
+
+\subsection{Model and split}
+
+The model is a fully connected network with ReLU units and one output,
+trained by full-batch Adam~\cite{kingma2015} on mean squared error against
+the standardized target, using MLX. The default has one hidden layer of 16
+units, which is close to linear in practice. A second configuration has two
+hidden layers of 64 units, with early stopping on the validation loss
+(patience 50, best epoch restored). The stopping point uses the validation
+window, so validation figures are slightly optimistic and the test window is
+the judge.
+
+Bars are split chronologically, 70\% train, 15\% validate, 15\% test, with no
+shuffling. The test window is about 30 days (43,400 bars) and is used once
+per model.
+
+\subsection{Backtest and sweep}
+
+A backtest replays the exact fills the labels were computed from. Equity
+starts at \$10,000, a position is capped at 10\% of equity, a daily loss limit
+of 2\% applies, and capital is held for the full horizon. The \emph{sweep}
+replays a set of decision rules over each of the validation and test windows:
+trade whenever the predicted return exceeds zero; trade whenever it exceeds a
+minimum edge of 0.13\%; trade the model's top 1\%, 5\%, 10\%, 25\% or 50\% of
+bars by predicted return, with the cutoff taken from the validation window;
+trade every bar; and, as a ceiling, an oracle that trades exactly the bars
+whose realized net return is positive. Three shuffled-prediction controls
+take the same number of trades at random positions.
+
+Training records the feature set, label settings, target and network size with
+the model, and backtests and sweeps relabel using those recorded settings, so
+a run cannot be replayed under different settings by accident.
+
+\subsection{Robustness study}
+\label{sec:study}
+
+The single-split experiments leave open whether the correlation is
+distinguishable from zero, whether it depends on the seed or on one 30-day
+window, and whether a longer horizon changes it. A separate study answers
+these with the same features and the gross-return target.
+
+\paragraph{Walk-forward folds.}
+The last half of the history is cut into five consecutive test blocks. Each
+fold trains on all bars before its test block, except a validation stretch
+(the trailing 15\% of that region) used for early stopping. One label length
+of bars is dropped between train and validation and between validation and
+test, so that overlapping labels cannot span the boundary. Every fold's model
+therefore sees only the past of the bars it is judged on.
+
+\paragraph{Seeds and horizons.}
+Each fold is trained with five seeds. The study is run at label horizons of 30,
+120 and 240 minutes, with the take-profit/stop-loss band widened with the
+square root of the horizon from two standard deviations at 30 minutes, since a
+band held fixed would be reached within minutes at any horizon.
+
+\paragraph{Inference.}
+Predictions are averaged over seeds within each fold and pooled over folds.
+Two quantities are then computed on the pooled out-of-sample series. A
+moving-block bootstrap~\cite{kunsch1989}, with blocks of one label length,
+gives a 95\% interval for the gross correlation. A circular-shift permutation
+test, which shifts the predictions against the outcomes by at least one
+block and so keeps each series' own dependence, gives a two-sided p-value
+for zero correlation. Both use 1,000 resamples. The spread of the correlation
+across seeds is reported separately. Both procedures are validated in the test
+suite on overlapping-noise series: the bootstrap interval is more than twice
+as wide as the naive $1/\sqrt{n}$ interval, and independent overlapping series
+are not flagged more than a fraction of the time.
+
+\paragraph{Trading slices.}
+For each fold the model's top 1\%, 5\%, 10\% and 25\% of bars are selected
+using a cutoff taken from that fold's own validation predictions. The study
+reports their mean gross return, mean cost and mean net return, with a
+block-bootstrap interval, against the same means over all bars. This is a
+per-trade measure and does not model capital or position limits, which the
+sweep does.
+
+\subsection{Validation of the pipeline}
+
+To test that the machinery can find a signal, we run it on synthetic swaps.
+On swaps whose price follows a hidden drift that flips sign every two hours,
+the pipeline recovers it with gross correlation 0.82 on validation and 0.85 on
+test. On a pure random walk the same run gives 0.03 and 0.02, while its
+correlation on the training data alone was 0.19, which is what fitting noise
+looks like. With a regime that tilts trade direction and, weakly, the price,
+and with lagged returns removed from the inputs, the model finds it from
+order flow (0.18 validation, 0.27 test) where a price-only model finds
+0.07 and 0.13. On a combined pattern (drift sign is the product of a flow
+regime and a volatility regime), a 64,64 network without early stopping fit
+its training data almost perfectly (0.71) and did worse on unseen data (0.13)
+than the 16-unit model (0.19); with early stopping the sizes 16, 64,64 and
+128,64 all reach about 0.21 on validation.
+
+\section{Results}
+\label{sec:results}
+
+Setting for all runs: WETH/USDC 0.05\%, blocks 24,642,884 to 26,084,902,
+one-minute bars, 30-minute horizon, band of two standard deviations,
+chronological 70/15/15 split. Sweep records are in \texttt{docs/paper/results/}.
+
+\subsection{Experiment log}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}llccl@{}}
+\toprule
+Run & Inputs and target & Gross corr. & Cost corr. & Outcome \\
+    &                   & (test)      & (test)     & \\
+\midrule
+1 & 7 price features, net & not measured & not measured & no edge \\
+2 & same model, diagnostics added & $+0.01$ & $-0.96$ & no edge; predicts cost \\
+3 & + 4 order-flow features, net & $+0.01$ & $-0.96$ & no edge \\
+4 & same inputs, gross target & $+0.04$ & $+0.12$ & no edge \\
+5 & 64,64 network, gross, early stop & $+0.03$ & $+0.02$ & no edge \\
+\bottomrule
+\end{tabular}
+\caption{The five runs. Runs 1 and 2 use the same trained model; the second
+sweep adds the gross/cost decomposition and the shuffled control. Run 3's
+validation gross correlation is $+0.03$, run 4's is $+0.04$, run 5's is $+0.04$.}
+\label{tab:runs}
+\end{table}
+
+\subsection{The first model learned cost}
+
+Trained on net return, the first model reached a correlation of 0.35 with the
+net-return label on the test window, up from 0.25 on train and 0.23 on
+validate, with an MSE improvement over the mean baseline of about 7\%, 6\% and
+12\%. That looks like skill. Splitting each label into its price move and its
+cost changes the reading. On the test window the predictions correlate $+0.01$
+with the gross return and $-0.96$ with the cost. The label mixes direction,
+which is hard to predict, with cost, which is easy: two of the inputs are gas
+price and volatility, which drive gas and slippage directly. The spread of the
+cost part is a fifth to two fifths of the gross part's, yet it accounts for
+nearly all of the correlation. A model can fit a net-return label without
+knowing anything about direction, and the headline correlation hides it.
+
+The model also never predicts a positive net return on the test window (mean
+$-0.126\%$, maximum $-0.046\%$), so the rule ``trade when the prediction is
+above zero'' takes no trades and the backtest ends at exactly the starting
+equity.
+
+\subsection{Trained on the price move}
+
+With the target changed to the gross return, the model no longer tracks cost
+(cost correlation falls from $-0.96$ to $+0.12$ and, with the larger network,
+to $+0.02$). It finds a faint direction signal: gross correlation $+0.04$ on
+validation and $+0.03$ to $+0.04$ on test, positive on every split. That is
+about 0.1\% to 0.2\% of the variance of the move.
+
+\subsection{More information and more capacity change nothing}
+
+Adding four order-flow features to the net-return model left the gross
+correlation at $+0.01$ on test ($+0.03$ on validation). Replacing the 16-unit
+network by a 64,64 network with early stopping, on the same inputs and the
+gross target, gave the same gross correlation ($+0.04$ validation, $+0.03$
+test). Two models of very different capacity reading the same inputs agree,
+which points at the inputs as the limit and not at the model.
+
+\subsection{No trading rule made money}
+
+Table~\ref{tab:trading} shows the test window for the gross-trained 16-unit
+model (run 4) and the 64,64 model (run 5). Results on the validation window
+are the same in kind.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+ & \multicolumn{2}{c}{Run 4 (16 units)} & \multicolumn{2}{c}{Run 5 (64,64)} \\
+Rule & Trades & Return & Trades & Return \\
+\midrule
+Predicted $>0$          & 7,007 & $-22.6\%$ & 9,369 & $-20.8\%$ \\
+Predicted $>0.13\%$      & 0     & $0.0\%$   & 0     & $0.0\%$ \\
+Top 1\% by prediction   & 298   & $-7.6\%$  & 118   & $-2.6\%$ \\
+Top 10\% by prediction  & 2,466 & $-28.1\%$ & 1,541 & $-18.2\%$ \\
+Top 50\% by prediction  & 5,257 & $-43.8\%$ & 5,166 & $-43.4\%$ \\
+Every bar               & 5,343 & $-44.5\%$ & 5,358 & $-44.5\%$ \\
+Oracle                  & 15,924 & $+16.6\%$ & 15,927 & $+17.0\%$ \\
+\bottomrule
+\end{tabular}
+\caption{Test-window results, \$10,000 start, positions capped at 10\% of
+equity. Returns are over the roughly 30-day window.}
+\label{tab:trading}
+\end{table}
+
+Trading every bar loses about \$0.83 per trade on average. The ranked slices
+lose about the same per trade at every cut (roughly \$0.8 to \$1.2), so the
+total loss shrinks only because fewer trades are taken. The model's ranking
+has no per-trade value on this data. Against the shuffled control, run 4's
+top-1\% slice on the test window is worse than random (\$2.5 lost per trade
+against \$1.3, on 298 trades), and the other slices match it to within the
+noise of a few hundred trades. The minimum-edge rule takes zero to three
+trades because no predicted move approaches the round-trip cost. In the net
+model (run 2) the ranked slices beat shuffled predictions by about \$0.18 per
+trade, consistent with the model picking bars that are cheap to trade, which
+agrees with the finding above, and every rule still lost.
+
+The oracle earns only \$0.10 to \$0.14 per trade and +15\% to +20\% per window
+even with perfect foresight of every trade, because typical 30-minute moves
+(about 0.17\%) are small against a round-trip cost of about 0.13\%.
+
+\subsection{Why a small correlation cannot be traded here}
+\label{sec:power}
+
+Suppose predictions are approximately normal and a trade is taken at a
+prediction whose z-score is $z$. With correlation $\rho$ between prediction
+and outcome, and $\sigma$ the standard deviation of the move (0.17\% on the
+test window), the expected gross move is about $\rho\,\sigma\,z$. A trade
+breaks even when this equals the round-trip cost $c\approx 0.13\%$, so
+\[
+\rho\,z \;\approx\; \frac{c}{\sigma} \;\approx\; 0.76 .
+\]
+Trading only the top 1\% of predictions (mean $z\approx 2.7$) still needs
+$\rho\approx 0.29$, against $0.04$ observed. At longer horizons the arithmetic
+does not rescue the strategy: a four-hour horizon needs $\rho\approx 0.27$ at
+$z=1$, and more for a rank rule.
+
+On the other side of the ledger, the sample cannot detect a small $\rho$. Labels
+overlap: one 30-minute label per one-minute bar means the effective number of
+independent points per window is about $1/30$ of the bar count, roughly
+1,400. The standard error of a correlation is then about 0.03, so
+correlations under about 0.03 are indistinguishable from zero. The observed
+$+0.03$ to $+0.04$ is at that boundary, and it matches the 0.02 to 0.03 that
+the pipeline gives on a pure random walk.
+
+\section{Discussion}
+
+The results fit market efficiency for a liquid, heavily arbitraged pool
+with public inputs, and the experiments add a decomposition of why the first
+attempt looked better than it was. Five points summarize it.
+
+\begin{enumerate}
+\item \textbf{A model can only find a pattern that is in the data.} On
+  planted signals the pipeline finds them; on a random walk it finds
+  nothing on unseen data.
+\item \textbf{The pattern the first model learned was the wrong one.} Gas
+  price and volatility set trading cost, cost is easy to predict, and a
+  net-return target rewards learning it. The fit statistic looked good and
+  said nothing about direction. It was found only by splitting the label.
+\item \textbf{Unseen data is what separates a real pattern from a fitted
+  one.} The chronological split is the instrument: 0.19 on training and 0.02
+  on unseen data for the random walk.
+\item \textbf{Absence of a pattern is the expected result.} The inputs were
+  the last few minutes of price and volume in the most watched pool
+  on chain. Easy patterns in public inputs are traded away, which removes
+  them.
+\item \textbf{A real pattern must also clear cost.} Even perfect foresight
+  earned only +15\% to +20\% per 30-day window here, so a weak signal is
+  not enough.
+\end{enumerate}
+
+\section{Threats to validity}
+\label{sec:validity}
+
+\paragraph{A unit error in the signal path.}
+An earlier backtest lost 43\% because the signal client returned the model's
+standardized output (in standard deviations of the target) while the guard
+read it as a real return, so ``predicted above zero'' meant ``above the
+average training return''. It was found because the result was suspicious,
+fixed in the signal client, and covered by a regression test. Every result
+produced before the fix is invalid and none is reported here.
+
+\paragraph{Other threats.}
+\begin{itemize}
+\item \emph{One pool, one 30-day test window.} The test window may be a
+  particular regime; test correlations were higher than validation
+  correlations for the net model, which looks like a regime difference and
+  not skill.
+\item \emph{Simplified costs.} Slippage uses a depth approximation, not
+  tick-crossing math, and gas uses the base fee at 150,000 gas per swap,
+  ignoring priority fees and aggregator routing. Real costs may be higher.
+  The gross-target diagnostics do not depend on the cost model.
+\item \emph{Capital held for the full horizon} in the backtest, which
+  understates capital efficiency when exits are early.
+\item \emph{Validation window used for early stopping.} Validation figures
+  for run 5 are slightly optimistic; the test window is unaffected.
+\item \emph{Sampling error.} Labels overlap, and the gross correlations we
+  report are inside about one standard error of zero.
+\item \emph{Gaps in the data.} Ingestion tracks fetched intervals and
+  training refuses holes, but the archive endpoint itself is a single source.
+\item \emph{One seed.} Each configuration was trained once.
+\end{itemize}
+
+\section{Limitations and future work}
+
+The following were not tested and are not claimed: horizons beyond 30
+minutes (the arithmetic above says a longer horizon is unlikely to help, but
+the claim is argued, not measured), other pools and less liquid ones, other
+bar sizes, model families other than a small feed-forward network,
+walk-forward evaluation, several seeds, data outside these 200 days, a control
+without gas price and volatility, and information outside the swap logs such
+as other venues or the mempool. Liquidity-provision fee income, which turns
+the question from prediction into carry, is also untested. Cross-market
+transfer and a less liquid pool are the most obvious next experiments.
+
+\section{An earlier attempt}
+\label{sec:prior}
+
+The project began, on 23 September 2026, as an order-book bot for Solana
+using Phoenix order-book snapshots, Jupiter for execution, and a safety guard
+for sizing and daily loss limits. The decision model was a general-purpose
+typed-decision text classifier served locally. It was asked whether now was
+a good moment to trade, given one text line with best bid, best ask and depth
+counts, and it traded when its confidence passed a threshold.
+
+The backtest used historical prices from a public price API. These carry no
+order-book data, so the model was fed a synthetic bid/ask ladder generated
+from the spot price plus a fixed cost in basis points, a deterministic
+function of price. The result was a win rate of about 23\%, worse than
+buy-and-hold. These figures are recalled: the result files did not survive the
+rewrite, and we did not re-run the old code.
+
+The cause is clear enough without them. The model had never seen financial
+time series, had no learned mapping from these inputs to price behaviour, and
+answered ``trade'' almost regardless of input. The inputs carried no
+predictive information beyond the price itself, and a single snapshot has no
+history. The restart on 24 September applied the rules this paper follows: a
+purpose-trained model, the venue's own on-chain data, net-of-cost labels, and
+a chronological split with a test window used once.
+
+\section{Conclusion}
+
+On about 200 days of WETH/USDC 0.05\% swaps, a small neural network trained
+to predict 30-minute trade returns finds no tradable edge. What looked like
+skill under a net-return target was cost prediction. Under a price-move
+target the signal is at the noise floor, adding order flow and network size
+does not move it, and a correlation near 0.3 would be needed before costs
+allow a profit on the best predictions. The pipeline recovers planted
+signals, so the result is about the market and its inputs, not about the
+machinery. We publish it as a result because a search that cannot report
+a null is not a search.
+
+\begin{thebibliography}{9}
+
+\bibitem{fama1970}
+E.~F. Fama.
+\newblock Efficient capital markets: A review of theory and empirical work.
+\newblock \emph{The Journal of Finance}, 25(2):383--417, 1970.
+
+\bibitem{adams2021}
+H.~Adams, N.~Zinsmeister, M.~Salem, R.~Keefer, and D.~Robinson.
+\newblock Uniswap v3 core.
+\newblock Technical report, Uniswap Labs, 2021.
+
+\bibitem{milionis2022}
+J.~Milionis, C.~C. Moallemi, T.~Roughgarden, and A.~L. Zhang.
+\newblock Automated market making and loss-versus-rebalancing.
+\newblock arXiv:2208.06046, 2022.
+
+\bibitem{lopezdeprado2018}
+M.~L\'opez de Prado.
+\newblock \emph{Advances in Financial Machine Learning}.
+\newblock Wiley, 2018.
+
+\bibitem{kingma2015}
+D.~P. Kingma and J.~Ba.
+\newblock Adam: A method for stochastic optimization.
+\newblock In \emph{International Conference on Learning Representations}, 2015.
+
+\bibitem{cont2014}
+R.~Cont, A.~Kukanov, and S.~Stoikov.
+\newblock The price impact of order book events.
+\newblock \emph{Journal of Financial Econometrics}, 12(1):47--88, 2014.
+
+\bibitem{sirignano2019}
+J.~Sirignano and R.~Cont.
+\newblock Universal features of price formation in financial markets:
+  perspectives from deep learning.
+\newblock \emph{Quantitative Finance}, 19(9):1449--1459, 2019.
+
+\bibitem{gu2020}
+S.~Gu, B.~Kelly, and D.~Xiu.
+\newblock Empirical asset pricing via machine learning.
+\newblock \emph{The Review of Financial Studies}, 33(5):2223--2273, 2020.
+
+\bibitem{bailey2014}
+D.~H. Bailey, J.~M. Borwein, M.~L\'opez de Prado, and Q.~J. Zhu.
+\newblock Pseudo-mathematics and financial charlatanism: The effects of
+  backtest overfitting on out-of-sample performance.
+\newblock \emph{Notices of the AMS}, 61(5):458--471, 2014.
+
+\bibitem{white2000}
+H.~White.
+\newblock A reality check for data snooping.
+\newblock \emph{Econometrica}, 68(5):1097--1126, 2000.
+
+\bibitem{kunsch1989}
+H.~R. K\"unsch.
+\newblock The jackknife and the bootstrap for general stationary observations.
+\newblock \emph{The Annals of Statistics}, 17(3):1217--1241, 1989.
+
+\end{thebibliography}
+
+\end{document}
