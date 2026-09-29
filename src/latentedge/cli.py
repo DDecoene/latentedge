@@ -765,6 +765,8 @@ def _run_sweep_direct(swaps: Path, model: Path) -> None:
     """Sweeps without the TUI — the non-tty chained (--sweep-after-train) runs."""
     result = _chained_sweep_fn(swaps, model)(sweeping.SweepObserver())
     click.echo(sweeping.describe_sweep(result))
+    click.echo(sweeping.describe_findings(result))
+    click.echo(sweeping.describe_findings(result))
 
 
 def _compute_sweep(
@@ -847,8 +849,10 @@ def _compute_sweep(
         "prediction_diagnostics": diagnostics,
         "training_metrics": metrics,
     }
+    findings = sweeping.build_findings(rows, diagnostics)
+    meta["findings"] = findings
     path = sweeping.write_sweep(out_dir, meta, rows)
-    return {"path": str(path), "scenarios": rows, "selection": sweeping.select_on_validate(rows)}
+    return {"path": str(path), "scenarios": rows, "selection": sweeping.select_on_validate(rows), "findings": findings}
 
 
 @cli.command()

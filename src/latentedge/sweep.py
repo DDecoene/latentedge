@@ -206,6 +206,89 @@ def select_on_validate(rows: list[dict[str, Any]]) -> tuple[dict[str, Any], dict
     return (best, test) if test is not None else None
 
 
+# A correlation this close to zero is indistinguishable from noise at the
+# sample sizes involved (tens of thousands of bars), and one this strong is
+# not a side effect.
+NO_SIGNAL_CORRELATION = 0.05
+DOMINANT_CORRELATION = 0.5
+
+
+def _mean(values: list[float]) -> float:
+    return float(np.mean(values))
+
+
+def build_findings(rows: list[dict[str, Any]], diagnostics: dict[str, dict[str, float]]) -> list[str]:
+    """The sweep's numbers as plain sentences, each a claim the rows and
+    diagnostics support: does the model predict direction or cost, does its
+    ranking beat chance and blind trading, and could anything be traded.
+    Judged on the test window, which no rule was chosen on."""
+    test = [r for r in rows if r["window"] == WINDOW_TEST]
+    findings: list[str] = []
+
+    d = diagnostics.get(WINDOW_TEST)
+    if d is not None:
+        gross, cost = d["gross_correlation"], d["cost_correlation"]
+        if abs(gross) < NO_SIGNAL_CORRELATION and cost < -DOMINANT_CORRELATION:
+            findings.append(
+                f"Direction: the model does not predict where the price goes (correlation with the pre-cost move "
+                f"{gross:+.2f}). It predicts what the trade will cost (correlation with cost {cost:+.2f}), so "
+                f"its correlation with net return is cost prediction, not skill."
+            )
+        elif abs(gross) < NO_SIGNAL_CORRELATION:
+            findings.append(
+                f"Direction: no evidence the model predicts the price move (correlation with the pre-cost move {gross:+.2f})."
+            )
+        else:
+            findings.append(
+                f"Direction: the model's predictions correlate {gross:+.2f} with the pre-cost price move "
+                f"(and {cost:+.2f} with cost), so some of what it learned is about direction."
+            )
+
+    always = next((r for r in test if r["signal"] == SIGNAL_ALWAYS), None)
+    ranked = [r for r in test if r["signal"] == SIGNAL_MODEL and r["top_fraction"] is not None and r["top_fraction"] < 1.0 and r["num_trades"]]
+    shuffled = [r for r in test if r["signal"] == SIGNAL_SHUFFLED and r["num_trades"]]
+    if ranked and shuffled:
+        vs_chance = []
+        for row in ranked:
+            same = [r["avg_pnl_usd"] for r in shuffled if r["top_fraction"] == row["top_fraction"]]
+            if same:
+                vs_chance.append(row["avg_pnl_usd"] - _mean(same))
+        if vs_chance:
+            edge = _mean(vs_chance)
+            findings.append(
+                f"Ranking vs chance: the model's ranked slices average {edge:+.2f} USD per trade against shuffled "
+                f"predictions with the same trade counts. "
+                + ("That is a real gap, which fits it picking cheap-to-trade bars rather than good moves." if edge > 0.05
+                   else "No gap: its ranking is no better than luck.")
+            )
+    if ranked and always is not None:
+        best = max(ranked, key=lambda r: r["avg_pnl_usd"])
+        findings.append(
+            f"Vs trading blindly: always trading loses {always['avg_pnl_usd']:+.2f} USD per trade "
+            f"({always['total_return_fraction']:+.1%} in total); the model's best slice ({describe_rule(best)}) "
+            f"{best['avg_pnl_usd']:+.2f} USD per trade ({best['total_return_fraction']:+.1%})."
+        )
+
+    oracle = next((r for r in test if r["signal"] == SIGNAL_ORACLE), None)
+    if oracle is not None:
+        findings.append(
+            f"Ceiling: a perfect forecaster earns {oracle['total_return_fraction']:+.1%} "
+            f"({oracle['avg_pnl_usd']:+.2f} USD per trade) after costs, which is what any model has to work with."
+        )
+
+    winners = [r for r in test if r["signal"] == SIGNAL_MODEL and r["total_return_usd"] > 0]
+    if winners:
+        best = max(winners, key=lambda r: r["total_return_usd"])
+        findings.append(
+            f"Verdict: {len(winners)} model rule(s) made money on the test window (best {describe_rule(best)}, "
+            f"{best['total_return_fraction']:+.1%} over {best['num_trades']:,} trades). Check that shuffled rows do "
+            f"not do the same before believing it."
+        )
+    else:
+        findings.append("Verdict: no model rule made money on the test window. No tradable edge in this run.")
+    return findings
+
+
 def _git_state() -> str | None:
     try:
         commit = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
@@ -241,6 +324,10 @@ def describe_rule(row: dict[str, Any]) -> str:
         seed = f", shuffle {row['seed']}" if row.get("seed") is not None else ""
         return f"top {row['top_fraction']:.0%} of bars{seed}"
     return f"min edge {row['min_edge']:.2%}, full size {row['full_size_return']:.2%}"
+
+
+def describe_findings(result: dict) -> str:
+    return "\n".join(f"- {line}" for line in result.get("findings", []))
 
 
 def describe_sweep(result: dict) -> str:

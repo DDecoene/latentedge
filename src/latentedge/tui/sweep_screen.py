@@ -10,7 +10,7 @@ from textual.binding import Binding
 from textual.screen import Screen
 from textual.widgets import DataTable, Static
 
-from latentedge.sweep import SweepObserver, describe_rule, describe_sweep
+from latentedge.sweep import SweepObserver, describe_findings, describe_rule, describe_sweep
 from latentedge.tui.backtest_screen import BacktestFn, BacktestScreen
 from latentedge.tui.widgets import LogPanel, ProgressPanel
 
@@ -38,6 +38,7 @@ class SweepScreen(Screen[None]):
         Binding("q", "exit_now", "Exit", show=False),
     ]
     CSS = """
+    #sweep-findings { height: auto; border: round $success; padding: 0 1; display: none; }
     #sweep-table { height: 1fr; border: round $primary; }
     #sweep-log { height: 8; }
     """
@@ -57,6 +58,7 @@ class SweepScreen(Screen[None]):
 
     def compose(self) -> ComposeResult:
         yield ProgressPanel(id="sweep-progress")
+        yield Static("", id="sweep-findings")
         yield DataTable(id="sweep-table")
         yield LogPanel(id="sweep-log")
         yield Static("", id="sweep-action-bar")
@@ -118,6 +120,11 @@ class SweepScreen(Screen[None]):
             rate_per_sec=0.0, rate_unit="scenarios/sec",
         )
         self.query_one("#sweep-log", LogPanel).log_line(f"sweep complete — {text}")
+        if result.get("findings"):
+            findings = self.query_one("#sweep-findings", Static)
+            findings.border_title = "What it means"
+            findings.update(describe_findings(result))
+            findings.display = True
         summary = f"Sweep complete — {text}."
         if self.backtest_fn is not None and self.backtest_after_sweep:
             self.query_one("#sweep-log", LogPanel).log_line("backtest_after_train is on — starting backtest now")

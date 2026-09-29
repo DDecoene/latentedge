@@ -8,37 +8,117 @@ method, experiments, and an honest conclusion, including a negative one.
 Format: LaTeX source under `docs/paper/`, source files only, no new
 dependencies. Plain research prose.
 
-## Current state of the evidence (2026-09-29)
+## Current state of the evidence (2026-09-29, evening)
 
-Not enough for conclusions yet.
+First full round trip on WETH/USDC 0.05%: about 200 days of swaps (blocks
+24,648,164 to 26,084,512), 1-minute bars, 30-minute triple-barrier net-return
+labels, a small MLX regressor (7 features, effectively linear), chronological
+70/15/15 split. Test window is about 30 days (43k bars).
 
-- The pipeline exists: ingest, 1-minute bars, triple-barrier net-return
-  labels, a small MLX regressor, chronological train/validate/test split.
-- One training run so far on WETH/USDC 0.05%. Correlation with the label:
-  train 0.17, validate 0.09, test 0.43. MSE improvement over the mean
-  baseline: about 3%, 1% and 18%.
-- The test figure is much higher than validate and the test window has a
-  higher label variance, so it looks like a regime difference.
-- The label is net of gas and slippage and two features are gas price and
-  volatility. The model may be predicting trading cost, not direction.
-  This is a hypothesis to test, not a finding.
-- No backtest P&L exists yet. The only metric that decides whether an edge
-  exists is backtest P&L on the untouched test window.
+Result so far: no tradable edge found. This is a null result and should be
+reported as one.
+
+- Regression fit is small but positive. Correlation with the label: train
+  0.25, validate 0.23, test 0.35. MSE improvement over the mean baseline:
+  about 7%, 6% and 12%. The test figure is again higher than validate, which
+  looks like a regime difference, not skill.
+- The model never predicts a positive net return. On the test window every
+  prediction is negative (mean -0.126%, max -0.046%), so the plain rule
+  "trade when the prediction is above zero" takes no trades and the backtest
+  ends at exactly the starting equity.
+- Sweep (saved in `data/sweeps/20260929T173520Z.json`, git state recorded in
+  the file), every rule replayed on validate and test, $10,000 start, 10%
+  max position:
+  - Always trade: -45.4% validate, -44.6% test, about -$0.83 per trade
+    (5.3k to 5.5k trades, win rate 26% and 34%).
+  - Model's top 1% of bars by predicted return: -3.9% validate, -3.8% test,
+    -$0.90 and -$1.23 per trade. Top 10%: -$0.85 and -$0.87 per trade. Top
+    50%: -$0.76 and -$0.81 per trade.
+  - The per-trade loss is the same in every slice. Total loss shrinks only
+    because fewer trades are taken. The model's ranking has no per-trade
+    value on this data.
+  - Oracle (predicts each bar's realized net return): +19.1% validate, +15.7%
+    test, only +$0.10 to +$0.14 per trade. Even perfect foresight earns
+    little under about 0.13% round-trip cost (roughly 0.10% pool fees, the
+    rest gas and slippage) against typical 30-minute moves near 0.4%.
+  - Absolute-edge rows (predicted return above a minimum) take zero or two
+    trades and carry no information.
+- Cost-prediction confound, tested (`data/sweeps/20260929T175549Z.json`, same
+  model as above): the label is net of gas and slippage and two features are
+  gas price and volatility. Splitting each label into its pre-cost price
+  move (gross) and its cost, the model's predictions correlate with gross
+  return at +0.03 (validate) and +0.01 (test), and with cost at -0.95 and
+  -0.96. The spread of the cost part is about a fifth to two-fifths of the
+  gross part's, yet it accounts for nearly all of the correlation, so the
+  0.35 test correlation with net return is cost prediction, not direction.
+  The model carries no measurable information about the price move.
+- Shuffled-predictions control (3 seeds, same trade counts): the model's
+  ranked slices average about $0.18 per trade better than shuffled
+  predictions on the test window (roughly -$0.85 against -$1.10 for the top
+  10%), and every rule still loses. The gap is consistent with the model
+  picking bars that are cheap to trade, which fits the finding above.
+
+Pipeline note: training now records the feature set and label settings with
+the model, and a backtest or sweep relabels with those, so a run cannot be
+replayed under different settings by accident. The sweep, not the plain
+backtest, is the pipeline's result (the backtest is one of its rules), and it
+writes a plain-language verdict with its numbers.
+
+Methodology note worth a paragraph: an earlier backtest lost 43% because the
+signal client returned the model's standardized output (in standard
+deviations) while the guard read it as a real return, so "predicted above
+zero" meant "above the average training return". It was found because a
+suspicious result was investigated, fixed in the signal client, and covered by
+a regression test. Any result produced before that fix (including a -43%
+backtest) is invalid and should not be cited.
 
 ## Experiments the paper needs
 
-1. Backtest on the test window only: total return, max drawdown, win rate,
-   trade count, Sharpe-like ratio (in progress).
-2. Controls, all through the same backtest:
-   - shuffled predictions (a model with no information),
-   - an always-trade baseline,
-   - a retrain without gas price and volatility, to separate cost
-     prediction from direction.
-3. More data: ingest is running for 150 days and will be extended. Report
-   results as a function of history length.
-4. Robustness: several seeds, more than one label horizon, and a walk-forward
-   variant instead of one split.
-5. Later: a second, less liquid pool, and cross-market transfer (v2).
+Done (2026-09-29):
+
+1. Backtest on the test window only.
+2. Always-trade baseline and oracle ceiling, through the same backtest.
+3. Rank rule (top share of bars by predicted return, cutoff set on the
+   validation window), which works even when no prediction is above zero.
+4. More data: 200 days ingested. Not yet reported as a function of history
+   length.
+
+5. Gross-return check (done, see above): pre-cost label, and the
+   correlation of predictions with gross return and with cost, in training
+   metrics and in every sweep.
+6. Shuffled-predictions control in the sweep (done, see above).
+
+Still needed:
+
+1. Retrain without gas price and volatility (`LATENTEDGE_TRAIN_EXCLUDE_FEATURES`)
+   to remove the cost signal and see whether any direction is left.
+2. Longer label horizon (hours; `LATENTEDGE_LABEL_HORIZON_MINUTES`), so a
+   fixed cost is small against the move. The take-profit/stop-loss band must
+   widen with it (`LATENTEDGE_LABEL_BARRIER_STDS`), since the current 2
+   standard deviations of a 1-minute return is hit within minutes.
+4. Richer inputs: order-flow imbalance and swap direction, and a non-linear
+   model, tested against the same baselines.
+5. Robustness: several seeds, more than one horizon, a walk-forward variant
+   instead of one split, results as a function of history length.
+6. Later: a second, less liquid pool, and cross-market transfer (v2).
+
+Sweep records live under `data/sweeps/` (gitignored). Copy the ones the paper
+cites into a versioned place before drafting, with the model hash and git
+state each file already records.
+
+## Experiment log
+
+One line per run, appended as they finish. Each run is one trained model
+(own `LATENTEDGE_TRAIN_OUT`) and one saved sweep; record the sweep file, the
+label settings and the feature set with it.
+
+| Sweep file | Features | Horizon, band | Direction (gross corr, test) | Cost corr (test) | Result |
+|---|---|---|---|---|---|
+| 20260929T173520Z | all 7 | 30 min, 2 std | not measured | not measured | no edge (first sweep) |
+| 20260929T175549Z | all 7 | 30 min, 2 std | +0.01 | -0.96 | no edge; model predicts cost |
+
+Planned: without gas and volatility at 30 minutes; all features at 240
+minutes with a 6 std band; both together.
 
 ## Sections
 
@@ -50,8 +130,9 @@ Not enough for conclusions yet.
    model, chronological splits, backtest accounting.
 5. Results, including controls and null findings.
 6. Threats to validity: cost-prediction confound, gaps in the data, regime
-   shift, single pool, simplified slippage model, capital held for the full
-   horizon in the backtest.
+   shift, single pool, one 30-day test window, simplified slippage model,
+   capital held for the full horizon in the backtest, an earlier unit bug in
+   the signal path (fixed and tested).
 7. Limitations and future work.
 
 ## Section: the prior attempt
