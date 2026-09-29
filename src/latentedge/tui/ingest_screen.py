@@ -27,6 +27,7 @@ from latentedge.env_file import update_env_value
 from latentedge.ingest.progress import read_progress, uncovered_gaps
 from latentedge.ingest.rate_limiter import RateLimiter
 from latentedge.ingest.rpc_logs import describe_error, fetch_swaps
+from latentedge.tui.backtest_screen import BacktestFn
 from latentedge.tui.train_screen import DEFAULT_MODEL_OUT_PATH, TrainAssembleFn, TrainScreen
 from latentedge.tui.widgets import LogPanel, ProgressPanel, StatsPanel, ThreadPanel
 
@@ -87,6 +88,8 @@ class IngestScreen(Screen[None]):
         model_out_path: Path = DEFAULT_MODEL_OUT_PATH,
         train_epochs: int = 100,
         train_after_ingest: bool = False,
+        backtest_fn: BacktestFn | None = None,
+        backtest_after_train: bool = False,
         ingest_fn: Callable[..., int] = default_ingest_range,
         fetch_fn: FetchFn = fetch_swaps,
         time_fn: Callable[[], float] = time.monotonic,
@@ -117,6 +120,8 @@ class IngestScreen(Screen[None]):
         self.model_out_path = model_out_path
         self.train_epochs = train_epochs
         self.train_after_ingest = train_after_ingest
+        self.backtest_fn = backtest_fn
+        self.backtest_after_train = backtest_after_train
         self.ingest_fn = ingest_fn
         self.fetch_fn = fetch_fn
         self.time_fn = time_fn
@@ -509,7 +514,8 @@ class IngestScreen(Screen[None]):
     def _push_train_screen(self) -> None:
         self.app.push_screen(TrainScreen(
             swaps_path=self.out_path, out_path=self.model_out_path, epochs=self.train_epochs,
-            assemble_fn=self.train_assemble_fn,
+            assemble_fn=self.train_assemble_fn, backtest_fn=self.backtest_fn,
+            backtest_after_train=self.backtest_after_train,
         ))
 
     def action_rate_up(self) -> None:

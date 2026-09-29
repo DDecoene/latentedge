@@ -278,3 +278,96 @@ async def test_train_screen_shows_assembly_progress(tmp_path: Path):
     finally:
         release.set()
     assert "labeling bars" in text
+
+
+def _fake_backtest(report):
+    report("replaying test window")
+    return {
+        "bars": 10, "total_return_usd": 12.5, "total_return_fraction": 0.00125,
+        "max_drawdown_usd": 3.0, "win_rate": 0.6, "num_trades": 5, "sharpe": 1.1,
+    }
+
+
+async def _run_train_screen(tmp_path: Path, **kwargs) -> tuple[TrainScreen, LatentEdgeApp]:
+    screen = TrainScreen(
+        swaps_path=tmp_path / "swaps.parquet", out_path=tmp_path / "model.safetensors", epochs=3,
+        assemble_fn=_fake_assemble, train_fn=_fake_train, **kwargs,
+    )
+    return screen, LatentEdgeApp(start_screen=screen)
+
+
+@pytest.mark.asyncio
+async def test_backtest_starts_automatically_after_training_when_the_flag_is_on(tmp_path: Path):
+    from latentedge.tui.backtest_screen import BacktestScreen
+
+    screen, app = await _run_train_screen(tmp_path, backtest_fn=_fake_backtest, backtest_after_train=True)
+    async with app.run_test() as pilot:
+        for _ in range(100):
+            await pilot.pause(0.01)
+            if isinstance(app.screen, BacktestScreen) and app.screen.is_complete:
+                break
+        assert isinstance(app.screen, BacktestScreen)
+        assert app.screen.summary is not None
+        assert app.screen.summary["num_trades"] == 5
+
+
+@pytest.mark.asyncio
+async def test_backtest_waits_for_b_when_the_flag_is_off(tmp_path: Path):
+    from latentedge.tui.backtest_screen import BacktestScreen
+
+    screen, app = await _run_train_screen(tmp_path, backtest_fn=_fake_backtest)
+    async with app.run_test() as pilot:
+        for _ in range(50):
+            await pilot.pause(0.01)
+            if screen.is_complete:
+                break
+        assert app.screen is screen
+        await pilot.press("b")
+        for _ in range(100):
+            await pilot.pause(0.01)
+            if isinstance(app.screen, BacktestScreen) and app.screen.is_complete:
+                break
+        assert isinstance(app.screen, BacktestScreen)
+        assert app.screen.is_complete
+
+
+@pytest.mark.asyncio
+async def test_b_does_nothing_before_training_completes(tmp_path: Path):
+    from latentedge.tui.backtest_screen import BacktestScreen
+
+    gate = threading.Event()
+
+    def slow_train(model, features, labels, epochs, learning_rate, on_epoch=None):
+        gate.wait(5)
+        return _fake_train(model, features, labels, epochs, learning_rate, on_epoch)
+
+    screen = TrainScreen(
+        swaps_path=tmp_path / "swaps.parquet", out_path=tmp_path / "model.safetensors", epochs=3,
+        assemble_fn=_fake_assemble, train_fn=slow_train, backtest_fn=_fake_backtest,
+    )
+    app = LatentEdgeApp(start_screen=screen)
+    async with app.run_test() as pilot:
+        await pilot.press("b")
+        await pilot.pause(0.05)
+        assert not isinstance(app.screen, BacktestScreen)
+        gate.set()
+        for _ in range(50):
+            await pilot.pause(0.01)
+            if screen.is_complete:
+                break
+
+
+@pytest.mark.asyncio
+async def test_backtest_screen_shows_a_failure(tmp_path: Path):
+    from latentedge.tui.backtest_screen import BacktestScreen
+
+    def failing(report):
+        raise RuntimeError("no test window")
+
+    screen = BacktestScreen(backtest_fn=failing)
+    async with LatentEdgeApp(start_screen=screen).run_test() as pilot:
+        for _ in range(50):
+            await pilot.pause(0.01)
+            if screen.error:
+                break
+    assert screen.error == "no test window"

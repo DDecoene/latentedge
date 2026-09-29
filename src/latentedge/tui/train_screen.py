@@ -16,6 +16,7 @@ from latentedge.metrics import build_training_metrics, save_training_metrics
 from latentedge.model import NetReturnRegressor, save
 from latentedge.model import train as default_train
 from latentedge.training_data import AssembledTrainingData
+from latentedge.tui.backtest_screen import BacktestFn, BacktestScreen
 from latentedge.tui.widgets import LogPanel, ProgressPanel
 
 DEFAULT_MODEL_OUT_PATH = Path("data/model.safetensors")
@@ -29,6 +30,7 @@ class TrainingCancelled(Exception):
 
 class TrainScreen(Screen[None]):
     BINDINGS = [
+        Binding("b", "backtest_now", "Backtest now", show=False),
         Binding("q", "exit_now", "Exit", show=False),
     ]
 
@@ -39,6 +41,8 @@ class TrainScreen(Screen[None]):
         out_path: Path = DEFAULT_MODEL_OUT_PATH,
         epochs: int = 100,
         learning_rate: float = 0.001,
+        backtest_fn: BacktestFn | None = None,
+        backtest_after_train: bool = False,
         train_fn: Callable[..., list[float]] = default_train,
         time_fn: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -48,6 +52,8 @@ class TrainScreen(Screen[None]):
         self.epochs = epochs
         self.learning_rate = learning_rate
         self.assemble_fn = assemble_fn
+        self.backtest_fn = backtest_fn
+        self.backtest_after_train = backtest_after_train
         self.train_fn = train_fn
         self.time_fn = time_fn
 
@@ -151,10 +157,25 @@ class TrainScreen(Screen[None]):
             f"training complete — final loss {final_loss:.6f}, val corr {validate_correlation:.4f}, "
             f"saved to {self.out_path}"
         )
-        self.query_one("#train-action-bar", Static).update(
+        summary = (
             f"Training complete — final loss {final_loss:.6f}, val corr {validate_correlation:.4f}, "
-            f"saved to {self.out_path}. Press [b]Q[/b] to exit."
+            f"saved to {self.out_path}."
         )
+        if self.backtest_fn is not None and self.backtest_after_train:
+            self.query_one("#train-log", LogPanel).log_line("backtest_after_train is on — starting backtest now")
+            self.query_one("#train-action-bar", Static).update(f"{summary} Starting backtest now.")
+            self._push_backtest_screen()
+            return
+        prompt = "Press [b]B[/b] to backtest now, or [b]Q[/b] to exit." if self.backtest_fn is not None else "Press [b]Q[/b] to exit."
+        self.query_one("#train-action-bar", Static).update(f"{summary} {prompt}")
+
+    def _push_backtest_screen(self) -> None:
+        assert self.backtest_fn is not None
+        self.app.push_screen(BacktestScreen(backtest_fn=self.backtest_fn))
+
+    def action_backtest_now(self) -> None:
+        if self.is_complete and self.backtest_fn is not None:
+            self._push_backtest_screen()
 
     def _handle_error(self, message: str) -> None:
         self.error = message

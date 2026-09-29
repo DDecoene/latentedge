@@ -113,3 +113,22 @@ def test_backtest_guard_parameters_come_from_env_vars(tmp_path: Path):
     summary = json.loads(Path(str(model) + ".backtest.json").read_text())
     assert summary["initial_equity_usd"] == 5000
     assert summary["max_position_fraction"] == 0.05
+
+
+def test_backtest_after_train_runs_the_backtest_once_training_finishes(tmp_path: Path):
+    swaps = tmp_path / "swaps.parquet"
+    model = tmp_path / "model.safetensors"
+    _write_synthetic_swaps(swaps)
+
+    result = CliRunner().invoke(
+        cli, ["train", "--swaps", str(swaps), "--out", str(model), "--epochs", "5", "--backtest-after-train"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "total return" in result.output.lower()
+    assert Path(str(model) + ".backtest.json").exists()
+
+
+def test_train_without_the_flag_does_not_backtest(tmp_path: Path):
+    _, model = _train(tmp_path)
+    assert not Path(str(model) + ".backtest.json").exists()

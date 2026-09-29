@@ -3,6 +3,7 @@ import os
 import sys
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 import click
@@ -44,6 +45,7 @@ from latentedge.split import chronological_split
 from latentedge.store import read_swaps
 from latentedge.training_data import FEATURE_COLUMNS, AssembledTrainingData, SplitArrays, assemble_training_data
 from latentedge.tui.app import LatentEdgeApp
+from latentedge.tui.backtest_screen import BacktestScreen, describe_summary
 from latentedge.tui.ingest_screen import IngestScreen
 from latentedge.tui.train_screen import TrainScreen
 
@@ -168,6 +170,10 @@ def _startup_call_with_retries(
     "--train-epochs", type=int, default=100, envvar="LATENTEDGE_TRAIN_EPOCHS",
     help="Epoch count for a chained (--train-after-ingest, or the TTY dashboard's [T]) training run. Falls back to the LATENTEDGE_TRAIN_EPOCHS env var (or a .env file).",
 )
+@click.option(
+    "--backtest-after-train/--no-backtest-after-train", default=False, envvar="LATENTEDGE_BACKTEST_AFTER_TRAIN",
+    help="Start the backtest immediately once training finishes, instead of pausing for a [B]/[Q] prompt (TTY) or just exiting (non-TTY). Applies to the training that follows an ingest too (--train-after-ingest or [T]). Uses the LATENTEDGE_BACKTEST_* env vars for its settings. Falls back to the LATENTEDGE_BACKTEST_AFTER_TRAIN env var (or a .env file).",
+)
 def ingest(
     from_block: int | None,
     to_block: int | None,
@@ -184,6 +190,7 @@ def ingest(
     train_after_ingest: bool,
     train_out: Path,
     train_epochs: int,
+    backtest_after_train: bool,
 ) -> None:
     # A large range (e.g. a year of history) needs chunking to respect
     # provider limits, concurrency to finish in a reasonable time, and
@@ -243,6 +250,7 @@ def ingest(
             max_rate_limit_backoff_seconds=max_rate_limit_backoff_seconds, ingest_fn=ingest_range,
             train_assemble_fn=_assemble_train_data,
             model_out_path=train_out, train_epochs=train_epochs, train_after_ingest=train_after_ingest,
+            backtest_fn=_chained_backtest_fn(out, train_out), backtest_after_train=backtest_after_train,
             env_path=Path.cwd() / ".env",
         )
         LatentEdgeApp(start_screen=screen).run()
@@ -277,6 +285,8 @@ def ingest(
 
     if train_after_ingest:
         _run_train_direct(out, train_out, train_epochs)
+        if backtest_after_train:
+            _run_backtest_direct(out, train_out, BacktestParams.from_env())
 
 
 def _resolve_fixed_rps() -> float | None:
@@ -426,15 +436,20 @@ def _run_train_direct(swaps: Path, out: Path, epochs: int) -> None:
     help="Falls back to the LATENTEDGE_TRAIN_OUT env var (or a .env file).",
 )
 @click.option(
+    "--backtest-after-train/--no-backtest-after-train", default=False, envvar="LATENTEDGE_BACKTEST_AFTER_TRAIN",
+    help="Start the backtest immediately once training finishes, instead of pausing for a [B]/[Q] prompt (TTY) or just exiting (non-TTY).  Uses the LATENTEDGE_BACKTEST_* env vars for its settings. Falls back to the LATENTEDGE_BACKTEST_AFTER_TRAIN env var (or a .env file).",
+)
+@click.option(
     "--epochs", type=int, default=100, envvar="LATENTEDGE_TRAIN_EPOCHS",
     help="Falls back to the LATENTEDGE_TRAIN_EPOCHS env var (or a .env file).",
 )
-def train(swaps: Path, out: Path, epochs: int) -> None:
+def train(swaps: Path, out: Path, epochs: int, backtest_after_train: bool) -> None:
     if sys.stdout.isatty():
         out.parent.mkdir(parents=True, exist_ok=True)
         screen = TrainScreen(
             swaps_path=swaps, out_path=out, epochs=epochs,
             assemble_fn=_assemble_train_data,
+            backtest_fn=_chained_backtest_fn(swaps, out), backtest_after_train=backtest_after_train,
         )
         LatentEdgeApp(start_screen=screen).run()
         if screen.error is not None:
@@ -443,6 +458,8 @@ def train(swaps: Path, out: Path, epochs: int) -> None:
         return
 
     _run_train_direct(swaps, out, epochs)
+    if backtest_after_train:
+        _run_backtest_direct(swaps, out, BacktestParams.from_env())
 
 
 @cli.command()
@@ -486,6 +503,58 @@ def backtest(
     data ingested since (which would move a fresh split's boundary into
     the model's own training data) can only extend the window forward.
     """
+    params = BacktestParams(initial_equity, max_position_fraction, daily_loss_limit_fraction, full_size_return)
+    if sys.stdout.isatty():
+        screen = BacktestScreen(backtest_fn=lambda report: _compute_backtest(swaps, model, params, report))
+        LatentEdgeApp(start_screen=screen).run()
+        if screen.error is not None:
+            click.echo(f"backtest failed: {screen.error}", err=True)
+            raise SystemExit(1)
+        return
+
+    _run_backtest_direct(swaps, model, params)
+
+
+@dataclass(frozen=True)
+class BacktestParams:
+    initial_equity: float = 10_000.0
+    max_position_fraction: float = 0.10
+    daily_loss_limit_fraction: float = 0.02
+    full_size_return: float = 0.002
+
+    @classmethod
+    def from_env(cls) -> "BacktestParams":
+        """What a chained run (--backtest-after-train) uses: the same env
+        vars the backtest command's own options fall back to."""
+        d = cls()
+        try:
+            return cls(
+                initial_equity=float(os.environ.get("LATENTEDGE_BACKTEST_INITIAL_EQUITY", d.initial_equity)),
+                max_position_fraction=float(
+                    os.environ.get("LATENTEDGE_BACKTEST_MAX_POSITION_FRACTION", d.max_position_fraction)
+                ),
+                daily_loss_limit_fraction=float(
+                    os.environ.get("LATENTEDGE_BACKTEST_DAILY_LOSS_LIMIT_FRACTION", d.daily_loss_limit_fraction)
+                ),
+                full_size_return=float(os.environ.get("LATENTEDGE_BACKTEST_FULL_SIZE_RETURN", d.full_size_return)),
+            )
+        except ValueError as exc:
+            raise click.UsageError(f"invalid LATENTEDGE_BACKTEST_* value: {exc}") from None
+
+
+def _chained_backtest_fn(swaps: Path, model: Path) -> Callable[[Callable[..., None]], dict]:
+    """The backtest a TrainScreen chains into, configured from env vars
+    (resolved now, so a bad value fails before the TUI starts)."""
+    params = BacktestParams.from_env()
+    return lambda report: _compute_backtest(swaps, model, params, report)
+
+
+def _compute_backtest(
+    swaps: Path, model: Path, params: BacktestParams, report: Callable[..., None]
+) -> dict:
+    """Runs the backtest and writes <model>.backtest.json; returns the
+    summary. report(stage, done, total) is called between and within the
+    slow stages and may raise to abort. Failures raise ClickException."""
     metrics_path = Path(str(model) + ".metrics.json")
     if not metrics_path.exists():
         raise click.ClickException(f"{metrics_path} not found — train the model first.")
@@ -496,17 +565,18 @@ def backtest(
             "backtest can't be guaranteed — retrain the model."
         )
 
-    assembled, swap_df = _prepare_labeled_bars(swaps, lambda *_: None)
+    assembled, swap_df = _prepare_labeled_bars(swaps, report)
     window = assembled[assembled["bar_start"] >= test_start]
     if window.empty:
         raise click.ClickException(f"no labeled bars at or after the model's test window start ({test_start}).")
 
+    report("replaying test window")
     inputs = build_backtest_inputs(window, swap_df, FEATURE_COLUMNS)
     client = SignalClient(model, input_dim=len(FEATURE_COLUMNS), feature_columns=FEATURE_COLUMNS)
     guard = SafetyGuard(
-        max_position_fraction=max_position_fraction,
-        daily_loss_limit_fraction=daily_loss_limit_fraction,
-        full_size_return=full_size_return,
+        max_position_fraction=params.max_position_fraction,
+        daily_loss_limit_fraction=params.daily_loss_limit_fraction,
+        full_size_return=params.full_size_return,
     )
     result = run_backtest(
         features=inputs.features,
@@ -516,29 +586,31 @@ def backtest(
         exit_swaps=inputs.exit_swaps,
         signal_client=client,
         guard=guard,
-        initial_equity_usd=initial_equity,
+        initial_equity_usd=params.initial_equity,
         timestamps=inputs.timestamps,
     )
 
     summary = {
         "test_start": test_start,
         "bars": len(window),
-        "initial_equity_usd": initial_equity,
-        "max_position_fraction": max_position_fraction,
-        "daily_loss_limit_fraction": daily_loss_limit_fraction,
-        "full_size_return": full_size_return,
+        "initial_equity_usd": params.initial_equity,
+        "max_position_fraction": params.max_position_fraction,
+        "daily_loss_limit_fraction": params.daily_loss_limit_fraction,
+        "full_size_return": params.full_size_return,
         "total_return_usd": result.total_return_usd,
-        "total_return_fraction": result.total_return_usd / initial_equity,
+        "total_return_fraction": result.total_return_usd / params.initial_equity,
         "max_drawdown_usd": result.max_drawdown_usd,
         "win_rate": result.win_rate,
         "num_trades": result.num_trades,
         "sharpe": daily_sharpe(np.array(result.equity_curve), inputs.timestamps),
     }
     Path(str(model) + ".backtest.json").write_text(json.dumps(summary, indent=2))
+    return summary
 
-    click.echo(
-        f"backtest over {summary['bars']:,} test bars: total return ${summary['total_return_usd']:,.2f} "
-        f"({summary['total_return_fraction']:.2%}), max drawdown ${summary['max_drawdown_usd']:,.2f}, "
-        f"win rate {summary['win_rate']:.1%} over {summary['num_trades']:,} trades, sharpe {summary['sharpe']:.2f}"
-    )
+
+def _run_backtest_direct(swaps: Path, model: Path, params: BacktestParams) -> None:
+    """Backtests without the TUI — used by `backtest` when stdout isn't a
+    tty and by the non-tty chained (--backtest-after-train) runs."""
+    summary = _compute_backtest(swaps, model, params, lambda *_: None)
+    click.echo(f"backtest over {describe_summary(summary)}")
     click.echo(f"summary saved to {model}.backtest.json")
