@@ -165,6 +165,7 @@ label settings and the feature set with it.
 | 20260929T173520Z | all 7 | 30 min, 2 std | not measured | not measured | no edge (first sweep) |
 | 20260929T175549Z | all 7 | 30 min, 2 std | +0.01 | -0.96 | no edge; model predicts cost |
 | 20260929T183041Z | all 7 + 4 order flow | 30 min, 2 std | +0.01 | -0.96 | no edge; order flow added nothing measurable (validate gross corr +0.03) |
+| 20260929T184128Z | all 7 + 4 order flow, trained on gross | 30 min, 2 std | +0.04 validate, +0.04 test | +0.10, +0.12 | no edge; first positive direction correlation on all splits but tiny (about 0.2% of variance), inside sampling error, and every rule loses |
 
 Pipeline validation (synthetic data, `tests/test_cli_backtest.py`): on swaps
 whose price follows a hidden drift that flips sign every two hours, the same
@@ -192,6 +193,17 @@ as the price-only model; the fit to net return is still cost prediction
 (cost correlation -0.93 to -0.96). Order flow at 1-minute bars and a 30-minute
 horizon adds no detectable direction signal. The price-only baseline is
 reproduced with `LATENTEDGE_TRAIN_EXCLUDE_FEATURES=order_flow`.
+
+Model capacity (`LATENTEDGE_TRAIN_HIDDEN`, early stopping): the original model
+is one hidden layer of 16 units, close to linear. Network size is now
+configurable, and training stops when the validate loss stops improving and
+restores the best epoch. On a synthetic combined pattern (drift sign is the
+product of a flow regime and a volatility regime), a 64,64 network without
+early stopping fit training data almost perfectly (gross correlation 0.71) but
+did worse on unseen data (0.13) than the 16-unit model (0.19); with early
+stopping the sizes 16, 64,64 and 128,64 all reach about 0.21 on validate. The
+early-stopping point uses the validate window, so validate results are
+slightly optimistic and the test window is the judge.
 
 Planned: without gas and volatility at 30 minutes; all features at 240
 minutes with a 6 std band; both together.

@@ -100,15 +100,17 @@ class TrainScreen(Screen[None]):
 
         try:
             assembled = self.assemble_fn(self.swaps_path, on_assemble_progress)
-            model = NetReturnRegressor(input_dim=assembled.input_dim)
+            model = NetReturnRegressor(input_dim=assembled.input_dim, hidden=assembled.hidden_sizes)
             # The return's raw scale is too flat a loss surface for Adam
             # to make real progress in a practical epoch count — train on
             # the standardized target, unstandardized back for reporting
             # in build_training_metrics below.
             y_train = standardize_value(assembled.train.y, target_stats(assembled.stats))
+            y_validate = standardize_value(assembled.validate.y, target_stats(assembled.stats))
             losses = self.train_fn(
                 model, assembled.train.x, y_train, epochs=self.epochs,
                 learning_rate=self.learning_rate, on_epoch=on_epoch,
+                validation=(assembled.validate.x, y_validate),
             )
             self.out_path.parent.mkdir(parents=True, exist_ok=True)
             save(model, self.out_path)

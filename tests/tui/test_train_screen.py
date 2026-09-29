@@ -21,7 +21,7 @@ def _fake_assemble(swaps_path: Path, on_progress=None) -> AssembledTrainingData:
     )
 
 
-def _fake_train(model, features, labels, epochs, learning_rate, on_epoch=None):
+def _fake_train(model, features, labels, epochs, learning_rate, on_epoch=None, **_kwargs):
     losses = []
     for epoch in range(epochs):
         loss = 1.0 / (epoch + 1)
@@ -72,7 +72,7 @@ async def test_train_screen_saves_stats_only_after_the_model_is_saved(tmp_path: 
     stats_path = tmp_path / "model.safetensors.stats.json"
     metrics_path = tmp_path / "model.safetensors.metrics.json"
 
-    def failing_train(model, features, labels, epochs, learning_rate, on_epoch=None):
+    def failing_train(model, features, labels, epochs, learning_rate, on_epoch=None, **_kwargs):
         raise RuntimeError("bad shapes")
 
     screen = TrainScreen(
@@ -119,7 +119,7 @@ async def test_train_screen_progress_reaches_full_bar(tmp_path: Path):
 
 @pytest.mark.asyncio
 async def test_train_screen_logs_error_without_crashing(tmp_path: Path):
-    def failing_train(model, features, labels, epochs, learning_rate, on_epoch=None):
+    def failing_train(model, features, labels, epochs, learning_rate, on_epoch=None, **_kwargs):
         raise RuntimeError("bad shapes")
 
     screen = TrainScreen(
@@ -167,7 +167,7 @@ async def test_train_screen_q_exits_after_completion(tmp_path: Path):
 
 @pytest.mark.asyncio
 async def test_train_screen_q_exits_after_error(tmp_path: Path):
-    def failing_train(model, features, labels, epochs, learning_rate, on_epoch=None):
+    def failing_train(model, features, labels, epochs, learning_rate, on_epoch=None, **_kwargs):
         raise RuntimeError("bad shapes")
 
     screen = TrainScreen(
@@ -197,7 +197,7 @@ async def test_train_screen_q_exits_after_error(tmp_path: Path):
 async def test_train_screen_q_ignored_before_completion(tmp_path: Path):
     release_train = threading.Event()
 
-    def gated_train(model, features, labels, epochs, learning_rate, on_epoch=None):
+    def gated_train(model, features, labels, epochs, learning_rate, on_epoch=None, **_kwargs):
         release_train.wait()
         return [1.0]
 
@@ -337,7 +337,7 @@ async def test_b_does_nothing_before_training_completes(tmp_path: Path):
 
     gate = threading.Event()
 
-    def slow_train(model, features, labels, epochs, learning_rate, on_epoch=None):
+    def slow_train(model, features, labels, epochs, learning_rate, on_epoch=None, **_kwargs):
         gate.wait(5)
         return _fake_train(model, features, labels, epochs, learning_rate, on_epoch)
 

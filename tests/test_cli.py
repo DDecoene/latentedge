@@ -96,7 +96,7 @@ def test_train_options_fall_back_to_env_vars(monkeypatch: pytest.MonkeyPatch, tm
             train=empty, validate=empty, test=empty, input_dim=1, stats={"net_return": (0.0, 1.0)}
         )
 
-    def fake_train(model, x, y, epochs, learning_rate):
+    def fake_train(model, x, y, epochs, learning_rate, **_kwargs):
         captured["epochs"] = epochs
         return [0.0]
 
@@ -136,7 +136,7 @@ def test_ingest_train_after_ingest_chains_training_in_non_tty_mode(monkeypatch: 
         empty = SplitArrays(x=np.zeros((1, 1), dtype="float32"), y=np.zeros(1, dtype="float32"))
         return AssembledTrainingData(train=empty, validate=empty, test=empty, input_dim=1, stats={"net_return": (0.0, 1.0)})
 
-    def fake_train(model, x, y, epochs, learning_rate):
+    def fake_train(model, x, y, epochs, learning_rate, **_kwargs):
         captured["epochs"] = epochs
         return [0.0]
 

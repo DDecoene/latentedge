@@ -36,6 +36,7 @@ class TrainingMetrics(TypedDict):
     test_start: NotRequired[int]
     feature_columns: NotRequired[list[str]]
     target: NotRequired[str]
+    hidden_sizes: NotRequired[list[int]]
     label_horizon_seconds: NotRequired[int]
     label_barrier_stds: NotRequired[float]
 
@@ -115,6 +116,7 @@ def build_training_metrics(
     if assembled.test_start is not None:
         metrics["test_start"] = assembled.test_start
     metrics["target"] = assembled.target
+    metrics["hidden_sizes"] = list(assembled.hidden_sizes)
     metrics["feature_columns"] = list(assembled.feature_columns)
     metrics["label_horizon_seconds"] = assembled.label_settings.horizon_seconds
     metrics["label_barrier_stds"] = assembled.label_settings.barrier_stds

@@ -57,6 +57,8 @@ class AssembledTrainingData(NamedTuple):
     # What the model is trained to predict: "gross" (the price move before any
     # cost) or "net" (after fees, slippage and gas). y holds that quantity.
     target: str = "net"
+    # Hidden layer widths of the model to train.
+    hidden_sizes: tuple[int, ...] = (16,)
 
 
 def assemble_training_data(

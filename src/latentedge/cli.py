@@ -217,6 +217,7 @@ def ingest(
     _label_settings_from_env()
     _excluded_features_from_env()
     _train_target_from_env()
+    _hidden_sizes_from_env()
 
     max_rps = float(os.environ.get("LATENTEDGE_INGEST_MAX_RPS", DEFAULT_MAX_RPS))
     fixed_rps = _resolve_fixed_rps()
@@ -405,6 +406,23 @@ def _train_target_from_env() -> str:
     return target
 
 
+def _hidden_sizes_from_env() -> tuple[int, ...]:
+    """LATENTEDGE_TRAIN_HIDDEN: widths of the hidden layers, comma-separated
+    (default 16, one layer). A bigger network, e.g. 64,64, can find patterns
+    that combine features, which one small layer barely can. The judge is
+    still the validate and test correlation, not the training fit."""
+    raw = os.environ.get("LATENTEDGE_TRAIN_HIDDEN", "16")
+    try:
+        sizes = tuple(int(part) for part in raw.split(",") if part.strip())
+    except ValueError:
+        sizes = ()
+    if not sizes or len(sizes) > 4 or any(size < 1 for size in sizes):
+        raise click.UsageError(
+            f"LATENTEDGE_TRAIN_HIDDEN must be one to four positive integers, comma-separated (like 64,64), got {raw!r}."
+        )
+    return sizes
+
+
 def _model_setup(metrics: TrainingMetrics) -> tuple[list[str], LabelSettings]:
     """The feature columns and label settings a model was trained with (the
     original seven features and 30-minute labels for a model whose metrics
@@ -459,6 +477,7 @@ def _assemble_train_data(
     excluded = _excluded_features_from_env()
     feature_columns = [name for name in FEATURE_COLUMNS if name not in excluded]
     target = _train_target_from_env()
+    hidden_sizes = _hidden_sizes_from_env()
     target_column = "gross_return" if target == "gross" else "net_return"
 
     assembled, _ = _prepare_labeled_bars(swaps_path, report, settings)
@@ -500,6 +519,7 @@ def _assemble_train_data(
         feature_columns=tuple(feature_columns),
         label_settings=settings,
         target=target,
+        hidden_sizes=hidden_sizes,
     )
 
 
@@ -510,13 +530,17 @@ def _run_train_direct(swaps: Path, out: Path, epochs: int) -> None:
     """
     out.parent.mkdir(parents=True, exist_ok=True)
     assembled = _assemble_train_data(swaps)
-    regressor = NetReturnRegressor(input_dim=assembled.input_dim)
+    regressor = NetReturnRegressor(input_dim=assembled.input_dim, hidden=assembled.hidden_sizes)
     # net_return's raw scale (~1e-3) makes the MSE loss surface too flat
     # for Adam to make real progress in a practical number of epochs —
     # train on the standardized target and let build_training_metrics
     # unstandardize predictions back for reporting.
     y_train = standardize_value(assembled.train.y, target_stats(assembled.stats))
-    losses = train_model(regressor, assembled.train.x, y_train, epochs=epochs, learning_rate=0.001)
+    y_validate = standardize_value(assembled.validate.y, target_stats(assembled.stats))
+    losses = train_model(
+        regressor, assembled.train.x, y_train, epochs=epochs, learning_rate=0.001,
+        validation=(assembled.validate.x, y_validate),
+    )
     save(regressor, out)
     save_feature_stats(assembled.stats, Path(str(out) + ".stats.json"))
     metrics = build_training_metrics(regressor, assembled, losses)
@@ -552,6 +576,7 @@ def train(swaps: Path, out: Path, epochs: int, backtest_after_train: bool, sweep
     _label_settings_from_env()
     _excluded_features_from_env()
     _train_target_from_env()
+    _hidden_sizes_from_env()
     if sys.stdout.isatty():
         out.parent.mkdir(parents=True, exist_ok=True)
         screen = TrainScreen(
