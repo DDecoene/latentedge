@@ -8,6 +8,7 @@ by hand, since doing that separately and filtering before computing
 features is exactly the bug this module exists to prevent.
 """
 
+from collections.abc import Callable
 from typing import NamedTuple
 
 import numpy as np
@@ -38,6 +39,7 @@ def assemble_training_data(
     return_windows: list[int],
     volatility_window: int,
     tp_sl_fraction: float,
+    on_label_progress: Callable[[int, int], None] | None = None,
 ) -> pd.DataFrame:
     feature_columns = [f"return_{n}" for n in return_windows] + [
         "volatility", "volume_usdc", "bars_since_swap", "base_fee_gwei",
@@ -47,7 +49,7 @@ def assemble_training_data(
     # series (not a post-exclusion-filtered one) so rolling windows never
     # silently span a gap where excluded rows were removed.
     featured = compute_features(bars, return_windows=return_windows, volatility_window=volatility_window)
-    labeled = label_bars(bars, swaps, tp_sl_fraction=tp_sl_fraction)
+    labeled = label_bars(bars, swaps, tp_sl_fraction=tp_sl_fraction, on_progress=on_label_progress)
 
     combined = featured.copy()
     combined["net_return"] = labeled["net_return"]

@@ -55,3 +55,23 @@ def test_bar_near_end_of_history_with_incomplete_horizon_is_excluded():
     result = label_bars(bars, swaps, tp_sl_fraction=0.01)
     assert result.iloc[0]["excluded"]
     assert result.iloc[0]["reason"] == "incomplete_horizon"
+
+
+def test_label_bars_reports_progress_and_can_be_cancelled():
+    swaps = pd.DataFrame([_swap(t, 3000.0) for t in range(0, 4000, 10)])
+    bars = pd.DataFrame(
+        [{"bar_start": t, "price_usdc_per_weth": 3000.0, "swap_count": 1, "volume_usdc": 1.0, "has_gap": False}
+         for t in range(0, 2000, 60)]
+    )
+    seen: list[tuple[int, int]] = []
+    label_bars(bars, swaps, tp_sl_fraction=0.01, on_progress=lambda done, total: seen.append((done, total)))
+    assert seen and seen[-1] == (len(bars), len(bars))
+
+    class Stop(Exception):
+        pass
+
+    def cancel(done: int, total: int) -> None:
+        raise Stop
+
+    with pytest.raises(Stop):
+        label_bars(bars, swaps, tp_sl_fraction=0.01, on_progress=cancel)
