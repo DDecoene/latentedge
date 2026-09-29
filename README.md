@@ -46,6 +46,17 @@ The paper is available as a PDF: [`docs/paper/paper.pdf`](docs/paper/paper.pdf).
 The LaTeX source is [`docs/paper/paper.tex`](docs/paper/paper.tex), and the sweep and study records it cites are in
 [`docs/paper/results/`](docs/paper/results/).
 
+## The dashboards
+
+Every long-running command runs in a terminal dashboard. These two are
+replays of the recorded study and sweep behind the paper's numbers.
+
+![The walk-forward study dashboard](docs/screenshots/study.svg)
+
+![The trading-rule sweep dashboard](docs/screenshots/sweep.svg)
+
+Regenerate them with `uv run python docs/screenshots/make_screenshots.py`.
+
 ## Getting started
 
 Requires Python 3.12+, [`uv`](https://docs.astral.sh/uv/), and an Apple
