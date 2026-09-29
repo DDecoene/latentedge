@@ -27,8 +27,8 @@ and the test window. An earlier model trained on net return looked much
 better (0.35 correlation with its label), but that was cost prediction, not
 direction.
 
-The write-up is in [`docs/paper/paper.tex`](docs/paper/paper.tex) (LaTeX
-source), and the sweep and study records it cites are in
+The paper is available as a PDF: [`docs/paper/paper.pdf`](docs/paper/paper.pdf).
+The LaTeX source is [`docs/paper/paper.tex`](docs/paper/paper.tex), and the sweep and study records it cites are in
 [`docs/paper/results/`](docs/paper/results/).
 
 ## Getting started
