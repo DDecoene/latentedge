@@ -214,15 +214,22 @@ def ingest_range(
     if not gaps:
         return 0
 
-    # Chunk each gap independently and concatenate in order — a chunk
-    # never straddles a gap boundary, so an already-covered stretch is
-    # never touched even at its edges.
+    # Newest blocks first: the newest gap is fetched before older ones,
+    # and within a gap chunks run from its top end downward (chunks
+    # aligned to the gap's newest block). Whatever has completed at any
+    # moment is therefore one stretch anchored to already-ingested (or
+    # the newest) data — stopping early never leaves a hole, so the
+    # result is trainable as-is. A chunk never straddles a gap boundary,
+    # so an already-covered stretch is never touched even at its edges.
     chunk_order: list[int] = []
-    chunk_ceiling: dict[int, int] = {}
-    for gap_start, gap_end in gaps:
-        for chunk_start in range(gap_start, gap_end + 1, chunk_size):
+    chunk_end_of: dict[int, int] = {}
+    for gap_start, gap_end in reversed(gaps):
+        chunk_end = gap_end
+        while chunk_end >= gap_start:
+            chunk_start = max(chunk_end - chunk_size + 1, gap_start)
             chunk_order.append(chunk_start)
-            chunk_ceiling[chunk_start] = gap_end
+            chunk_end_of[chunk_start] = chunk_end
+            chunk_end = chunk_start - 1
 
     lock = threading.Lock()
     completed: dict[int, tuple[int, list[SwapRecord]]] = {}
@@ -297,7 +304,7 @@ def ingest_range(
             return worker_slots[ident]
 
     def process_chunk(chunk_start: int) -> tuple[int, int, list[SwapRecord]]:
-        chunk_end = min(chunk_start + chunk_size - 1, chunk_ceiling[chunk_start])
+        chunk_end = chunk_end_of[chunk_start]
 
         slot = worker_slot() if on_worker_status is not None else -1
 
@@ -353,9 +360,12 @@ def ingest_range(
                         c_end, recs = completed.pop(cs)
                         pending_records.extend(recs)
 
-                        if pending_intervals and pending_intervals[-1][1] + 1 == cs:
-                            last_start, _ = pending_intervals[-1]
-                            pending_intervals[-1] = (last_start, c_end)
+                        # Chunks arrive newest to oldest, so a contiguous
+                        # run grows downward: this chunk ends right below
+                        # the run's current start.
+                        if pending_intervals and c_end + 1 == pending_intervals[-1][0]:
+                            _, last_end = pending_intervals[-1]
+                            pending_intervals[-1] = (cs, last_end)
                         else:
                             pending_intervals.append((cs, c_end))
 

@@ -57,8 +57,9 @@ def test_ingest_range_splits_into_chunks_and_writes_incrementally(tmp_path: Path
             fetch_fn=fake_fetch,
         )
 
-    # [0,99], [100,199], [200,249] — three chunks, one record each.
-    assert sorted(calls) == [(0, 99), (100, 199), (200, 249)]
+    # [150,249], [50,149], [0,49] — three chunks (aligned to the newest
+    # block), one record each.
+    assert sorted(calls) == [(0, 49), (50, 149), (150, 249)]
     assert total == 3
     assert len(read_swaps(out_path)) == 3
     assert read_progress(out_path) == [(0, 249)]
@@ -194,13 +195,13 @@ def test_ingest_range_records_each_disjoint_new_stretch_as_its_own_interval_befo
     finally:
         chunked_module.add_interval = original
 
-    assert calls == [(0, 9), (20, 29), (40, 49)]
+    assert calls == [(40, 49), (20, 29), (0, 9)]  # newest stretch first
 
 
 def test_ingest_range_flushes_correctly_when_failure_happens_after_crossing_a_gap_boundary(tmp_path: Path):
     # A pre-existing covered interval sits between two uncovered
-    # stretches. The first stretch's chunk succeeds (crossing into the
-    # second gap advances the fold past the covered middle); the second
+    # stretches. The newest stretch's chunk succeeds (crossing into the
+    # older gap advances the fold past the covered middle); the older
     # stretch's chunk then fails permanently. The already-succeeded
     # chunk must still be flushed and merged with the pre-existing
     # interval, not discarded.
@@ -224,7 +225,7 @@ def test_ingest_range_flushes_correctly_when_failure_happens_after_crossing_a_ga
                 max_retries=1, fetch_fn=succeed_first_gap_then_fail,
             )
 
-    assert read_progress(out_path) == [(0, 19)]
+    assert read_progress(out_path) == [(10, 29)]
     assert len(read_swaps(out_path)) == 1
 
 
@@ -383,11 +384,11 @@ def test_ingest_range_progress_never_exceeds_what_was_actually_flushed(tmp_path:
                 flush_every_n_chunks=20, max_retries=1, fetch_fn=fetch_then_die,
             )
 
-    # 15 chunks succeeded (blocks 0-149) but the flush threshold (20)
-    # was never reached — the existing flush-before-raising safeguard
-    # still flushes them on the way out, so progress lands exactly at
-    # the end of the 15th chunk, never further.
-    assert read_progress(out_path) == [(0, 149)]
+    # 15 chunks succeeded (blocks 850-999, newest first) but the flush
+    # threshold (20) was never reached — the existing flush-before-raising
+    # safeguard still flushes them on the way out, so progress lands
+    # exactly at the 15th chunk, never further.
+    assert read_progress(out_path) == [(850, 999)]
 
 
 def test_ingest_range_backs_off_longer_for_rate_limit_errors(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -535,13 +536,14 @@ def test_ingest_range_calls_on_retry_for_each_failed_attempt(tmp_path: Path):
 
 
 def test_ingest_range_reports_queue_status_when_a_chunk_buffers_behind_a_straggler(tmp_path: Path):
-    # Chunk [0,9] is slow (simulates a retrying straggler); chunk [10,19]
-    # finishes first and must buffer behind it rather than being folded
-    # into progress immediately. on_queue_status reports that buildup.
+    # Chunk [10,19] (the newest, so first in line) is slow (simulates a
+    # retrying straggler); chunk [0,9] finishes first and must buffer
+    # behind it rather than being folded into progress immediately.
+    # on_queue_status reports that buildup.
     release_first_chunk = threading.Event()
 
     def gated_fetch(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str, **kwargs) -> list[SwapRecord]:
-        if from_block == 0:
+        if from_block == 10:
             release_first_chunk.wait()
         return [_record(from_block, 0)]
 
@@ -565,7 +567,7 @@ def test_ingest_range_reports_queue_status_when_a_chunk_buffers_behind_a_straggl
         )
 
     assert saw_second_chunk_done.is_set()
-    assert (1, 0) in statuses  # one chunk buffered, blocked on chunk starting at block 0
+    assert (1, 10) in statuses  # one chunk buffered, blocked on chunk starting at block 10
 
 
 def test_ingest_range_reports_worker_status_while_fetching_and_when_idle(tmp_path: Path):
@@ -903,7 +905,7 @@ def test_ingest_range_flushes_completed_chunks_before_raising_on_a_later_failure
     # The 5 chunks that succeeded before the 6th chunk's failure must
     # have been written to disk and their watermark recorded, even
     # though the whole call ultimately raised.
-    assert read_progress(out_path) == [(0, 49)]  # end of the 5th chunk (blocks 0-49)
+    assert read_progress(out_path) == [(50, 99)]  # the 5 newest chunks (blocks 50-99)
     assert len(read_swaps(out_path)) == 5
 
 
@@ -938,7 +940,7 @@ def test_ingest_range_cancel_event_stops_cleanly_and_flushes_completed_chunks(tm
     assert written == len(read_swaps(out_path))
     assert written >= 3
     progress = read_progress(out_path)
-    assert progress and progress[0][0] == 0
+    assert progress and progress[0][1] == 99  # anchored at the newest block
 
 
 def test_ingest_range_fixed_rps_pins_the_rate_and_ignores_persisted_state(tmp_path: Path):
@@ -964,3 +966,74 @@ def test_ingest_range_fixed_rps_pins_the_rate_and_ignores_persisted_state(tmp_pa
     assert rate_changes == []
     # A fixed run must not overwrite the auto-throttle's learned state.
     assert read_rate_limit(out_path) == 1.0
+
+
+def _collecting_fetch(calls: list[tuple[int, int]], cancel_event: threading.Event | None = None, cancel_on_call: int | None = None):
+    def fake_fetch(pool_address: str, from_block: int, to_block: int, client: httpx.Client, rpc_url: str, **kwargs) -> list[SwapRecord]:
+        calls.append((from_block, to_block))
+        if cancel_event is not None and len(calls) == cancel_on_call:
+            cancel_event.set()
+        return [_record(to_block, 0)]
+
+    return fake_fetch
+
+
+def test_ingest_range_fetches_the_newest_blocks_first(tmp_path: Path):
+    calls: list[tuple[int, int]] = []
+    with httpx.Client() as client:
+        ingest_range(
+            pool_address="0xpool", from_block=0, to_block=249, out_path=tmp_path / "swaps.parquet",
+            client=client, rpc_url="http://fake", chunk_size=100, max_workers=1, fetch_fn=_collecting_fetch(calls),
+        )
+
+    # chunks are aligned to the top of the range, so the newest chunk is full-size
+    assert calls == [(150, 249), (50, 149), (0, 49)]
+
+
+def test_stopping_a_fresh_ingest_early_leaves_one_stretch_ending_at_the_newest_block(tmp_path: Path):
+    cancel_event = threading.Event()
+    calls: list[tuple[int, int]] = []
+    out_path = tmp_path / "swaps.parquet"
+    with httpx.Client() as client:
+        with pytest.raises(IngestCancelled):
+            ingest_range(
+                pool_address="0xpool", from_block=0, to_block=999, out_path=out_path,
+                client=client, rpc_url="http://fake", chunk_size=100, max_workers=1,
+                fetch_fn=_collecting_fetch(calls, cancel_event, cancel_on_call=3), cancel_event=cancel_event,
+            )
+
+    (start, end), = read_progress(out_path)
+    assert end == 999  # anchored at the newest block, so what's on disk is trainable as-is
+    assert start <= 700
+
+
+def test_stopping_a_backfill_early_stays_contiguous_with_the_data_already_ingested(tmp_path: Path):
+    out_path = tmp_path / "swaps.parquet"
+    write_progress(out_path, [(1000, 1999)])
+    cancel_event = threading.Event()
+    calls: list[tuple[int, int]] = []
+    with httpx.Client() as client:
+        with pytest.raises(IngestCancelled):
+            ingest_range(
+                pool_address="0xpool", from_block=0, to_block=1999, out_path=out_path,
+                client=client, rpc_url="http://fake", chunk_size=100, max_workers=1,
+                fetch_fn=_collecting_fetch(calls, cancel_event, cancel_on_call=3), cancel_event=cancel_event,
+            )
+
+    (start, end), = read_progress(out_path)  # merged into one interval — no hole before the older data
+    assert end == 1999
+    assert start < 1000
+
+
+def test_ingest_range_fills_the_newest_gap_first_when_there_are_several(tmp_path: Path):
+    out_path = tmp_path / "swaps.parquet"
+    write_progress(out_path, [(100, 199), (300, 399)])
+    calls: list[tuple[int, int]] = []
+    with httpx.Client() as client:
+        ingest_range(
+            pool_address="0xpool", from_block=0, to_block=499, out_path=out_path,
+            client=client, rpc_url="http://fake", chunk_size=1000, max_workers=1, fetch_fn=_collecting_fetch(calls),
+        )
+
+    assert calls == [(400, 499), (200, 299), (0, 99)]
+    assert read_progress(out_path) == [(0, 499)]
