@@ -151,3 +151,43 @@ def test_standardize_array_matches_standardize_features():
     actual = (raw - means) / stds
 
     assert np.allclose(actual, expected)
+
+
+def _flow_bars(net_flow, volume, biggest):
+    n = len(net_flow)
+    return pd.DataFrame(
+        {
+            "bar_start": [60 * i for i in range(n)],
+            "price_usdc_per_weth": [3000.0] * n,
+            "volume_usdc": volume, "net_flow_usdc": net_flow, "max_swap_usdc": biggest, "swap_count": [1] * n,
+        }
+    )
+
+
+def test_flow_imbalance_is_net_buying_share_of_volume_over_the_window():
+    bars = _flow_bars([100.0] * 5 + [-100.0] * 5, [100.0] * 10, [100.0] * 10)
+    result = compute_features(bars, return_windows=[2], volatility_window=3)
+
+    assert result.loc[4, "flow_imbalance_5"] == pytest.approx(1.0)   # five buy bars
+    assert result.loc[9, "flow_imbalance_5"] == pytest.approx(-1.0)  # five sell bars
+    assert pd.isna(result.loc[3, "flow_imbalance_5"])                # window not yet full
+
+
+def test_flow_features_use_only_past_data():
+    net_flow, volume, biggest = [50.0] * 40, [100.0] * 40, [60.0] * 40
+    bars = _flow_bars(net_flow, volume, biggest)
+    altered = _flow_bars(net_flow[:35] + [-9999.0] * 5, volume[:35] + [9999.0] * 5, biggest[:35] + [9999.0] * 5)
+
+    base = compute_features(bars, return_windows=[2], volatility_window=3)
+    changed = compute_features(altered, return_windows=[2], volatility_window=3)
+
+    for column in ("flow_imbalance_5", "flow_imbalance_30", "large_swap_share_15"):
+        assert changed.loc[34, column] == base.loc[34, column]
+
+
+def test_large_swap_share_and_a_window_with_no_trades():
+    bars = _flow_bars([0.0] * 20, [10.0] * 10 + [0.0] * 10, [4.0] * 10 + [0.0] * 10)
+    result = compute_features(bars, return_windows=[2], volatility_window=3)
+
+    assert result.loc[14, "large_swap_share_15"] == pytest.approx(4.0 / 100.0)
+    assert result.loc[19, "flow_imbalance_5"] == 0.0  # nothing traded: no imbalance, not NaN

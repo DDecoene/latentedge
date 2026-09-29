@@ -47,7 +47,7 @@ from latentedge.signal_client import SignalClient
 from latentedge.split import chronological_split
 from latentedge import sweep as sweeping
 from latentedge.store import read_swaps
-from latentedge.training_data import FEATURE_COLUMNS, AssembledTrainingData, SplitArrays, assemble_training_data
+from latentedge.training_data import FEATURE_COLUMNS, FEATURE_GROUPS, AssembledTrainingData, SplitArrays, assemble_training_data
 from latentedge.tui.app import LatentEdgeApp
 from latentedge.tui.backtest_screen import BacktestScreen, describe_summary
 from latentedge.tui.sweep_screen import SweepScreen
@@ -370,14 +370,19 @@ def _label_settings_from_env() -> LabelSettings:
 
 
 def _excluded_features_from_env() -> list[str]:
-    """LATENTEDGE_TRAIN_EXCLUDE_FEATURES: comma-separated feature names to
-    leave out of training, e.g. base_fee_gwei,volatility to test whether
-    the model predicts trading cost rather than direction."""
-    excluded = [name.strip() for name in os.environ.get("LATENTEDGE_TRAIN_EXCLUDE_FEATURES", "").split(",") if name.strip()]
+    """LATENTEDGE_TRAIN_EXCLUDE_FEATURES: comma-separated feature names, or
+    group names (order_flow, cost, returns), to leave out of training —
+    e.g. cost to test whether the model predicts trading cost rather than
+    direction, or order_flow to get the price-only baseline."""
+    excluded: list[str] = []
+    for name in os.environ.get("LATENTEDGE_TRAIN_EXCLUDE_FEATURES", "").split(","):
+        name = name.strip()
+        if name:
+            excluded.extend(FEATURE_GROUPS.get(name, [name]))
     unknown = [name for name in excluded if name not in FEATURE_COLUMNS]
     if unknown:
         raise click.UsageError(
-            f"LATENTEDGE_TRAIN_EXCLUDE_FEATURES names unknown feature(s) {unknown}; choose from {FEATURE_COLUMNS}."
+            f"LATENTEDGE_TRAIN_EXCLUDE_FEATURES names unknown feature(s) {unknown}; choose from {FEATURE_COLUMNS} or the groups {list(FEATURE_GROUPS)}."
         )
     if len(excluded) >= len(FEATURE_COLUMNS):
         raise click.UsageError("LATENTEDGE_TRAIN_EXCLUDE_FEATURES leaves no features to train on.")

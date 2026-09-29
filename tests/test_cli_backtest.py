@@ -142,7 +142,7 @@ def test_train_records_gross_correlation_and_the_default_setup(tmp_path: Path):
 
     assert {"gross_correlation", "cost_correlation"} <= set(metrics["splits"]["test"])
     assert metrics["label_horizon_seconds"] == 1800
-    assert len(metrics["feature_columns"]) == 7
+    assert metrics["feature_columns"] == FEATURE_COLUMNS
 
 
 def test_excluded_features_are_left_out_of_training_and_the_backtest_follows_the_model(tmp_path: Path):
@@ -157,7 +157,9 @@ def test_excluded_features_are_left_out_of_training_and_the_backtest_follows_the
     )
     assert trained.exit_code == 0, trained.output
     metrics = json.loads(Path(str(model) + ".metrics.json").read_text())
-    assert metrics["feature_columns"] == ["return_5", "return_15", "return_30", "volume_usdc", "bars_since_swap"]
+    assert metrics["feature_columns"] == [
+        c for c in FEATURE_COLUMNS if c not in ("base_fee_gwei", "volatility")
+    ]
 
     # no exclusion in the environment now: the backtest must still use the model's five features
     replayed = runner.invoke(cli, ["backtest", "--swaps", str(swaps), "--model", str(model)])
@@ -280,3 +282,76 @@ def test_the_pipeline_finds_a_planted_direction_signal(tmp_path: Path):
     splits = json.loads(Path(str(model) + ".metrics.json").read_text())["splits"]
     for name in ("validate", "test"):
         assert splits[name]["gross_correlation"] > 0.15, (name, splits[name])
+
+
+def test_feature_groups_can_be_excluded_by_name(tmp_path: Path):
+    swaps = tmp_path / "swaps.parquet"
+    model = tmp_path / "model.safetensors"
+    _write_synthetic_swaps(swaps)
+
+    trained = CliRunner().invoke(
+        cli, ["train", "--swaps", str(swaps), "--out", str(model), "--epochs", "5", "--no-sweep-after-train"],
+        env={"LATENTEDGE_TRAIN_EXCLUDE_FEATURES": "order_flow"},
+    )
+
+    assert trained.exit_code == 0, trained.output
+    columns = json.loads(Path(str(model) + ".metrics.json").read_text())["feature_columns"]
+    assert columns == ["return_5", "return_15", "return_30", "volatility", "volume_usdc", "bars_since_swap", "base_fee_gwei"]
+
+
+def _write_flow_led_swaps(path: Path, n_minutes: int = 8000, seed: int = 9) -> None:
+    """Swaps where the price is a random walk with heavy noise, but who is
+    buying leads it: a regime that flips every two hours tilts both the
+    direction of the trades (buys vs sells) and, slightly, the price. The
+    price alone is too noisy to show the regime; the order flow shows it
+    plainly. Only a model that reads the order flow can find it."""
+    rng = np.random.default_rng(seed)
+    rows = []
+    price, regime, log_index = 3000.0, 0.0, 0
+    for minute in range(n_minutes):
+        if minute % 120 == 0:
+            regime = rng.choice([-1.0, 1.0])
+        for _ in range(4):
+            price *= 1 + regime * 0.0001 + rng.normal(0, 0.0015)
+            buy = rng.random() < 0.5 + 0.4 * regime
+            size = float(abs(rng.normal(5000, 1000)) * 10**6)
+            log_index += 1
+            rows.append(
+                {
+                    "block_number": 1_000 + minute // 12,
+                    "timestamp": 1_700_000_000 + minute * 60,
+                    "tx_hash": f"0x{log_index:064x}",
+                    "log_index": log_index,
+                    "sqrt_price_x96": str(price_to_sqrt_price_x96(1.0 / price, decimals0=6, decimals1=18)),
+                    "tick": 0,
+                    "liquidity": str(10**18),
+                    "amount0": size if buy else -size,
+                    "amount1": 0.0,
+                    "base_fee_wei": 15_000_000_000,
+                }
+            )
+    df = pd.DataFrame(rows)
+    df.to_parquet(path, index=False)
+    write_progress(path, [(int(df["block_number"].min()), int(df["block_number"].max()))])
+
+
+def test_order_flow_finds_a_signal_that_price_alone_cannot(tmp_path: Path):
+    swaps = tmp_path / "swaps.parquet"
+    _write_flow_led_swaps(swaps)
+
+    def gross_correlations(exclude: str) -> dict[str, float]:
+        model = tmp_path / f"model-{exclude}.safetensors"
+        result = CliRunner().invoke(
+            cli, ["train", "--swaps", str(swaps), "--out", str(model), "--epochs", "500", "--no-sweep-after-train"],
+            env={"LATENTEDGE_TRAIN_EXCLUDE_FEATURES": exclude},
+        )
+        assert result.exit_code == 0, result.output
+        splits = json.loads(Path(str(model) + ".metrics.json").read_text())["splits"]
+        return {name: splits[name]["gross_correlation"] for name in ("validate", "test")}
+
+    with_flow = gross_correlations("returns")  # order flow and the rest, no lagged returns
+    price_only = gross_correlations("order_flow")
+
+    for name in ("validate", "test"):
+        assert with_flow[name] > 0.12, (name, with_flow)
+        assert with_flow[name] > price_only[name] + 0.05, (name, with_flow, price_only)

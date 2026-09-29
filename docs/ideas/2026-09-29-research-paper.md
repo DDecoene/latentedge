@@ -177,6 +177,17 @@ roughly 1/30 of the bar count and a correlation must be about 0.03 or more
 before it is distinguishable from zero. "No detectable signal" is the claim,
 not "no information".
 
+Order-flow features (added after the price-only null): per bar, signed dollar
+flow (USDC paid in minus paid out, so net buying of WETH) and the largest
+single swap; per window, `flow_imbalance_{5,15,30}` (net flow over volume,
+-1 to +1) and `large_swap_share_15` (largest swap over the window's volume).
+All use only past bars and are shifted one bar like the other features.
+Validated on synthetic swaps where a regime tilts both trade direction and,
+weakly, the price: with the lagged returns removed, the pipeline still finds
+it (gross correlation 0.18 validate, 0.27 test), and a price-only model finds
+about 0.07 and 0.13. Real-data run pending; the price-only baseline is
+reproduced with `LATENTEDGE_TRAIN_EXCLUDE_FEATURES=order_flow`.
+
 Planned: without gas and volatility at 30 minutes; all features at 240
 minutes with a 6 std band; both together.
 

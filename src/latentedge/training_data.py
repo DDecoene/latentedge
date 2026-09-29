@@ -14,10 +14,20 @@ from typing import NamedTuple
 import numpy as np
 import pandas as pd
 
-from latentedge.features import compute_features, shift_features_for_labeling
+from latentedge.features import ORDER_FLOW_COLUMNS, compute_features, shift_features_for_labeling
 from latentedge.labeling import LabelSettings, label_bars
 
-FEATURE_COLUMNS = ["return_5", "return_15", "return_30", "volatility", "volume_usdc", "bars_since_swap", "base_fee_gwei"]
+PRICE_FEATURE_COLUMNS = [
+    "return_5", "return_15", "return_30", "volatility", "volume_usdc", "bars_since_swap", "base_fee_gwei",
+]
+FEATURE_COLUMNS = [*PRICE_FEATURE_COLUMNS, *ORDER_FLOW_COLUMNS]
+
+# Names an exclusion setting may use for a set of features at once.
+FEATURE_GROUPS = {
+    "order_flow": ORDER_FLOW_COLUMNS,
+    "cost": ["base_fee_gwei", "volatility"],
+    "returns": ["return_5", "return_15", "return_30"],
+}
 
 
 class SplitArrays(NamedTuple):
@@ -54,7 +64,7 @@ def assemble_training_data(
     horizon_seconds: int = LabelSettings().horizon_seconds,
 ) -> pd.DataFrame:
     feature_columns = [f"return_{n}" for n in return_windows] + [
-        "volatility", "volume_usdc", "bars_since_swap", "base_fee_gwei",
+        "volatility", "volume_usdc", "bars_since_swap", "base_fee_gwei", *ORDER_FLOW_COLUMNS,
     ]
 
     # Compute features and labels on the same full, contiguous bar

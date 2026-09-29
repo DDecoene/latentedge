@@ -69,3 +69,20 @@ def test_volume_usdc_is_decimal_adjusted_from_raw_amount0():
     swaps = pd.DataFrame([_swap(0, 3000.0, 11_923.388581)])
     bars = build_bars(swaps, interval_seconds=60)
     assert bars.iloc[0]["volume_usdc"] == pytest.approx(11_923.388581, rel=1e-6)
+
+
+def test_bars_carry_signed_flow_and_the_largest_swap():
+    # a positive amount0 is USDC paid in: a buy of WETH
+    swaps = pd.DataFrame([_swap(0, 3000.0, 300.0), _swap(10, 3000.0, -100.0), _swap(20, 3000.0, -50.0)])
+    bars = build_bars(swaps, interval_seconds=60)
+
+    assert bars.iloc[0]["net_flow_usdc"] == pytest.approx(150.0)
+    assert bars.iloc[0]["volume_usdc"] == pytest.approx(450.0)
+    assert bars.iloc[0]["max_swap_usdc"] == pytest.approx(300.0)
+
+
+def test_a_bar_with_no_swaps_has_no_flow():
+    swaps = pd.DataFrame([_swap(0, 3000.0, 100.0), _swap(150, 3000.0, -100.0)])
+    gap = build_bars(swaps, interval_seconds=60).iloc[1]
+
+    assert gap["net_flow_usdc"] == 0.0 and gap["max_swap_usdc"] == 0.0

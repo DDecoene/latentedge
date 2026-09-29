@@ -4,6 +4,20 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+# Order-flow features: who is pushing the pool, not just where the price is.
+# Price bars keep only the last price and total volume; the signed dollar flow
+# and the biggest single swap are what a price-only model never sees.
+FLOW_WINDOWS = [5, 15, 30]
+LARGE_SWAP_WINDOW = 15
+ORDER_FLOW_COLUMNS = [f"flow_imbalance_{n}" for n in FLOW_WINDOWS] + [f"large_swap_share_{LARGE_SWAP_WINDOW}"]
+
+
+def _safe_ratio(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
+    """numerator / denominator, 0 where nothing traded (no flow, no imbalance)
+    but NaN kept where the window is not yet full."""
+    ratio = numerator / denominator.where(denominator > 0)
+    return ratio.where(~(denominator == 0) | numerator.isna(), 0.0)
+
 
 def compute_features(bars: pd.DataFrame, return_windows: list[int], volatility_window: int) -> pd.DataFrame:
     result = bars.copy()
@@ -14,6 +28,18 @@ def compute_features(bars: pd.DataFrame, return_windows: list[int], volatility_w
 
     one_bar_return = price.pct_change(periods=1)
     result["volatility"] = one_bar_return.rolling(window=volatility_window, min_periods=volatility_window).std()
+
+    if "net_flow_usdc" in result.columns:
+        for n in FLOW_WINDOWS:
+            flow = result["net_flow_usdc"].rolling(window=n, min_periods=n).sum()
+            volume = result["volume_usdc"].rolling(window=n, min_periods=n).sum()
+            # In [-1, 1]: +1 is all buying over the window, -1 all selling.
+            result[f"flow_imbalance_{n}"] = _safe_ratio(flow, volume)
+        biggest = result["max_swap_usdc"].rolling(window=LARGE_SWAP_WINDOW, min_periods=LARGE_SWAP_WINDOW).max()
+        volume = result["volume_usdc"].rolling(window=LARGE_SWAP_WINDOW, min_periods=LARGE_SWAP_WINDOW).sum()
+        # How much of the window's volume one swap accounts for: high when a
+        # single large trader, not many small ones, is moving the pool.
+        result[f"large_swap_share_{LARGE_SWAP_WINDOW}"] = _safe_ratio(biggest, volume)
 
     had_swap = result["swap_count"] > 0
     groups = had_swap.cumsum()
