@@ -120,6 +120,68 @@ overlap (one 30-minute label per 1-minute bar), so the effective sample is
 about 1/30 of the bar count and correlations under roughly 0.03 cannot be
 told apart from zero.
 
+## Results summary (2026-09-29): a null result
+
+Setting: WETH/USDC 0.05% on Ethereum mainnet, about 200 days of swaps
+(blocks 24,642,884 to 26,084,902), 1-minute bars, 30-minute triple-barrier
+labels, chronological 70/15/15 split, test window about 30 days (43k bars).
+Cited runs are in `docs/paper/results/` (see the experiment log below).
+
+Finding: no tradable edge, and the cause is measurable.
+
+1. What the first model appeared to learn was trading cost. Trained on net
+   return, its predictions correlated 0.35 with the test label but +0.01
+   with the pre-cost price move and -0.96 with the cost part of the label.
+   Net return mixes direction and cost, cost is the easier part to predict,
+   so a model can fit the label without knowing anything about direction.
+2. Trained directly on the pre-cost return, the model finds a faint
+   direction signal: gross correlation +0.04 (validate) and +0.03 to +0.04
+   (test), positive on every split. That is about 0.1% to 0.2% of the
+   variance of the move, and inside sampling error (labels overlap, so the
+   effective sample is about 1,400 independent points per window and the
+   standard error is about 0.03).
+3. More information and more capacity did not change it. Adding four
+   order-flow features (signed net buying, largest-swap share) and a
+   64,64 network with early stopping, in place of one 16-unit layer, gave
+   the same gross correlation (+0.04 validate, +0.03 test). Two very
+   different models reading the same inputs agree, which points at the
+   inputs, not the model.
+4. No trading rule made money on either window in any run. The rank rules
+   (trade the model's top share of bars) lose about as much per trade as
+   trading every bar (about -$0.83 on a $1,000 reference trade) and no
+   less than shuffled predictions in the cases that matter; the minimum-edge
+   rule (predicted move above the round-trip cost) takes zero to three
+   trades because no predicted move approaches the cost.
+5. The pipeline can find a signal when one exists. On synthetic swaps with a
+   planted drift it recovers gross correlation 0.82 to 0.85 on unseen data,
+   with order flow alone it finds a signal that price alone barely shows
+   (0.18 to 0.27 against 0.07 to 0.13), and on a pure random walk it finds
+   0.02 to 0.03. The real-data figures sit at the random-walk level.
+
+Why a small correlation cannot be traded here (back of envelope, normal
+predictions): a trade taken at prediction z-score z has expected gross move
+about rho * sigma * z, with rho the correlation and sigma the spread of the
+move (0.17% on the test window). Round-trip cost is about 0.13% (roughly
+0.10% pool fees, the rest gas and slippage), so a trade needs rho * z of
+about 0.76. Selecting only the top 1% of predictions (mean z about 2.7)
+still needs rho of about 0.29, against 0.04 observed. Even perfect foresight
+of every trade returned only +15.5% to +19% over a window (oracle rows),
+because typical moves are small against the cost.
+
+Reading: the result matches market efficiency for a liquid, heavily
+arbitraged pool and public inputs. Easy patterns in what every participant
+sees are traded away. What the experiments add is the decomposition: the
+apparent skill under a net target was cost prediction, the direction signal
+under a gross target is small and not distinguishable from noise, and neither
+order flow nor model size moves it.
+
+Not tested, so not claimed: horizons beyond 30 minutes (the arithmetic above
+says a 4-hour horizon needs rho of about 0.27 at z of 1 and still far above
+0.04 for a rank rule), other pools, other bar sizes, other model families
+than a small feed-forward network, walk-forward evaluation, several seeds,
+data outside these 200 days, and information not in the swap logs (other
+venues, mempool).
+
 ## Experiments the paper needs
 
 Done (2026-09-29):
@@ -128,31 +190,34 @@ Done (2026-09-29):
 2. Always-trade baseline and oracle ceiling, through the same backtest.
 3. Rank rule (top share of bars by predicted return, cutoff set on the
    validation window), which works even when no prediction is above zero.
-4. More data: 200 days ingested. Not yet reported as a function of history
-   length.
-
-5. Gross-return check (done, see above): pre-cost label, and the
-   correlation of predictions with gross return and with cost, in training
-   metrics and in every sweep.
-6. Shuffled-predictions control in the sweep (done, see above).
+4. More data: about 200 days ingested. Not yet reported as a function of
+   history length.
+5. Gross-return check: pre-cost label, and the correlation of predictions
+   with gross return and with cost, in training metrics and in every sweep.
+6. Shuffled-predictions control in the sweep.
+7. Gross (pre-cost) training target, in place of net.
+8. Order-flow features (signed flow imbalance, largest-swap share), tested
+   against the price-only model.
+9. Larger network (64,64) with early stopping, tested against the 16-unit
+   model.
+10. Planted-signal validation of the pipeline on synthetic data (linear
+    drift, order-flow-led drift, combined pattern, pure random walk).
 
 Still needed:
 
-1. Retrain without gas price and volatility (`LATENTEDGE_TRAIN_EXCLUDE_FEATURES`)
-   to remove the cost signal and see whether any direction is left.
-2. Longer label horizon (hours; `LATENTEDGE_LABEL_HORIZON_MINUTES`), so a
-   fixed cost is small against the move. The take-profit/stop-loss band must
-   widen with it (`LATENTEDGE_LABEL_BARRIER_STDS`), since the current 2
-   standard deviations of a 1-minute return is hit within minutes.
-4. Richer inputs: order-flow imbalance and swap direction, and a non-linear
-   model, tested against the same baselines.
-5. Robustness: several seeds, more than one horizon, a walk-forward variant
+1. Longer label horizon (hours; `LATENTEDGE_LABEL_HORIZON_MINUTES`, with the
+   band widened through `LATENTEDGE_LABEL_BARRIER_STDS`). The arithmetic in
+   the results summary says it is unlikely to change the conclusion; run it
+   so the claim is measured, not argued.
+2. Retrain without gas price and volatility. With the gross target this is a
+   control, not a route to an edge.
+3. Robustness: several seeds, more than one horizon, a walk-forward variant
    instead of one split, results as a function of history length.
-6. Later: a second, less liquid pool, and cross-market transfer (v2).
+4. A second, less liquid pool, and cross-market transfer (v2).
 
-Sweep records live under `data/sweeps/` (gitignored). Copy the ones the paper
-cites into a versioned place before drafting, with the model hash and git
-state each file already records.
+Sweep records live under `data/sweeps/` (gitignored). The ones the paper cites
+are copied to `docs/paper/results/sweeps/`, with a README describing each; the
+files carry the model hash and git state of the run.
 
 ## Experiment log
 
@@ -166,6 +231,7 @@ label settings and the feature set with it.
 | 20260929T175549Z | all 7 | 30 min, 2 std | +0.01 | -0.96 | no edge; model predicts cost |
 | 20260929T183041Z | all 7 + 4 order flow | 30 min, 2 std | +0.01 | -0.96 | no edge; order flow added nothing measurable (validate gross corr +0.03) |
 | 20260929T184128Z | all 7 + 4 order flow, trained on gross | 30 min, 2 std | +0.04 validate, +0.04 test | +0.10, +0.12 | no edge; first positive direction correlation on all splits but tiny (about 0.2% of variance), inside sampling error, and every rule loses |
+| 20260929T185051Z | as above, 64,64 network, early stopping | 30 min, 2 std | +0.04 validate, +0.03 test | +0.04, +0.02 | no edge; a bigger network changes nothing (same gross correlation as the 16-unit model), so capacity was not the limit; every rule loses |
 
 Pipeline validation (synthetic data, `tests/test_cli_backtest.py`): on swaps
 whose price follows a hidden drift that flips sign every two hours, the same
@@ -205,8 +271,8 @@ stopping the sizes 16, 64,64 and 128,64 all reach about 0.21 on validate. The
 early-stopping point uses the validate window, so validate results are
 slightly optimistic and the test window is the judge.
 
-Planned: without gas and volatility at 30 minutes; all features at 240
-minutes with a 6 std band; both together.
+Planned: all features at 240 minutes with a 6 std band; without gas and
+volatility at 30 minutes (a control under the gross target).
 
 ## Sections
 
