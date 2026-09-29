@@ -950,3 +950,66 @@ async def test_ingest_screen_shows_a_fixed_rate_label(tmp_path: Path):
 
     assert "8.6 req/s (fixed)" in stats_text
     assert "8.6/8.6" not in stats_text
+
+
+def _gated_screen(tmp_path: Path, release_fetch: threading.Event, **kwargs) -> IngestScreen:
+    def gated_fetch(pool_address, from_block, to_block, client, rpc_url, **fetch_kwargs):
+        release_fetch.wait()
+        return [_record(from_block)]
+
+    return IngestScreen(
+        pool_address="0xpool", from_block=0, to_block=9, out_path=tmp_path / "swaps.parquet",
+        client_factory=lambda: httpx.Client(), rpc_url="http://fake",
+        chunk_size=10, max_workers=1, flush_every_n_chunks=1,
+        max_retries=1, retry_backoff_seconds=0.001, fetch_fn=gated_fetch,
+        train_assemble_fn=_placeholder_assemble, **kwargs,
+    )
+
+
+@pytest.mark.asyncio
+async def test_arrow_keys_tune_a_fixed_rate_and_update_the_env_file(tmp_path: Path):
+    env_path = tmp_path / ".env"
+    env_path.write_text("LATENTEDGE_INGEST_FIXED_RPS=6.5\n")
+    release_fetch = threading.Event()
+    screen = _gated_screen(tmp_path, release_fetch, fixed_rps=6.5, env_path=env_path)
+    app = LatentEdgeApp(start_screen=screen)
+
+    try:
+        async with app.run_test() as pilot:
+            for _ in range(50):
+                await pilot.pause(0.01)
+                if screen._rate_limiter is not None:
+                    break
+            await pilot.press("up", "up", "down")
+            await pilot.pause()
+            stats_text = str(app.screen.query_one("#ingest-stats-body").content)
+            limiter_rate = screen._rate_limiter.rate
+    finally:
+        release_fetch.set()
+
+    assert limiter_rate == 6.6
+    assert "6.6 req/s (fixed)" in stats_text
+    assert env_path.read_text() == "LATENTEDGE_INGEST_FIXED_RPS=6.6\n"
+
+
+@pytest.mark.asyncio
+async def test_arrow_keys_do_nothing_when_the_rate_is_auto_throttled(tmp_path: Path):
+    env_path = tmp_path / ".env"
+    release_fetch = threading.Event()
+    screen = _gated_screen(tmp_path, release_fetch, max_rps=5.0, env_path=env_path)
+    app = LatentEdgeApp(start_screen=screen)
+
+    try:
+        async with app.run_test() as pilot:
+            for _ in range(50):
+                await pilot.pause(0.01)
+                if screen._rate_limiter is not None:
+                    break
+            await pilot.press("up", "down")
+            await pilot.pause()
+            limiter_rate = screen._rate_limiter.rate
+    finally:
+        release_fetch.set()
+
+    assert limiter_rate == 5.0
+    assert not env_path.exists()

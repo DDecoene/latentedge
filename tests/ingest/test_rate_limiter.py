@@ -377,6 +377,23 @@ def test_fixed_limiter_holds_its_rate_through_throttles_and_successes():
     assert ceilings == []
 
 
+def test_fixed_limiter_can_be_retuned_by_hand_without_float_drift():
+    changes: list[float] = []
+    limiter = RateLimiter(ceiling=6.5, fixed=True, on_change=changes.append)
+    for _ in range(3):
+        limiter.set_fixed_rate(limiter.rate + 0.1)
+    assert limiter.rate == 6.8
+    assert limiter.ceiling == 6.8
+    assert limiter.set_fixed_rate(0.01) == 0.5  # clamped to the floor
+    assert changes == []  # the caller retuned it, so no callback
+
+
+def test_auto_limiter_refuses_a_manual_retune():
+    limiter = RateLimiter(ceiling=6.5)
+    with pytest.raises(RuntimeError):
+        limiter.set_fixed_rate(7.0)
+
+
 def test_fixed_limiter_still_cools_down_after_a_rate_limit():
     limiter = RateLimiter(ceiling=8.6, fixed=True, cooldown_seconds=0.3)
     limiter.acquire()

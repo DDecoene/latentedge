@@ -189,6 +189,7 @@ def ingest_range(
     on_worker_status: Callable[[int, int, int, str], None] | None = None,
     on_rate_change: Callable[[float], None] | None = None,
     on_ceiling_change: Callable[[float], None] | None = None,
+    on_rate_limiter: Callable[[RateLimiter], None] | None = None,
     fetch_fn: FetchFn = fetch_swaps,
     cancel_event: threading.Event | None = None,
 ) -> int:
@@ -273,6 +274,8 @@ def ingest_range(
         on_ceiling_change=on_ceiling_change,
         fixed=fixed_rps is not None,
     )
+    if on_rate_limiter is not None:
+        on_rate_limiter(rate_limiter)
     # A resumed run can start below its ceiling (the floor-clamped
     # persisted rate above), or with a ceiling already raised past
     # max_rps — without this, a caller (e.g. the TUI) has no way to know

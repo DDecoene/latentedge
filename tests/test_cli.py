@@ -662,3 +662,63 @@ def test_ingest_rejects_an_unrecognized_auto_throttle_value(monkeypatch: pytest.
     )
     assert result.exit_code != 0
     assert "LATENTEDGE_INGEST_AUTO_THROTTLE" in result.output
+
+
+def test_ingest_start_block_lookup_retries_through_rate_limits_instead_of_aborting(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    # Regression test: only the chain-head lookup used to retry; a single
+    # 429 during the start-block binary search aborted the whole start
+    # (seen for real against Alchemy right after a previous run). A rate
+    # limit must retry until it clears, even past --max-retries.
+    from latentedge.ingest.rpc_logs import RateLimitError
+
+    monkeypatch.setattr("latentedge.cli.get_latest_block", lambda client, rpc_url: 20_000_000)
+    monkeypatch.setattr("latentedge.cli.time.sleep", lambda seconds: None)
+
+    calls = {"count": 0}
+
+    def flaky_anchor(client, rpc_url, target_timestamp, floor_block, head_block):
+        calls["count"] += 1
+        if calls["count"] <= 4:  # more failures than --max-retries
+            raise RateLimitError("429")
+        return 19_000_000
+
+    monkeypatch.setattr("latentedge.cli.get_block_at_or_after_timestamp", flaky_anchor)
+
+    captured: dict[str, int] = {}
+
+    def fake_ingest_range(pool_address, from_block, to_block, out, client, rpc_url, **kwargs):
+        captured["from_block"] = from_block
+        return 0
+
+    monkeypatch.setattr("latentedge.cli.ingest_range", fake_ingest_range)
+
+    result = CliRunner().invoke(
+        cli, ["ingest", "--days", "1", "--out", str(tmp_path / "swaps.parquet"), "--max-retries", "2"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls["count"] == 5
+    assert captured["from_block"] == 19_000_000
+
+
+def test_ingest_start_block_lookup_still_gives_up_on_a_non_rate_limit_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    import httpx as httpx_module
+
+    monkeypatch.setattr("latentedge.cli.get_latest_block", lambda client, rpc_url: 20_000_000)
+    monkeypatch.setattr("latentedge.cli.time.sleep", lambda seconds: None)
+
+    def unreachable(client, rpc_url, target_timestamp, floor_block, head_block):
+        raise httpx_module.ConnectError("no route")
+
+    monkeypatch.setattr("latentedge.cli.get_block_at_or_after_timestamp", unreachable)
+
+    result = CliRunner().invoke(
+        cli, ["ingest", "--days", "1", "--out", str(tmp_path / "swaps.parquet"), "--max-retries", "2"],
+    )
+
+    assert result.exit_code != 0
+    assert "internet connection" in result.output

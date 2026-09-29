@@ -138,6 +138,21 @@ class RateLimiter:
         with self._cond:
             return self._ceiling
 
+    def set_fixed_rate(self, rate: float) -> float:
+        """Manually retune a fixed-mode limiter mid-run. Returns the rate
+        actually applied (clamped to DEFAULT_MIN_RPS and rounded to 0.1,
+        so repeated +/-0.1 steps never accumulate float drift). Does not
+        fire on_change: the caller is the one retuning it and already
+        knows, and on_change callbacks may assume a worker thread."""
+        if not self._fixed:
+            raise RuntimeError("set_fixed_rate only applies to a fixed-rate limiter")
+        applied = max(DEFAULT_MIN_RPS, round(rate, 1))
+        with self._cond:
+            self._rate = applied
+            self._ceiling = applied
+            self._cond.notify_all()
+        return applied
+
     def acquire(self, cancel_event: threading.Event | None = None) -> None:
         """Block until this call's scheduled slot arrives and any
         post-rate-limit cooldown has elapsed, then claim the next slot.

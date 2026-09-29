@@ -59,31 +59,40 @@ def cli() -> None:
 DEFAULT_RPC_URL = "https://ethereum.publicnode.com"
 
 
-def _get_latest_block_with_retries(
-    client: httpx.Client, rpc_url: str, max_retries: int, backoff_seconds: float,
+def _startup_call_with_retries(
+    step: str,
+    call: Callable[[], int],
+    rpc_url: str,
+    max_retries: int,
+    backoff_seconds: float,
+    max_rate_limit_backoff_seconds: float,
 ) -> int:
-    """Same retry-with-backoff behavior as every chunk fetch in
-    ingest_range — a single transient network hiccup at startup must not
-    kill the whole run before it even begins.
+    """Same retry behavior as every chunk fetch in ingest_range — a
+    single transient hiccup while resolving the block range must not kill
+    the whole run before it even begins. A rate limit is expected,
+    temporary provider behavior (especially right after a previous run),
+    so it retries until it clears with a capped backoff; any other error
+    gives up after max_retries.
     """
-    last_error: Exception | None = None
-    for attempt in range(max_retries):
+    attempt = 0
+    while True:
         try:
-            return get_latest_block(client, rpc_url)
+            return call()
         except (httpx.HTTPError, RpcLogsError) as exc:
-            last_error = exc
-            if attempt < max_retries - 1:
-                sleep_seconds = backoff_seconds * (2**attempt)
-                if isinstance(exc, RateLimitError):
-                    sleep_seconds *= RATE_LIMIT_BACKOFF_MULTIPLIER
-                click.echo(
-                    f"  chain head lookup failed ({describe_error(rpc_url, exc)}) — "
-                    f"retry {attempt + 1}/{max_retries}, waiting {sleep_seconds:.1f}s",
-                    err=True,
-                )
-                time.sleep(sleep_seconds)
-    assert last_error is not None
-    raise last_error
+            attempt += 1
+            rate_limited = isinstance(exc, RateLimitError)
+            if not rate_limited and attempt >= max_retries:
+                raise
+            sleep_seconds = backoff_seconds * (2 ** (attempt - 1))
+            if rate_limited:
+                sleep_seconds = min(sleep_seconds * RATE_LIMIT_BACKOFF_MULTIPLIER, max_rate_limit_backoff_seconds)
+            of = "" if rate_limited else f"/{max_retries}"
+            click.echo(
+                f"  {step} failed ({describe_error(rpc_url, exc)}) — "
+                f"retry {attempt}{of}, waiting {sleep_seconds:.1f}s",
+                err=True,
+            )
+            time.sleep(sleep_seconds)
 
 
 @cli.command()
@@ -188,7 +197,12 @@ def ingest(
         target_timestamp = int(time.time() - days * 86400)
         with httpx.Client(timeout=30.0) as client:
             try:
-                head = _get_latest_block_with_retries(client, rpc_url, max_retries, retry_backoff_seconds)
+                def with_retries(step: str, call: Callable[[], int]) -> int:
+                    return _startup_call_with_retries(
+                        step, call, rpc_url, max_retries, retry_backoff_seconds, max_rate_limit_backoff_seconds,
+                    )
+
+                head = with_retries("chain head lookup", lambda: get_latest_block(client, rpc_url))
                 # An exact, on-chain-verified anchor for the window's
                 # start — never an estimate from a constant average
                 # block time, which drifts from the chain's real block
@@ -197,8 +211,11 @@ def ingest(
                 # [from_block, to_block] (including any already-known
                 # internal gap) are queued and filled below exactly as
                 # for an explicit --from-block/--to-block range.
-                from_block = get_block_at_or_after_timestamp(
-                    client, rpc_url, target_timestamp, config.POOL_CREATION_BLOCK, head,
+                from_block = with_retries(
+                    "start-block lookup",
+                    lambda: get_block_at_or_after_timestamp(
+                        client, rpc_url, target_timestamp, config.POOL_CREATION_BLOCK, head,
+                    ),
                 )
             except (httpx.HTTPError, RpcLogsError) as exc:
                 raise click.ClickException(describe_error(rpc_url, exc)) from None
@@ -222,6 +239,7 @@ def ingest(
             max_rate_limit_backoff_seconds=max_rate_limit_backoff_seconds, ingest_fn=ingest_range,
             train_assemble_fn=_assemble_train_data,
             model_out_path=train_out, train_epochs=train_epochs, train_after_ingest=train_after_ingest,
+            env_path=Path.cwd() / ".env",
         )
         LatentEdgeApp(start_screen=screen).run()
         if screen.error is not None:

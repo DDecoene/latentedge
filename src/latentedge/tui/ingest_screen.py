@@ -22,7 +22,9 @@ from latentedge.ingest.chunked import (
     IngestCancelled,
 )
 from latentedge.ingest.chunked import ingest_range as default_ingest_range
+from latentedge.env_file import update_env_value
 from latentedge.ingest.progress import read_progress, uncovered_gaps
+from latentedge.ingest.rate_limiter import RateLimiter
 from latentedge.ingest.rpc_logs import describe_error, fetch_swaps
 from latentedge.tui.train_screen import DEFAULT_MODEL_OUT_PATH, TrainAssembleFn, TrainScreen
 from latentedge.tui.widgets import LogPanel, ProgressPanel, StatsPanel, ThreadPanel
@@ -48,6 +50,8 @@ class IngestScreen(Screen[None]):
     BINDINGS = [
         Binding("t", "train_now", "Train now", show=False),
         Binding("q", "exit_now", "Exit", show=False),
+        Binding("up", "rate_up", "Rate +0.1", show=False, priority=True),
+        Binding("down", "rate_down", "Rate -0.1", show=False, priority=True),
     ]
     CSS = """
     #ingest-top-row { height: auto; }
@@ -79,6 +83,7 @@ class IngestScreen(Screen[None]):
         ingest_fn: Callable[..., int] = default_ingest_range,
         fetch_fn: FetchFn = fetch_swaps,
         time_fn: Callable[[], float] = time.monotonic,
+        env_path: Path | None = None,
     ) -> None:
         super().__init__()
         self.pool_address = pool_address
@@ -108,6 +113,10 @@ class IngestScreen(Screen[None]):
         self.ingest_fn = ingest_fn
         self.fetch_fn = fetch_fn
         self.time_fn = time_fn
+        # Where a manually tuned fixed rate is written back, so the next
+        # launch starts from it; None (tests) skips persisting.
+        self.env_path = env_path
+        self._rate_limiter: RateLimiter | None = None
 
         self.is_complete = False
         self.total_written: int | None = None
@@ -239,6 +248,9 @@ class IngestScreen(Screen[None]):
         def on_ceiling_change(new_ceiling: float) -> None:
             self.app.call_from_thread(self._handle_ceiling_change, new_ceiling)
 
+        def on_rate_limiter(limiter: RateLimiter) -> None:
+            self._rate_limiter = limiter
+
         try:
             with self.client_factory() as client:
                 total = self.ingest_fn(
@@ -253,6 +265,7 @@ class IngestScreen(Screen[None]):
                     on_progress=on_progress, on_retry=on_retry,
                     on_queue_status=on_queue_status, on_worker_status=on_worker_status,
                     on_rate_change=on_rate_change, on_ceiling_change=on_ceiling_change,
+                    on_rate_limiter=on_rate_limiter,
                     fetch_fn=self.fetch_fn,
                     cancel_event=self._cancel_event,
                 )
@@ -342,7 +355,7 @@ class IngestScreen(Screen[None]):
         )
         retries = f"[yellow]{self.retry_count}[/yellow]" if self.retry_count > 0 else "0"
         if self.fixed_rps is not None:
-            rate = f"{self.fixed_rps:.1f} req/s (fixed)"
+            rate = f"{self._rate_limit:.1f} req/s (fixed) [dim]↑/↓ = ±0.1[/dim]"
         else:
             rate = (
                 f"[yellow]{self._rate_limit:.1f}/{self._rate_ceiling:.1f} req/s[/yellow]"
@@ -441,6 +454,28 @@ class IngestScreen(Screen[None]):
             swaps_path=self.out_path, out_path=self.model_out_path, epochs=self.train_epochs,
             assemble_fn=self.train_assemble_fn,
         ))
+
+    def action_rate_up(self) -> None:
+        self._nudge_fixed_rate(+0.1)
+
+    def action_rate_down(self) -> None:
+        self._nudge_fixed_rate(-0.1)
+
+    def _nudge_fixed_rate(self, delta: float) -> None:
+        """Manual fine-tuning, fixed-rate mode only: the auto-throttle
+        owns the rate otherwise."""
+        limiter = self._rate_limiter
+        if self.fixed_rps is None or limiter is None or self.is_complete:
+            return
+        applied = limiter.set_fixed_rate(limiter.rate + delta)
+        self._rate_limit = self._rate_ceiling = applied
+        self._log(f"fixed rate set to {applied:.1f} req/s")
+        if self.env_path is not None:
+            try:
+                update_env_value(self.env_path, "LATENTEDGE_INGEST_FIXED_RPS", f"{applied:.1f}")
+            except OSError as exc:
+                self._log(f"could not update {self.env_path}: {exc}")
+        self._refresh_disk_stats()
 
     def action_train_now(self) -> None:
         if not self.is_complete:
