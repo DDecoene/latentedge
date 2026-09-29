@@ -111,6 +111,12 @@ def unstandardize_value(values: np.ndarray, stats: tuple[float, float]) -> np.nd
     return values * std + mean
 
 
+def target_stats(stats: dict[str, tuple[float, float]]) -> tuple[float, float]:
+    """(mean, std) of whatever the model was trained to predict: the "target"
+    entry, or net_return for stats saved before the target was selectable."""
+    return stats["target"] if "target" in stats else stats["net_return"]
+
+
 def save_feature_stats(stats: dict[str, tuple[float, float]], path: Path) -> None:
     path.write_text(json.dumps(stats))
 

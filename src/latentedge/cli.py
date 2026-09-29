@@ -15,7 +15,9 @@ from dotenv import load_dotenv
 from latentedge import config
 from latentedge.backtest import BacktestObserver, build_backtest_inputs, daily_sharpe, run_backtest
 from latentedge.bars import build_bars
-from latentedge.features import compute_feature_stats, save_feature_stats, standardize_features, standardize_value
+from latentedge.features import (
+    compute_feature_stats, save_feature_stats, standardize_features, standardize_value, target_stats,
+)
 from latentedge.labeling import LabelSettings
 from latentedge.metrics import (
     TrainingMetrics, build_training_metrics, load_training_metrics, prediction_correlations, save_training_metrics,
@@ -214,6 +216,7 @@ def ingest(
     # A bad training setting should fail now, not after hours of ingesting.
     _label_settings_from_env()
     _excluded_features_from_env()
+    _train_target_from_env()
 
     max_rps = float(os.environ.get("LATENTEDGE_INGEST_MAX_RPS", DEFAULT_MAX_RPS))
     fixed_rps = _resolve_fixed_rps()
@@ -389,6 +392,19 @@ def _excluded_features_from_env() -> list[str]:
     return excluded
 
 
+def _train_target_from_env() -> str:
+    """LATENTEDGE_TRAIN_TARGET: "gross" (default) trains the model on the
+    price move before any cost, "net" on the return after fees, slippage and
+    gas. Net is dominated by what a trade costs, which is easy to predict, so
+    a net-trained model can look skilled while knowing nothing about
+    direction; gross asks the direction question head on and leaves costs to
+    the trading rule (the sweep's minimum edge)."""
+    target = os.environ.get("LATENTEDGE_TRAIN_TARGET", "gross").strip().lower()
+    if target not in ("gross", "net"):
+        raise click.UsageError(f"LATENTEDGE_TRAIN_TARGET must be gross or net, got {target!r}.")
+    return target
+
+
 def _model_setup(metrics: TrainingMetrics) -> tuple[list[str], LabelSettings]:
     """The feature columns and label settings a model was trained with (the
     original seven features and 30-minute labels for a model whose metrics
@@ -442,6 +458,8 @@ def _assemble_train_data(
     settings = _label_settings_from_env()
     excluded = _excluded_features_from_env()
     feature_columns = [name for name in FEATURE_COLUMNS if name not in excluded]
+    target = _train_target_from_env()
+    target_column = "gross_return" if target == "gross" else "net_return"
 
     assembled, _ = _prepare_labeled_bars(swaps_path, report, settings)
     report("splitting and standardizing")
@@ -458,13 +476,19 @@ def _assemble_train_data(
     # FEATURE_COLUMNS get standardized into x), so callers that want a
     # standardized training target must apply these net_return stats
     # themselves via features.standardize_value/unstandardize_value.
-    stats = compute_feature_stats(train_split, [*feature_columns, "net_return"])
+    stats = compute_feature_stats(train_split, [*feature_columns, "net_return", target_column])
+    # What the model is trained on, for standardizing it and mapping its
+    # output back (see features.target_stats).
+    stats["target"] = stats[target_column]
 
     def to_arrays(split: pd.DataFrame) -> SplitArrays:
         standardized = standardize_features(split, feature_columns, stats)
         x = standardized[feature_columns].to_numpy(dtype="float32")
-        y = standardized["net_return"].to_numpy(dtype="float32")
-        return SplitArrays(x=x, y=y, gross=split["gross_return"].to_numpy(dtype="float64"))
+        y = standardized[target_column].to_numpy(dtype="float32")
+        return SplitArrays(
+            x=x, y=y, gross=split["gross_return"].to_numpy(dtype="float64"),
+            net=split["net_return"].to_numpy(dtype="float64"),
+        )
 
     return AssembledTrainingData(
         train=to_arrays(train_split),
@@ -475,6 +499,7 @@ def _assemble_train_data(
         test_start=int(test_split["bar_start"].iloc[0]),
         feature_columns=tuple(feature_columns),
         label_settings=settings,
+        target=target,
     )
 
 
@@ -490,7 +515,7 @@ def _run_train_direct(swaps: Path, out: Path, epochs: int) -> None:
     # for Adam to make real progress in a practical number of epochs —
     # train on the standardized target and let build_training_metrics
     # unstandardize predictions back for reporting.
-    y_train = standardize_value(assembled.train.y, assembled.stats["net_return"])
+    y_train = standardize_value(assembled.train.y, target_stats(assembled.stats))
     losses = train_model(regressor, assembled.train.x, y_train, epochs=epochs, learning_rate=0.001)
     save(regressor, out)
     save_feature_stats(assembled.stats, Path(str(out) + ".stats.json"))
@@ -526,6 +551,7 @@ def _run_train_direct(swaps: Path, out: Path, epochs: int) -> None:
 def train(swaps: Path, out: Path, epochs: int, backtest_after_train: bool, sweep_after_train: bool) -> None:
     _label_settings_from_env()
     _excluded_features_from_env()
+    _train_target_from_env()
     if sys.stdout.isatty():
         out.parent.mkdir(parents=True, exist_ok=True)
         screen = TrainScreen(
@@ -770,8 +796,6 @@ def _run_sweep_direct(swaps: Path, model: Path) -> None:
     """Sweeps without the TUI — the non-tty chained (--sweep-after-train) runs."""
     result = _chained_sweep_fn(swaps, model)(sweeping.SweepObserver())
     click.echo(sweeping.describe_sweep(result))
-    click.echo(sweeping.describe_findings(result))
-    click.echo(sweeping.describe_findings(result))
 
 
 def _compute_sweep(
@@ -854,10 +878,8 @@ def _compute_sweep(
         "prediction_diagnostics": diagnostics,
         "training_metrics": metrics,
     }
-    findings = sweeping.build_findings(rows, diagnostics)
-    meta["findings"] = findings
     path = sweeping.write_sweep(out_dir, meta, rows)
-    return {"path": str(path), "scenarios": rows, "selection": sweeping.select_on_validate(rows), "findings": findings}
+    return {"path": str(path), "scenarios": rows, "selection": sweeping.select_on_validate(rows)}
 
 
 @cli.command()

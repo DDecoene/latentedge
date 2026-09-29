@@ -10,7 +10,7 @@ from typing import NotRequired, TypedDict
 import mlx.core as mx
 import numpy as np
 
-from latentedge.features import unstandardize_value
+from latentedge.features import target_stats, unstandardize_value
 from latentedge.model import NetReturnRegressor
 from latentedge.training_data import AssembledTrainingData, SplitArrays
 
@@ -21,6 +21,7 @@ class SplitMetrics(TypedDict):
     baseline_mse: float
     correlation: float
     # Only when the pre-cost return is known; see prediction_correlations.
+    net_correlation: NotRequired[float]
     gross_correlation: NotRequired[float]
     cost_correlation: NotRequired[float]
     gross_std: NotRequired[float]
@@ -34,6 +35,7 @@ class TrainingMetrics(TypedDict):
     splits: dict[str, SplitMetrics]
     test_start: NotRequired[int]
     feature_columns: NotRequired[list[str]]
+    target: NotRequired[str]
     label_horizon_seconds: NotRequired[int]
     label_barrier_stds: NotRequired[float]
 
@@ -62,7 +64,8 @@ def prediction_correlations(predictions: np.ndarray, net: np.ndarray, gross: np.
 
 
 def evaluate_predictions(
-    predictions: np.ndarray, targets: np.ndarray, baseline_prediction: float, gross: np.ndarray | None = None
+    predictions: np.ndarray, targets: np.ndarray, baseline_prediction: float, gross: np.ndarray | None = None,
+    net: np.ndarray | None = None,
 ) -> SplitMetrics:
     """MSE against a trivial "always predict this constant" baseline, plus
     correlation — a model with MSE worse than the baseline, or near-zero
@@ -76,23 +79,25 @@ def evaluate_predictions(
         "correlation": _correlation(predictions, targets),
     }
     if gross is not None:
-        result.update(prediction_correlations(predictions, targets, gross))  # type: ignore[typeddict-item]
+        actual_net = net if net is not None else targets
+        result["net_correlation"] = _correlation(predictions, actual_net)
+        result.update(prediction_correlations(predictions, actual_net, gross))  # type: ignore[typeddict-item]
     return result
 
 
 def evaluate_model(model: NetReturnRegressor, assembled: AssembledTrainingData) -> dict[str, SplitMetrics]:
-    # The model was trained to predict net_return on its standardized
-    # scale (see cli.train / TrainScreen._run_train) — unstandardize its
-    # raw output back to real net_return units before comparing against
-    # SplitArrays.y, which is always on the raw scale, so MSE here reads
-    # in the same units as the trade returns it's meant to predict.
-    target_stats = assembled.stats["net_return"]
+    # The model was trained to predict its target (net or gross return) on
+    # a standardized scale (see cli.train / TrainScreen._run_train) —
+    # unstandardize its raw output back to real return units before
+    # comparing against SplitArrays.y, which is always on the raw scale, so
+    # MSE here reads in the same units as the returns it's meant to predict.
+    stats_for_target = target_stats(assembled.stats)
     baseline_prediction = float(np.mean(assembled.train.y))
     splits: dict[str, SplitArrays] = {"train": assembled.train, "validate": assembled.validate, "test": assembled.test}
     return {
         name: evaluate_predictions(
-            unstandardize_value(np.array(model(mx.array(split.x))), target_stats), split.y, baseline_prediction,
-            gross=split.gross,
+            unstandardize_value(np.array(model(mx.array(split.x))), stats_for_target), split.y, baseline_prediction,
+            gross=split.gross, net=split.net,
         )
         for name, split in splits.items()
     }
@@ -109,6 +114,7 @@ def build_training_metrics(
     }
     if assembled.test_start is not None:
         metrics["test_start"] = assembled.test_start
+    metrics["target"] = assembled.target
     metrics["feature_columns"] = list(assembled.feature_columns)
     metrics["label_horizon_seconds"] = assembled.label_settings.horizon_seconds
     metrics["label_barrier_stds"] = assembled.label_settings.barrier_stds

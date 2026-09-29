@@ -36,6 +36,8 @@ class SplitArrays(NamedTuple):
     # Raw (unstandardized) pre-cost return of each row's round trip, for
     # checking whether predictions track direction or only trading cost.
     gross: np.ndarray | None = None
+    # Raw net return of each row. Equals y when the model is trained on it.
+    net: np.ndarray | None = None
 
 
 class AssembledTrainingData(NamedTuple):
@@ -52,6 +54,9 @@ class AssembledTrainingData(NamedTuple):
     # with the model so a later backtest reproduces both.
     feature_columns: tuple[str, ...] = tuple(FEATURE_COLUMNS)
     label_settings: LabelSettings = LabelSettings()
+    # What the model is trained to predict: "gross" (the price move before any
+    # cost) or "net" (after fees, slippage and gas). y holds that quantity.
+    target: str = "net"
 
 
 def assemble_training_data(

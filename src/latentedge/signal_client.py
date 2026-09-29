@@ -2,7 +2,7 @@ from pathlib import Path
 
 import numpy as np
 
-from latentedge.features import load_feature_stats, stats_to_arrays, unstandardize_value
+from latentedge.features import load_feature_stats, stats_to_arrays, target_stats, unstandardize_value
 from latentedge.model import load
 
 
@@ -22,11 +22,12 @@ class SignalClient:
             if stats_path.exists():
                 stats = load_feature_stats(stats_path)
                 self._means, self._stds = stats_to_arrays(stats, feature_columns)
-                # The model is trained on a standardized net_return, so its
-                # raw output is in standard deviations, not return units.
-                # Consumers (the guard's sign test and sizing) need real
-                # net returns, so map the output back here, once.
-                self._target_stats = stats.get("net_return")
+                # The model is trained on a standardized return (gross or
+                # net), so its raw output is in standard deviations, not
+                # return units. Consumers (the guard's sign test and
+                # sizing) need real returns, so map the output back here,
+                # once.
+                self._target_stats = target_stats(stats) if ("target" in stats or "net_return" in stats) else None
 
     def predict_batch(self, features: np.ndarray) -> np.ndarray:
         if not np.isfinite(features).all():

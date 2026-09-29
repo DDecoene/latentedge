@@ -355,3 +355,78 @@ def test_order_flow_finds_a_signal_that_price_alone_cannot(tmp_path: Path):
     for name in ("validate", "test"):
         assert with_flow[name] > 0.12, (name, with_flow)
         assert with_flow[name] > price_only[name] + 0.05, (name, with_flow, price_only)
+
+
+def _write_costly_gas_swaps(path: Path, n_minutes: int = 8000, seed: int = 21) -> None:
+    """A pure random walk (no direction to find) whose gas price swings a lot
+    from one half hour to the next, so what a trade costs is very predictable."""
+    rng = np.random.default_rng(seed)
+    rows = []
+    price, gas_gwei, log_index = 3000.0, 20.0, 0
+    for minute in range(n_minutes):
+        if minute % 30 == 0:
+            gas_gwei = float(rng.uniform(5, 200))
+        price *= 1 + rng.normal(0, 0.0012)
+        log_index += 1
+        rows.append(
+            {
+                "block_number": 1_000 + minute // 12,
+                "timestamp": 1_700_000_000 + minute * 60,
+                "tx_hash": f"0x{log_index:064x}",
+                "log_index": log_index,
+                "sqrt_price_x96": str(price_to_sqrt_price_x96(1.0 / price, decimals0=6, decimals1=18)),
+                "tick": 0,
+                "liquidity": str(10**18),
+                "amount0": float(abs(rng.normal(5000, 1000)) * 10**6),
+                "amount1": 0.0,
+                "base_fee_wei": int(gas_gwei * 1_000_000_000),
+            }
+        )
+    df = pd.DataFrame(rows)
+    df.to_parquet(path, index=False)
+    write_progress(path, [(int(df["block_number"].min()), int(df["block_number"].max()))])
+
+
+def test_a_net_trained_model_learns_cost_and_a_gross_trained_one_does_not(tmp_path: Path):
+    swaps = tmp_path / "swaps.parquet"
+    _write_costly_gas_swaps(swaps)
+
+    def train_on(target: str) -> dict:
+        model = tmp_path / f"model-{target}.safetensors"
+        result = CliRunner().invoke(
+            cli, ["train", "--swaps", str(swaps), "--out", str(model), "--epochs", "500", "--no-sweep-after-train"],
+            env={"LATENTEDGE_TRAIN_TARGET": target},
+        )
+        assert result.exit_code == 0, result.output
+        return json.loads(Path(str(model) + ".metrics.json").read_text())
+
+    net = train_on("net")
+    gross = train_on("gross")
+
+    assert net["target"] == "net" and gross["target"] == "gross"
+    assert net["splits"]["test"]["cost_correlation"] < -0.5   # it learned the cost
+    assert abs(gross["splits"]["test"]["cost_correlation"]) < 0.3  # it was never asked to
+    # a gross-trained model's own correlation is with the price move
+    assert gross["splits"]["test"]["correlation"] == pytest.approx(gross["splits"]["test"]["gross_correlation"], abs=1e-5)
+
+
+def test_gross_is_the_default_training_target(tmp_path: Path):
+    _, model = _train(tmp_path)
+    assert json.loads(Path(str(model) + ".metrics.json").read_text())["target"] == "gross"
+
+
+def test_a_bad_training_target_is_refused_before_any_work(tmp_path: Path):
+    result = CliRunner().invoke(
+        cli, ["train", "--swaps", str(tmp_path / "s.parquet"), "--out", str(tmp_path / "m.safetensors")],
+        env={"LATENTEDGE_TRAIN_TARGET": "profit"},
+    )
+    assert result.exit_code != 0 and "LATENTEDGE_TRAIN_TARGET" in result.output
+
+
+def test_the_backtest_and_sweep_return_real_units_for_a_gross_trained_model(tmp_path: Path):
+    swaps, model = _train(tmp_path)  # gross by default
+    swept = CliRunner().invoke(
+        cli, ["sweep", "--swaps", str(swaps), "--model", str(model), "--out-dir", str(tmp_path / "sw"),
+              "--min-edges", "0", "--top-fractions", "0.5", "--shuffle-seeds", ""],
+    )
+    assert swept.exit_code == 0, swept.output

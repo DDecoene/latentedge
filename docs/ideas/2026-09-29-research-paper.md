@@ -61,8 +61,7 @@ reported as one.
 Pipeline note: training now records the feature set and label settings with
 the model, and a backtest or sweep relabels with those, so a run cannot be
 replayed under different settings by accident. The sweep, not the plain
-backtest, is the pipeline's result (the backtest is one of its rules), and it
-writes a plain-language verdict with its numbers.
+backtest, is the pipeline's result (the backtest is one of its rules).
 
 Methodology note worth a paragraph: an earlier backtest lost 43% because the
 signal client returned the model's standardized output (in standard
@@ -165,6 +164,7 @@ label settings and the feature set with it.
 |---|---|---|---|---|---|
 | 20260929T173520Z | all 7 | 30 min, 2 std | not measured | not measured | no edge (first sweep) |
 | 20260929T175549Z | all 7 | 30 min, 2 std | +0.01 | -0.96 | no edge; model predicts cost |
+| 20260929T183041Z | all 7 + 4 order flow | 30 min, 2 std | +0.01 | -0.96 | no edge; order flow added nothing measurable (validate gross corr +0.03) |
 
 Pipeline validation (synthetic data, `tests/test_cli_backtest.py`): on swaps
 whose price follows a hidden drift that flips sign every two hours, the same
@@ -185,7 +185,12 @@ All use only past bars and are shifted one bar like the other features.
 Validated on synthetic swaps where a regime tilts both trade direction and,
 weakly, the price: with the lagged returns removed, the pipeline still finds
 it (gross correlation 0.18 validate, 0.27 test), and a price-only model finds
-about 0.07 and 0.13. Real-data run pending; the price-only baseline is
+about 0.07 and 0.13. Real-data run (`20260929T183041Z`, block range 24,642,884 to 26,084,902, about
+200 days, 250 requested; the ingest was stopped before the extra 50 days were
+fetched): gross correlation 0.006 train, 0.025 validate, 0.011 test, the same
+as the price-only model; the fit to net return is still cost prediction
+(cost correlation -0.93 to -0.96). Order flow at 1-minute bars and a 30-minute
+horizon adds no detectable direction signal. The price-only baseline is
 reproduced with `LATENTEDGE_TRAIN_EXCLUDE_FEATURES=order_flow`.
 
 Planned: without gas and volatility at 30 minutes; all features at 240
