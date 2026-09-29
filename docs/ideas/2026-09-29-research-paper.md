@@ -109,6 +109,28 @@ Needs a solid write-up of its own, since the data are the foundation.
 - Locating label entry and exit swaps by binary search instead of rescanning.
 - Sources: the ingest and rate-limiting design specs and the git history.
 
+Measured rate limit and ingest time (to be written up as a short subsection):
+
+- Empirically, about 6.2 requests/sec is the sweet spot against the RPC
+  provider. At or below it there are no HTTP 429 responses. Above it the
+  provider throttles, and each 429 carries a wait time, so the time lost
+  waiting costs more than the extra request rate gained. Net blocks per
+  minute drops noticeably once 429s start.
+- At that rate, ingestion settles at roughly 30 blocks/min. Report how long
+  the full history took (and takes for the 150-day window and any extension),
+  since it sets the practical cost of adding more data. Fill in the measured
+  wall-clock time from the progress file before drafting.
+- This is probably not the most efficient way to collect the data. Other
+  methods may exist (a provider with bulk or export endpoints, a self-hosted
+  node, a public dataset of Uniswap v3 swaps). `eth_getLogs` over an archive
+  endpoint was the approach already known, and there was no time pressure,
+  so a slow, safe ingest was acceptable. Say this plainly in the paper as a
+  limitation of the data collection and not as a recommended method.
+- Constraints behind the choice: this was the only truly free option known
+  to the author, and running a node was not possible because of hardware
+  and budget limits. The free-tier rate limit is therefore what sets the
+  ingest speed.
+
 ## Constraints on the writing
 
 - No tooling or process fingerprints in anything committed.
